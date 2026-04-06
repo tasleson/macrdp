@@ -1,0 +1,20 @@
+[package]
+name = "macrdp-audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+approx = "0.5"
+
+[features]
+default = []
+opus = ["dep:opus"]
+
+[dependencies.opus]
+version = "0.3"
+optional = true
