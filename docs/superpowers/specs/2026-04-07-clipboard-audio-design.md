@@ -265,9 +265,9 @@ impl CliprdrBackend for MacClipboardBackend {
         ));
     }
 
-    fn on_remote_copy(&mut self, formats: Vec<ClipboardFormat>) {
+    fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         // Client has new clipboard content. Store formats for lazy fetch.
-        *self.remote_formats.lock().unwrap() = formats;
+        *self.remote_formats.lock().unwrap() = available_formats.to_vec();
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
@@ -279,7 +279,7 @@ impl CliprdrBackend for MacClipboardBackend {
         ));
     }
 
-    fn on_format_data_response(&mut self, response: FormatDataResponse) {
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
         // Received data from client clipboard → write to NSPasteboard
         // Suppress echo by updating last_change_count after write
         convert_and_write_to_pasteboard(&self.pasteboard, &response);
@@ -293,7 +293,7 @@ impl CliprdrBackend for MacClipboardBackend {
         // Send response through clipboard message channel
     }
 
-    fn on_file_contents_response(&mut self, response: FileContentsResponse) {
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
         // Write received file content to temp directory
         write_file_contents(&self.temp_dir, &response);
     }
@@ -695,7 +695,8 @@ async fn audio_loop(
 
 ```rust
 pub struct MacAudioFactory {
-    audio_rx: Option<mpsc::Receiver<AudioFrame>>,
+    // Mutex for interior mutability: build_backend(&self) needs to take() the receiver
+    audio_rx: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     config: AudioConfig,
 }
@@ -703,7 +704,7 @@ pub struct MacAudioFactory {
 impl MacAudioFactory {
     pub fn new(audio_rx: mpsc::Receiver<AudioFrame>, config: AudioConfig) -> Self {
         Self {
-            audio_rx: Some(audio_rx),
+            audio_rx: Mutex::new(Some(audio_rx)),
             event_sender: None,
             config,
         }
@@ -712,8 +713,10 @@ impl MacAudioFactory {
 
 impl SoundServerFactory for MacAudioFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        let rx = self.audio_rx.lock().unwrap().take()
+            .expect("audio_rx already taken — build_backend called more than once");
         Box::new(MacAudioHandler::new(
-            self.audio_rx.take().expect("audio_rx already taken"),
+            rx,
             self.event_sender.clone().expect("event sender not set"),
             self.config.clone(),
         ))
