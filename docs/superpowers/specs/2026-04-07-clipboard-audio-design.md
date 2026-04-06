@@ -70,8 +70,8 @@ macOS → RDP Client (Server-initiated Copy):
 RDP Client → macOS (Client-initiated Copy):
   Client sends FormatList → [SVC] → CliprdrBackend::on_remote_copy(formats)
     → Store remote format list (lazy fetch)
-    → [Later: macOS app pastes]
-    → CliprdrBackend::on_format_data_request() triggered
+    → Write placeholder to NSPasteboard (declare available types)
+    → [Later: macOS app triggers paste]
     → ClipboardMessage::SendInitiatePaste(format_id)
     → [event loop] → SVC → Client sends FormatDataResponse
     → CliprdrBackend::on_format_data_response(data)
@@ -82,11 +82,12 @@ RDP Client → macOS (Client-initiated Copy):
 
 ```
 ScreenCaptureKit Audio Callback (48kHz Float32 PCM, non-interleaved)
-  → Interleave channels if needed
+  → Extract float32 samples from AudioBufferList
+  → Interleave channels if non-interleaved (num_buffers > 1)
   → mpsc::channel<AudioFrame> → macrdp-audio
-  → Ring buffer accumulation (20ms frames = 960 samples @ 48kHz)
+  → Ring buffer accumulation (20ms frames = 960 samples per channel @ 48kHz)
   → Float32 → S16LE conversion (or Opus encoding)
-  → RdpsndServerMessage::Wave(pcm_data, timestamp_ms)
+  → RdpsndServerMessage::Wave(pcm_data, presentation_timestamp_ms)
   → ServerEvent::Rdpsnd → [ironrdp-server-gfx event loop]
   → SVC encode → Client playback
 ```
@@ -127,8 +128,8 @@ impl PasteboardBridge {
 |-----------|-------------|------------|-----------------|
 | mac→rdp | NSPasteboardTypeString (UTF-8) | CF_UNICODETEXT (13) | UTF-8 → UTF-16LE + null terminator |
 | rdp→mac | CF_UNICODETEXT (13) | NSPasteboardTypeString | UTF-16LE → UTF-8, strip null |
-| mac→rdp | PNG/TIFF image | CF_DIB (8) | Decode image → BITMAPINFOHEADER + BGR pixel rows (bottom-up) |
-| rdp→mac | CF_DIB (8) | PNG image | Parse DIB header → extract pixels → encode PNG |
+| mac→rdp | PNG/TIFF image | CF_DIB (8) | Decode image → BITMAPINFOHEADER (positive height, bottom-up) + BGR pixel rows |
+| rdp→mac | CF_DIB (8) | PNG image | Parse DIB header → flip rows if bottom-up → encode PNG |
 | mac→rdp | NSPasteboardTypeHTML | "HTML Format" (registered) | Wrap in Windows HTML Format header (StartHTML/EndHTML/StartFragment/EndFragment) |
 | rdp→mac | "HTML Format" | NSPasteboardTypeHTML | Strip Windows HTML Format header, extract fragment |
 | mac→rdp | file URLs | FileGroupDescriptorW (registered) | Build FILEDESCRIPTORW array from file metadata |
@@ -153,8 +154,10 @@ fn utf16le_to_utf8(data: &[u8]) -> Option<String> {
 
 **DIB Conversion:**
 Use the `image` crate for PNG/TIFF decode/encode. DIB format requires:
-- BITMAPINFOHEADER (40 bytes): width, height (negative = top-down), planes=1, bitCount=32, compression=BI_RGB
-- Pixel data: BGRA or BGR, row-aligned to 4-byte boundary
+- BITMAPINFOHEADER (40 bytes): width, **positive height** (bottom-up row order for maximum RDP client compatibility), planes=1, bitCount=32, compression=BI_RGB
+- Pixel data: BGRA, row-aligned to 4-byte boundary
+- When converting from macOS image (top-down) to DIB (bottom-up): **flip row order** (reverse the array of pixel rows)
+- When converting from DIB (bottom-up, positive height) to PNG: flip rows back to top-down before encoding
 
 ### 3.3 File Clipboard — FileGroupDescriptor + FileContents
 
@@ -197,33 +200,182 @@ pub struct MacClipboardBackend {
     file_handles: Mutex<HashMap<u32, File>>,
     temp_dir: PathBuf,
     poll_handle: Option<JoinHandle<()>>,
+    stop_signal: Arc<AtomicBool>,           // Graceful shutdown for polling thread
+    locked: AtomicBool,                     // File transfer lock state
 }
 ```
 
-**Polling thread:**
+**Required trait implementations:**
+
+`MacClipboardBackend` must implement `CliprdrBackend` (which requires `AsAny + Debug + Send`):
+
 ```rust
-fn poll_clipboard(bridge: &PasteboardBridge, last: &AtomicI64, sender: &Sender) {
-    loop {
+// Debug: manual impl due to mpsc::UnboundedSender and Mutex<File>
+impl fmt::Debug for MacClipboardBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MacClipboardBackend")
+            .field("temp_dir", &self.temp_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+// AsAny: required by CliprdrBackend for downcasting
+impl_as_any!(MacClipboardBackend);
+```
+
+**Complete CliprdrBackend trait method implementations:**
+
+```rust
+impl CliprdrBackend for MacClipboardBackend {
+    fn temporary_directory(&self) -> &str {
+        self.temp_dir.to_str().unwrap_or("/tmp/macrdp-clipboard")
+    }
+
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+    }
+
+    fn on_ready(&mut self) {
+        // Channel is initialized. Start the polling thread.
+        let bridge = self.pasteboard.clone();
+        let last = self.last_change_count.clone();
+        let sender = self.event_sender.clone();
+        let stop = self.stop_signal.clone();
+        self.poll_handle = Some(std::thread::spawn(move || {
+            poll_clipboard(&bridge, &last, &sender, &stop);
+        }));
+    }
+
+    fn on_process_negotiated_capabilities(&mut self, capabilities: ClipboardGeneralCapabilityFlags) {
+        // Store negotiated capabilities for feature gating
+        // e.g., check if client supports file streams
+    }
+
+    fn on_request_format_list(&mut self) {
+        // Server requests our current clipboard format list
+        let formats = self.pasteboard.available_types()
+            .iter()
+            .filter_map(|uti| uti_to_rdp_format(uti))
+            .collect();
+        let _ = self.event_sender.send(ServerEvent::Clipboard(
+            ClipboardMessage::SendInitiateCopy(formats)
+        ));
+    }
+
+    fn on_remote_copy(&mut self, formats: Vec<ClipboardFormat>) {
+        // Client has new clipboard content. Store formats for lazy fetch.
+        *self.remote_formats.lock().unwrap() = formats;
+    }
+
+    fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        // Client wants specific format data from our clipboard
+        let data = read_and_convert_format(&self.pasteboard, request.format_id);
+        let response = OwnedFormatDataResponse { data };
+        let _ = self.event_sender.send(ServerEvent::Clipboard(
+            ClipboardMessage::SendFormatData(response)
+        ));
+    }
+
+    fn on_format_data_response(&mut self, response: FormatDataResponse) {
+        // Received data from client clipboard → write to NSPasteboard
+        // Suppress echo by updating last_change_count after write
+        convert_and_write_to_pasteboard(&self.pasteboard, &response);
+        let new_count = self.pasteboard.change_count();
+        self.last_change_count.store(new_count, Ordering::SeqCst);
+    }
+
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        // Read file content at offset for the given streamId
+        let data = read_file_contents(&self.file_handles, &request);
+        // Send response through clipboard message channel
+    }
+
+    fn on_file_contents_response(&mut self, response: FileContentsResponse) {
+        // Write received file content to temp directory
+        write_file_contents(&self.temp_dir, &response);
+    }
+
+    fn on_lock(&mut self, data_id: LockDataId) {
+        self.locked.store(true, Ordering::SeqCst);
+    }
+
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        self.locked.store(false, Ordering::SeqCst);
+        // Clean up file handles
+        self.file_handles.lock().unwrap().clear();
+    }
+}
+```
+
+**Polling thread with graceful shutdown:**
+
+```rust
+fn poll_clipboard(
+    bridge: &PasteboardBridge,
+    last: &AtomicI64,
+    sender: &mpsc::UnboundedSender<ServerEvent>,
+    stop: &AtomicBool,
+) {
+    while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(500));
+        if stop.load(Ordering::Relaxed) { break; }
+
         let current = bridge.change_count();
         let prev = last.swap(current, Ordering::SeqCst);
         if current != prev {
-            // Read formats, send ClipboardMessage::SendInitiateCopy
             let formats = bridge.available_types()
                 .iter()
                 .filter_map(|uti| uti_to_rdp_format(uti))
                 .collect();
-            sender.send(ServerEvent::Clipboard(
+            let _ = sender.send(ServerEvent::Clipboard(
                 ClipboardMessage::SendInitiateCopy(formats)
             ));
         }
     }
 }
+
+impl Drop for MacClipboardBackend {
+    fn drop(&mut self) {
+        self.stop_signal.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.poll_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 ```
 
-**Anti-echo:** When we write to NSPasteboard ourselves (due to client copy), increment `last_change_count` to skip the next poll detection. This prevents infinite clipboard echo loops.
+**Anti-echo:** When we write to NSPasteboard ourselves (due to client copy), we update `last_change_count` to the new changeCount immediately after the write. This prevents the polling thread from detecting it as a remote change, avoiding infinite clipboard echo loops.
 
-### 3.5 Dependencies
+### 3.5 MacClipboardFactory
+
+```rust
+pub struct MacClipboardFactory {
+    event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    config: ClipboardConfig,
+}
+
+impl CliprdrBackendFactory for MacClipboardFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        Box::new(MacClipboardBackend::new(
+            self.event_sender.clone().expect("event sender not set"),
+            self.config.clone(),
+        ))
+    }
+}
+
+impl ServerEventSender for MacClipboardFactory {
+    fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+        self.event_sender = Some(sender);
+    }
+}
+
+impl CliprdrServerFactory for MacClipboardFactory {}
+```
+
+### 3.6 Dependencies
 
 ```toml
 [dependencies]
@@ -263,11 +415,54 @@ fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutp
         }
         SCStreamOutputType::Audio => {
             if let Some(audio_buffer_list) = sample.audio_buffer_list() {
-                let format = sample.format_description();
+                let format_desc = sample.format_description();
                 let timestamp = sample.presentation_timestamp();
-                let frame = AudioFrame::from_sample_buffer(
-                    &audio_buffer_list, &format, &timestamp
-                );
+                let timestamp_ms = (timestamp.value as f64
+                    / timestamp.timescale as f64 * 1000.0) as u64;
+
+                // Extract float32 samples from AudioBufferList.
+                // SCK may output non-interleaved (num_buffers == channels)
+                // or interleaved (num_buffers == 1).
+                let num_buffers = audio_buffer_list.len();
+                let is_float = format_desc.audio_is_float();
+                let channels = format_desc.audio_channel_count() as u16;
+
+                let interleaved_data = if num_buffers == 1 {
+                    // Single buffer = already interleaved
+                    let buf = &audio_buffer_list[0];
+                    let raw = buf.data();
+                    // Safety: SCK outputs Float32 PCM, data is properly aligned
+                    let samples = unsafe {
+                        std::slice::from_raw_parts(
+                            raw.as_ptr() as *const f32,
+                            raw.len() / 4,
+                        )
+                    };
+                    samples.to_vec()
+                } else {
+                    // Multiple buffers = non-interleaved, one buffer per channel
+                    let channel_buffers: Vec<&[f32]> = audio_buffer_list.iter()
+                        .map(|buf| {
+                            let raw = buf.data();
+                            unsafe {
+                                std::slice::from_raw_parts(
+                                    raw.as_ptr() as *const f32,
+                                    raw.len() / 4,
+                                )
+                            }
+                        })
+                        .collect();
+                    let num_samples = channel_buffers[0].len();
+                    AudioConverter::interleave(&channel_buffers, num_samples)
+                };
+
+                let frame = AudioFrame {
+                    data: interleaved_data,
+                    sample_rate: format_desc.audio_sample_rate() as u32,
+                    channels,
+                    num_samples: interleaved_data.len() / channels as usize,
+                    timestamp_ms,
+                };
                 let _ = self.audio_tx.try_send(frame);
             }
         }
@@ -280,11 +475,11 @@ fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutp
 
 ```rust
 pub struct AudioFrame {
-    pub data: Vec<f32>,       // Interleaved Float32 PCM samples
+    pub data: Vec<f32>,       // Interleaved Float32 PCM samples (L0,R0,L1,R1,...)
     pub sample_rate: u32,     // 48000
     pub channels: u16,        // 2
     pub num_samples: usize,   // Number of samples per channel
-    pub timestamp_ms: u64,    // Presentation timestamp in milliseconds
+    pub timestamp_ms: u64,    // Presentation timestamp in milliseconds (from CMSampleBuffer)
 }
 ```
 
@@ -348,7 +543,7 @@ optional = true
 #[cfg(feature = "opus")]
 pub struct OpusEncoder {
     encoder: opus::Encoder,
-    frame_size: usize,     // 960 samples (20ms @ 48kHz)
+    frame_size: usize,     // 960 samples per channel (20ms @ 48kHz)
     buffer: Vec<f32>,      // Accumulation buffer
 }
 
@@ -359,6 +554,8 @@ impl OpusEncoder {
 }
 ```
 
+**Compatibility note:** Opus (`WaveFormat::OPUS`, tag `0x704F`) is a FreeRDP-defined non-standard format tag. **Windows mstsc and Microsoft Remote Desktop mobile clients do not support Opus.** Opus encoding is only effective with FreeRDP clients. PCM S16LE serves as the universal fallback format that all RDP clients support.
+
 ### 4.4 MacAudioHandler — RdpsndServerHandler Implementation
 
 ```rust
@@ -368,10 +565,20 @@ pub struct MacAudioHandler {
     formats: Vec<AudioFormat>,
     selected_format: Option<usize>,
     ring_buffer: VecDeque<f32>,
-    frame_size: usize,         // Samples per RDP wave packet (960 for 20ms@48kHz)
-    block_number: u16,         // Wave block sequence counter
+    // frame_size: total interleaved samples per 20ms packet.
+    // At 48kHz stereo: 960 samples/ch * 2 channels = 1920 interleaved samples.
+    frame_size_interleaved: usize,
     #[cfg(feature = "opus")]
     opus_encoder: Option<OpusEncoder>,
+}
+
+impl fmt::Debug for MacAudioHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MacAudioHandler")
+            .field("selected_format", &self.selected_format)
+            .field("frame_size_interleaved", &self.frame_size_interleaved)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RdpsndServerHandler for MacAudioHandler {
@@ -385,12 +592,42 @@ impl RdpsndServerHandler for MacAudioHandler {
     }
 
     fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
-        // Client selected a format index from our list
-        // Store the selection, start the audio processing task
-        let server_idx = /* match client selection to server format */ ;
-        self.selected_format = Some(server_idx);
-        // Spawn audio processing loop
-        Some(server_idx as u16)
+        // client_format contains the FULL list of formats the client supports.
+        // We need to find the best match between our formats and theirs.
+        //
+        // Format matching algorithm (priority: Opus > PCM):
+        // 1. Iterate our server formats in order (index 0 = PCM, index 1 = Opus if enabled)
+        //    in REVERSE priority (check Opus first if available).
+        // 2. For each server format, check if client_format.formats contains a matching
+        //    format (same WaveFormat tag, sample rate, channels, bits_per_sample).
+        // 3. Return the server format index of the best match.
+        //
+        // If no match found, return None (audio disabled for this session).
+
+        let mut best_match: Option<usize> = None;
+
+        for (server_idx, server_fmt) in self.formats.iter().enumerate().rev() {
+            for client_fmt in &client_format.formats {
+                if server_fmt.format == client_fmt.format
+                    && server_fmt.n_samples_per_sec == client_fmt.n_samples_per_sec
+                    && server_fmt.n_channels == client_fmt.n_channels
+                    && server_fmt.bits_per_sample == client_fmt.bits_per_sample
+                {
+                    best_match = Some(server_idx);
+                    break;
+                }
+            }
+            if best_match.is_some() { break; }
+        }
+
+        if let Some(idx) = best_match {
+            self.selected_format = Some(idx);
+            // Spawn audio processing loop (see Section 4.5)
+            Some(idx as u16)
+        } else {
+            tracing::warn!("No matching audio format found with client");
+            None
+        }
     }
 
     fn stop(&mut self) {
@@ -400,24 +637,35 @@ impl RdpsndServerHandler for MacAudioHandler {
 }
 ```
 
+**Note:** `RdpsndServer` internally manages its own `block_no: u8` counter for Wave PDU sequencing. `MacAudioHandler` does NOT need to track block numbers — the IronRDP server layer handles this automatically when `wave()` is called.
+
 ### 4.5 Audio Processing Loop
 
 ```rust
 async fn audio_loop(
     mut audio_rx: mpsc::Receiver<AudioFrame>,
     event_sender: mpsc::UnboundedSender<ServerEvent>,
-    frame_size: usize,
+    frame_size_interleaved: usize,  // Total interleaved samples per packet (e.g., 1920 for 20ms@48kHz stereo)
     selected_format: AudioFormatType,
+    sample_rate: u32,
+    channels: u16,
 ) {
-    let mut ring_buffer = VecDeque::with_capacity(frame_size * 4);
-    let mut block_number: u16 = 0;
+    let mut ring_buffer: VecDeque<f32> = VecDeque::with_capacity(frame_size_interleaved * 4);
+    // Track elapsed samples for timestamp generation when SCK timestamps are not monotonic
+    let mut base_timestamp_ms: Option<u64> = None;
+    let mut samples_sent: u64 = 0;
 
     while let Some(frame) = audio_rx.recv().await {
+        // Use the SCK presentation timestamp for the first frame in each batch
+        if base_timestamp_ms.is_none() {
+            base_timestamp_ms = Some(frame.timestamp_ms);
+        }
+
         ring_buffer.extend(frame.data.iter());
 
-        // Emit 20ms frames
-        while ring_buffer.len() >= frame_size * 2 /* stereo */ {
-            let chunk: Vec<f32> = ring_buffer.drain(..frame_size * 2).collect();
+        // Emit fixed-size packets (20ms of interleaved samples)
+        while ring_buffer.len() >= frame_size_interleaved {
+            let chunk: Vec<f32> = ring_buffer.drain(..frame_size_interleaved).collect();
 
             let wave_data = match selected_format {
                 AudioFormatType::Pcm => AudioConverter::float32_to_s16le(&chunk),
@@ -425,19 +673,61 @@ async fn audio_loop(
                 AudioFormatType::Opus => opus_encoder.encode(&chunk),
             };
 
-            let timestamp = block_number as u32 * 20; // 20ms per block
+            // Use actual presentation timestamp from SCK.
+            // Calculate offset based on samples sent since base timestamp.
+            let samples_per_channel = frame_size_interleaved / channels as usize;
+            let offset_ms = (samples_sent * 1000) / sample_rate as u64;
+            let timestamp_ms = base_timestamp_ms.unwrap_or(0) + offset_ms;
+
             let _ = event_sender.send(ServerEvent::Rdpsnd(
-                RdpsndServerMessage::Wave(wave_data, timestamp)
+                RdpsndServerMessage::Wave(wave_data, timestamp_ms as u32)
             ));
-            block_number = block_number.wrapping_add(1);
+
+            samples_sent += samples_per_channel as u64;
         }
     }
 }
 ```
 
-**Back-pressure:** `mpsc::channel` with bounded capacity (32 frames). If the channel is full, `try_send` drops the oldest frame. Audio tolerates frame drops better than accumulated latency.
+**Back-pressure:** `mpsc::channel` with bounded capacity (32 frames). If the channel is full, `try_send` drops the frame. Audio tolerates frame drops better than accumulated latency.
 
-### 4.6 Dependencies
+### 4.6 MacAudioFactory
+
+```rust
+pub struct MacAudioFactory {
+    audio_rx: Option<mpsc::Receiver<AudioFrame>>,
+    event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    config: AudioConfig,
+}
+
+impl MacAudioFactory {
+    pub fn new(audio_rx: mpsc::Receiver<AudioFrame>, config: AudioConfig) -> Self {
+        Self {
+            audio_rx: Some(audio_rx),
+            event_sender: None,
+            config,
+        }
+    }
+}
+
+impl SoundServerFactory for MacAudioFactory {
+    fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        Box::new(MacAudioHandler::new(
+            self.audio_rx.take().expect("audio_rx already taken"),
+            self.event_sender.clone().expect("event sender not set"),
+            self.config.clone(),
+        ))
+    }
+}
+
+impl ServerEventSender for MacAudioFactory {
+    fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+        self.event_sender = Some(sender);
+    }
+}
+```
+
+### 4.7 Dependencies
 
 ```toml
 [dependencies]
@@ -504,9 +794,10 @@ pub async fn build_rdp_server(config: &Config) -> Result<RdpServer> {
 ```rust
 #[derive(Deserialize, Clone)]
 pub struct ClipboardConfig {
-    pub enabled: bool,           // default: true
-    pub file_transfer: bool,     // default: true
-    pub max_file_size_mb: u32,   // default: 100
+    pub enabled: bool,              // default: true
+    pub file_transfer: bool,        // default: true
+    pub max_file_size_mb: u32,      // default: 100
+    pub max_data_size_mb: u32,      // default: 50 — limit for non-file format data (text, images)
     pub temp_dir: Option<PathBuf>,
 }
 
@@ -514,8 +805,8 @@ pub struct ClipboardConfig {
 pub struct AudioConfig {
     pub enabled: bool,           // default: true
     pub codec: AudioCodec,       // "pcm" or "opus", default: pcm
-    pub sample_rate: u32,        // default: 48000
-    pub channels: u16,           // default: 2
+    pub sample_rate: AudioSampleRate, // enum: 8000/16000/24000/48000, default: 48000
+    pub channels: AudioChannels,     // enum: Mono(1)/Stereo(2), default: Stereo
     pub buffer_ms: u32,          // default: 20
 }
 
@@ -523,6 +814,20 @@ pub struct AudioConfig {
 pub enum AudioCodec {
     Pcm,
     Opus,
+}
+
+#[derive(Deserialize, Clone)]
+pub enum AudioSampleRate {
+    Rate8000 = 8000,
+    Rate16000 = 16000,
+    Rate24000 = 24000,
+    Rate48000 = 48000,
+}
+
+#[derive(Deserialize, Clone)]
+pub enum AudioChannels {
+    Mono = 1,
+    Stereo = 2,
 }
 ```
 
@@ -533,6 +838,7 @@ pub enum AudioCodec {
 enabled = true
 file_transfer = true
 max_file_size_mb = 100
+max_data_size_mb = 50
 
 [audio]
 enabled = true
@@ -541,6 +847,8 @@ sample_rate = 48000
 channels = 2
 buffer_ms = 20
 ```
+
+**Config validation:** On load, validate that `sample_rate` is one of the supported SCK values (8000/16000/24000/48000) and `channels` is 1 or 2. Log a warning and fall back to defaults for invalid values.
 
 ---
 
@@ -552,10 +860,12 @@ buffer_ms = 20
 | Format conversion failure (corrupted image/DIB) | Return empty response, log warning | Single paste fails, no crash |
 | Audio capture interrupted | Stop sending Wave packets | Client goes silent, video unaffected |
 | File read failure during transfer | Send FileContentsResponse with error | Client shows error dialog |
-| Channel capacity full (audio back-pressure) | Drop oldest audio frame | Brief audio skip, no latency buildup |
+| Channel capacity full (audio back-pressure) | Drop current audio frame | Brief audio skip, no latency buildup |
 | Clipboard echo loop detected | Anti-echo via changeCount tracking | No infinite loop |
 | SCK audio permission denied | Disable audio, log error | Audio feature unavailable |
 | Opus encoding failure | Fallback to PCM if possible, else skip | Degraded audio quality |
+| Clipboard data exceeds max_data_size_mb | Reject with warning, don't write to pasteboard | Prevents memory exhaustion from malicious client |
+| Polling thread outlives session | Graceful shutdown via AtomicBool + Drop impl | No resource leak |
 
 ---
 
@@ -563,23 +873,23 @@ buffer_ms = 20
 
 ### 7.1 Unit Tests
 
-- **Format conversion:** UTF-8 ↔ UTF-16LE roundtrip, DIB ↔ PNG roundtrip, HTML Format header generation/parsing
-- **Audio conversion:** Float32 → S16LE correctness (boundary values: -1.0, 0.0, 1.0, overflow)
-- **Interleave:** Non-interleaved → interleaved channel reordering
+- **Format conversion:** UTF-8 ↔ UTF-16LE roundtrip, DIB ↔ PNG roundtrip (with row-flip verification), HTML Format header generation/parsing
+- **Audio conversion:** Float32 → S16LE correctness (boundary values: -1.0, 0.0, 1.0, overflow clamping)
+- **Interleave:** Non-interleaved → interleaved channel reordering correctness
 - **FileGroupDescriptorW:** Serialization/deserialization of file descriptor structures
-- **Ring buffer:** Frame accumulation and 20ms slicing
+- **Ring buffer:** Frame accumulation and fixed-size packet slicing
 
 ### 7.2 Integration Tests
 
 - **Clipboard polling:** Verify changeCount detection with mock NSPasteboard
 - **Anti-echo:** Write to pasteboard, verify no re-trigger
-- **Audio pipeline:** SCK AudioFrame → converter → Wave packet sizing
+- **Audio pipeline:** SCK AudioFrame → converter → Wave packet sizing and timestamp correctness
 
 ### 7.3 Manual End-to-End Tests
 
-- **Windows mstsc:** Text copy/paste both directions, image paste, file drag
-- **FreeRDP (Linux):** Same clipboard tests + audio playback
-- **Microsoft Remote Desktop (iOS/Android):** Basic text clipboard + audio
+- **Windows mstsc:** Text copy/paste both directions, image paste, file drag, audio playback (PCM only)
+- **FreeRDP (Linux):** Same clipboard tests + audio playback (PCM + Opus)
+- **Microsoft Remote Desktop (iOS/Android):** Basic text clipboard + audio (PCM only)
 
 ### 7.4 Test Environment Notes
 
@@ -594,10 +904,10 @@ buffer_ms = 20
 | Phase | Component | Complexity | Description |
 |-------|-----------|-----------|-------------|
 | 3.1 | Audio RDPSND | Medium | SCK audio capture → Float32→S16LE → RDPSND Wave |
-| 3.2 | Clipboard — Text | Low | NSPasteboard text ↔ CF_UNICODETEXT, polling |
-| 3.3 | Clipboard — Image | Medium | PNG/TIFF ↔ CF_DIB format conversion |
-| 3.4 | Clipboard — File | High | FileGroupDescriptorW, FileContents, temp dir management |
-| 3.5 | Opus Encoding | Low | Optional Opus codec behind feature flag |
+| 3.2 | Clipboard — Text | Low | NSPasteboard text ↔ CF_UNICODETEXT, polling, anti-echo |
+| 3.3 | Clipboard — Image | Medium | PNG/TIFF ↔ CF_DIB format conversion with row-flip |
+| 3.4 | Clipboard — File | High | FileGroupDescriptorW, FileContents, temp dir management, lock mechanism |
+| 3.5 | Opus Encoding | Low | Optional Opus codec behind feature flag (FreeRDP only) |
 
 Each phase is independently testable and deployable. Audio (3.1) is prioritized as it is simpler and provides immediate user-visible value.
 
@@ -606,6 +916,7 @@ Each phase is independently testable and deployable. Audio (3.1) is prioritized 
 ## 9. Security Considerations
 
 - **Clipboard data size limits:** Enforce `max_file_size_mb` to prevent memory exhaustion during file transfer
+- **Non-file data size limits:** Enforce `max_data_size_mb` for `FormatDataResponse` to prevent memory exhaustion from malicious clients sending oversized text/image data
 - **Temporary file cleanup:** Auto-delete temp files on session end or clipboard change
 - **Path traversal:** Validate file paths from `FileGroupDescriptorW` — reject `..` components and absolute paths
 - **Audio privacy:** `excludes_current_process_audio(true)` prevents capturing our own audio output
