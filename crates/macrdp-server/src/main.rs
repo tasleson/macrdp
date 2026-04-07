@@ -141,6 +141,18 @@ async fn main() -> Result<()> {
             None
         };
 
+    // Clipboard factory
+    let cliprdr_factory: Option<Box<dyn ironrdp_server::CliprdrServerFactory>> =
+        if config.clipboard.enabled {
+            let temp_dir = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("macrdp")
+                .join("clipboard");
+            Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir)))
+        } else {
+            None
+        };
+
     // fixed_resolution = true when user explicitly set width/height in config
     let fixed_resolution = config.width > 0 && config.height > 0;
 
@@ -160,6 +172,7 @@ async fn main() -> Result<()> {
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_sound_factory(sound_factory)
+        .with_cliprdr_factory(cliprdr_factory)
         .build();
 
     // Share GFX state with the server

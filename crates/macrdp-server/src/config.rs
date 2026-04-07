@@ -41,6 +41,25 @@ impl Default for AudioConfig {
     }
 }
 
+/// Clipboard synchronization configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    pub enabled: bool,
+    pub file_transfer: bool,
+    pub max_file_size_mb: u32,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_transfer: true,
+            max_file_size_mb: 100,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -85,6 +104,9 @@ pub struct ServerConfig {
     /// Audio forwarding configuration
     #[serde(default)]
     pub audio: AudioConfig,
+    /// Clipboard synchronization configuration
+    #[serde(default)]
+    pub clipboard: ClipboardConfig,
 }
 
 impl Default for ServerConfig {
@@ -108,6 +130,7 @@ impl Default for ServerConfig {
             skip_unchanged: None,
             idle_keyframe_sec: None,
             audio: AudioConfig::default(),
+            clipboard: ClipboardConfig::default(),
         }
     }
 }

@@ -8,6 +8,7 @@ macrdp-capture = { path = "../macrdp-capture" }
 macrdp-input = { path = "../macrdp-input" }
 macrdp-encode = { path = "../macrdp-encode" }
 macrdp-audio = { path = "../macrdp-audio" }
+macrdp-clipboard = { path = "../macrdp-clipboard" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

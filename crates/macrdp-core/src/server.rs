@@ -390,6 +390,18 @@ fn run_server_thread(args: ServerThreadArgs) {
                 None
             };
 
+        // Clipboard factory
+        let cliprdr_factory: Option<Box<dyn ironrdp_server::CliprdrServerFactory>> =
+            if args.config.clipboard.enabled {
+                let temp_dir = dirs::cache_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("macrdp")
+                    .join("clipboard");
+                Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir)))
+            } else {
+                None
+            };
+
         // Create display
         let fixed_resolution = args.config.width > 0 && args.config.height > 0;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
@@ -413,6 +425,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             .with_input_handler(input_handler)
             .with_display_handler(display)
             .with_sound_factory(sound_factory)
+            .with_cliprdr_factory(cliprdr_factory)
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));

@@ -222,6 +222,7 @@ impl UiConfig {
             hidpi_scale: Some(self.hidpi_scale),
             bitrate_mbps: Some(self.bitrate_mbps),
             audio: macrdp_core::AudioConfig::default(),
+            clipboard: macrdp_core::ClipboardConfig::default(),
         }
     }
 }
