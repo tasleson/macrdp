@@ -195,8 +195,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).
         let frame = loop {
-            let frame = match self.capturer.next_frame().await {
-                Some(f) => f,
+            let event = match self.capturer.next_frame().await {
+                Some(e) => e,
                 None => {
                     // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
                     tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
@@ -222,10 +222,16 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     continue; // retry next_frame with restored SCK capturer
                 }
             };
+            // Handle CaptureEvent — extract frame or skip idle
+            let frame = match event {
+                macrdp_capture::CaptureEvent::Frame(f) => f,
+                macrdp_capture::CaptureEvent::Idle => continue,
+            };
             // If another frame is already buffered, skip this one and grab the newer one
             // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
-                Some(_newer) => continue, // drop older frame, grab newer
+                Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue,
+                Some(macrdp_capture::CaptureEvent::Idle) => break frame,
                 None => break frame,
             }
         };
