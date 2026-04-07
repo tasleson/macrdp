@@ -5,10 +5,11 @@ use ironrdp_server::{
     RdpServerDisplay, RdpServerDisplayUpdates,
     gfx::GfxState,
 };
-use macrdp_capture::{AudioFrame, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
+use macrdp_capture::{AudioFrame, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, SafePixelBuffer, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Maximum tile size for bitmap updates
@@ -173,9 +174,21 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             display_frame_count: 0,
             skip_next_frame: false,
+            idle_frame_count: 0,
+            last_idr_time: Instant::now(),
+            last_frame_cache: None,
         }))
     }
 }
+
+/// Cached frame data for idle IDR re-encoding.
+enum CachedFrame {
+    Bgra { data: Vec<u8>, width: u32, height: u32, stride: usize },
+    PixelBuffer(SafePixelBuffer, u32, u32), // buffer, width, height
+}
+
+/// IDR keepalive interval during idle scenes (seconds).
+const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
 
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
@@ -186,6 +199,12 @@ struct MacDisplayUpdates {
     mode_444: bool,
     display_frame_count: u64,
     skip_next_frame: bool,
+    /// Consecutive idle events from SCK (desktop unchanged).
+    idle_frame_count: u32,
+    /// When the last IDR keyframe was sent (natural or keepalive).
+    last_idr_time: Instant,
+    /// Cached last frame for idle IDR re-encoding.
+    last_frame_cache: Option<CachedFrame>,
 }
 
 #[async_trait::async_trait]
@@ -195,38 +214,111 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).
         let frame = loop {
-            let event = match self.capturer.next_frame().await {
-                Some(e) => e,
-                None => {
-                    // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
-                    tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
-                    let fallback = CgFallbackCapturer::new(&self.capture_config);
-                    loop {
-                        // Try to restore SCK (faster, has dirty rects)
-                        match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                            Ok(new_capturer) => {
-                                tracing::info!("SCStream recovered — switching back from CoreGraphics");
-                                self.capturer = new_capturer;
-                                break;
-                            }
-                            Err(_) => {
-                                // SCK still unavailable — use CGDisplayCreateImage
-                                if let Some(cg_frame) = fallback.capture_frame() {
-                                    // Send this fallback frame through the normal encoding path
-                                    return self.encode_and_send(cg_frame);
+            // Calculate timeout for idle IDR keepalive.
+            // If we have a cached frame and are in idle state, wait at most until
+            // the next IDR keepalive is due instead of blocking forever.
+            let idle_deadline = if self.idle_frame_count > 0 && self.last_frame_cache.is_some() {
+                let elapsed = self.last_idr_time.elapsed();
+                if elapsed >= IDLE_IDR_INTERVAL {
+                    // IDR keepalive is overdue — send it immediately
+                    if let Some(update) = self.send_idle_idr() {
+                        return Ok(Some(update));
+                    }
+                    // If send_idle_idr returned None (no encoder/gfx), just continue waiting
+                    None
+                } else {
+                    Some(IDLE_IDR_INTERVAL - elapsed)
+                }
+            } else {
+                None
+            };
+
+            let event = if let Some(timeout) = idle_deadline {
+                match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        // SCK channel closed — handle below in the fallback path
+                        // Reset idle state since we're switching capture sources
+                        self.idle_frame_count = 0;
+                        // Fall through to CG fallback
+                        tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
+                        let fallback = CgFallbackCapturer::new(&self.capture_config);
+                        loop {
+                            match ScreenCapturer::new(self.capture_config.clone(), None).await {
+                                Ok(new_capturer) => {
+                                    tracing::info!("SCStream recovered — switching back from CoreGraphics");
+                                    self.capturer = new_capturer;
+                                    break;
                                 }
-                                tokio::time::sleep(fallback.frame_interval()).await;
+                                Err(_) => {
+                                    if let Some(cg_frame) = fallback.capture_frame() {
+                                        return self.encode_and_send(cg_frame);
+                                    }
+                                    tokio::time::sleep(fallback.frame_interval()).await;
+                                }
                             }
                         }
+                        continue;
                     }
-                    continue; // retry next_frame with restored SCK capturer
+                    Err(_elapsed) => {
+                        // Timeout — time to send an idle IDR keepalive
+                        if let Some(update) = self.send_idle_idr() {
+                            return Ok(Some(update));
+                        }
+                        // No encoder/GFX available — just continue waiting
+                        continue;
+                    }
+                }
+            } else {
+                match self.capturer.next_frame().await {
+                    Some(e) => e,
+                    None => {
+                        // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
+                        self.idle_frame_count = 0;
+                        tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
+                        let fallback = CgFallbackCapturer::new(&self.capture_config);
+                        loop {
+                            match ScreenCapturer::new(self.capture_config.clone(), None).await {
+                                Ok(new_capturer) => {
+                                    tracing::info!("SCStream recovered — switching back from CoreGraphics");
+                                    self.capturer = new_capturer;
+                                    break;
+                                }
+                                Err(_) => {
+                                    if let Some(cg_frame) = fallback.capture_frame() {
+                                        return self.encode_and_send(cg_frame);
+                                    }
+                                    tokio::time::sleep(fallback.frame_interval()).await;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
             };
+
             // Handle idle events (desktop unchanged)
             let frame = match event {
-                macrdp_capture::CaptureEvent::Frame(f) => f,
-                macrdp_capture::CaptureEvent::Idle => continue,
+                macrdp_capture::CaptureEvent::Frame(f) => {
+                    // Desktop became active — reset idle counter
+                    if self.idle_frame_count > 0 {
+                        tracing::debug!(
+                            idle_frames = self.idle_frame_count,
+                            "Desktop active again — forcing keyframe for clean recovery"
+                        );
+                        if let Some(enc) = &mut self.encoder {
+                            enc.force_keyframe();
+                        }
+                    }
+                    self.idle_frame_count = 0;
+                    f
+                }
+                macrdp_capture::CaptureEvent::Idle => {
+                    self.idle_frame_count += 1;
+                    continue;
+                }
             };
+
             // If another frame is already buffered, skip this one and grab the newer one
             // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
@@ -241,6 +333,66 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
+    /// Returns `None` if no cached frame or GFX is not ready.
+    fn send_idle_idr(&mut self) -> Option<DisplayUpdate> {
+        let cache = self.last_frame_cache.as_ref()?;
+        let encoder = self.encoder.as_mut()?;
+
+        // Check GFX readiness
+        {
+            let state = self.gfx_state.lock().unwrap();
+            if !state.is_ready() {
+                return None;
+            }
+        }
+
+        let t0 = Instant::now();
+        let result = match cache {
+            CachedFrame::Bgra { data, width, height, stride } => {
+                encoder.force_keyframe();
+                encoder.encode_bgra(data, *width, *height, *stride)
+            }
+            CachedFrame::PixelBuffer(buf, _w, _h) => {
+                encoder.encode_pixel_buffer(buf.as_ptr(), true)
+            }
+        };
+
+        match result {
+            Ok(encoded) if !encoded.data.is_empty() => {
+                let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                tracing::debug!(
+                    h264_bytes = encoded.data.len(),
+                    encode_ms = format!("{:.1}", encode_ms),
+                    idle_frames = self.idle_frame_count,
+                    "Sent idle IDR keepalive"
+                );
+                self.last_idr_time = Instant::now();
+                let (vis_w, vis_h) = match cache {
+                    CachedFrame::Bgra { width, height, .. } => (*width as u16, *height as u16),
+                    CachedFrame::PixelBuffer(_, w, h) => (*w as u16, *h as u16),
+                };
+                Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                    h264_data: encoded.data,
+                    width: vis_w,
+                    height: vis_h,
+                    enc_width: encoded.width as u16,
+                    enc_height: encoded.height as u16,
+                    is_keyframe: true,
+                    h264_aux: None,
+                }))
+            }
+            Ok(_) => {
+                tracing::warn!("Idle IDR encode returned empty data");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Idle IDR encode failed: {e}");
+                None
+            }
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
@@ -271,10 +423,11 @@ impl MacDisplayUpdates {
                         match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
                             Ok(encoded) if !encoded.data.is_empty() => {
                                 let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                let is_keyframe = encoded.is_keyframe;
                                 tracing::debug!(
                                     display_frame = self.display_frame_count,
                                     h264_bytes = encoded.data.len(),
-                                    is_keyframe = encoded.is_keyframe,
+                                    is_keyframe,
                                     encode_ms = format!("{:.1}", encode_ms),
                                     "Display: sending zero-copy GFX frame"
                                 );
@@ -292,13 +445,20 @@ impl MacDisplayUpdates {
                                         "encode overload — skipping next frame"
                                     );
                                 }
+                                // Cache frame for idle IDR re-encoding
+                                self.last_frame_cache = Some(CachedFrame::PixelBuffer(
+                                    buf.clone_ref(), frame.width, frame.height,
+                                ));
+                                if is_keyframe {
+                                    self.last_idr_time = Instant::now();
+                                }
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
                                     height: frame.height as u16,
                                     enc_width: encoded.width as u16,
                                     enc_height: encoded.height as u16,
-                                    is_keyframe: encoded.is_keyframe,
+                                    is_keyframe,
                                     h264_aux: None,
                                 })));
                             }
@@ -324,11 +484,12 @@ impl MacDisplayUpdates {
                         Ok(encoded) if !encoded.main_view.data.is_empty() => {
                             let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             let total_bytes = encoded.main_view.data.len() + encoded.aux_view.data.len();
+                            let is_keyframe = encoded.main_view.is_keyframe;
                             tracing::debug!(
                                 display_frame = self.display_frame_count,
                                 main_bytes = encoded.main_view.data.len(),
                                 aux_bytes = encoded.aux_view.data.len(),
-                                is_keyframe = encoded.main_view.is_keyframe,
+                                is_keyframe,
                                 encode_ms = format!("{:.1}", encode_ms),
                                 "Display: sending AVC444 GFX frame"
                             );
@@ -346,13 +507,20 @@ impl MacDisplayUpdates {
                                     "encode overload — skipping next frame"
                                 );
                             }
+                            // Cache frame for idle IDR re-encoding
+                            self.last_frame_cache = Some(CachedFrame::Bgra {
+                                data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+                            });
+                            if is_keyframe {
+                                self.last_idr_time = Instant::now();
+                            }
                             return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
                                 width: frame.width as u16,
                                 height: frame.height as u16,
                                 enc_width: encoded.main_view.width as u16,
                                 enc_height: encoded.main_view.height as u16,
-                                is_keyframe: encoded.main_view.is_keyframe,
+                                is_keyframe,
                                 h264_aux: Some(encoded.aux_view.data),
                             })));
                         }
@@ -374,10 +542,11 @@ impl MacDisplayUpdates {
                 match encoder.encode_bgra(bgra, frame.width, frame.height, frame.stride) {
                     Ok(encoded) if !encoded.data.is_empty() => {
                         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        let is_keyframe = encoded.is_keyframe;
                         tracing::debug!(
                             display_frame = self.display_frame_count,
                             h264_bytes = encoded.data.len(),
-                            is_keyframe = encoded.is_keyframe,
+                            is_keyframe,
                             encode_ms = format!("{:.1}", encode_ms),
                             "Display: sending GFX frame"
                         );
@@ -395,13 +564,20 @@ impl MacDisplayUpdates {
                                 "encode overload — skipping next frame"
                             );
                         }
+                        // Cache frame for idle IDR re-encoding
+                        self.last_frame_cache = Some(CachedFrame::Bgra {
+                            data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+                        });
+                        if is_keyframe {
+                            self.last_idr_time = Instant::now();
+                        }
                         return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
                             width: frame.width as u16,
                             height: frame.height as u16,
                             enc_width: encoded.width as u16,
                             enc_height: encoded.height as u16,
-                            is_keyframe: encoded.is_keyframe,
+                            is_keyframe,
                             h264_aux: None,
                         })));
                     }

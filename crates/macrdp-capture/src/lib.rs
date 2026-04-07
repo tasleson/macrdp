@@ -613,6 +613,15 @@ impl SafePixelBuffer {
         self.ptr
     }
 
+    /// Create a new `SafePixelBuffer` that shares the same underlying
+    /// `CVPixelBuffer`, incrementing its retain count.
+    pub fn clone_ref(&self) -> Self {
+        unsafe {
+            CVPixelBufferRetain(self.ptr);
+        }
+        Self { ptr: self.ptr }
+    }
+
     /// Lock the pixel buffer, copy NV12 plane data out, and unlock.
     ///
     /// This is the software-encoding path: we lock the buffer read-only,
