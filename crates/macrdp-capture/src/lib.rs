@@ -112,7 +112,7 @@ pub struct CaptureConfig {
 
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
-    _stream: SCStream,
+    stream: SCStream,
     frame_rx: mpsc::Receiver<CaptureEvent>,
 }
 
@@ -446,7 +446,7 @@ impl ScreenCapturer {
         );
 
         Ok(Self {
-            _stream: stream,
+            stream,
             frame_rx,
         })
     }
@@ -459,6 +459,22 @@ impl ScreenCapturer {
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
     pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
         self.frame_rx.try_recv().ok()
+    }
+
+    /// Update capture frame rate at runtime.
+    /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
+    pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
+        use screencapturekit::cm::CMTime;
+        use screencapturekit::prelude::SCStreamConfiguration;
+
+        let interval = CMTime::new(1, fps as i32);
+        let mut config = SCStreamConfiguration::new();
+        config.set_minimum_frame_interval(&interval);
+        self.stream
+            .update_configuration(&config)
+            .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
+        tracing::info!(fps, "Capture frame rate updated");
+        Ok(())
     }
 }
 
