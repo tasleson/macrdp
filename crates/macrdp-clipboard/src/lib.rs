@@ -17,7 +17,7 @@ use ironrdp_core::{impl_as_any, IntoOwned};
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use crate::formats::uti_to_rdp_format_id;
+use crate::formats::{uti_to_rdp_format_id, png_to_dib, dib_to_png};
 use crate::pasteboard::PasteboardBridge;
 
 /// macOS clipboard backend implementing the CLIPRDR protocol.
@@ -150,7 +150,19 @@ impl CliprdrBackend for MacClipboardBackend {
                     None => FormatDataResponse::new_error(),
                 }
             }
-            // CF_DIB will be added in Task 10
+            8 => {
+                // CF_DIB — convert macOS image to Windows DIB
+                match pb.read_image() {
+                    Some(png_data) => match png_to_dib(&png_data) {
+                        Ok(dib) => FormatDataResponse::new_data(dib),
+                        Err(e) => {
+                            tracing::warn!("Failed to convert image to DIB: {e}");
+                            FormatDataResponse::new_error()
+                        }
+                    },
+                    None => FormatDataResponse::new_error(),
+                }
+            }
             _ => {
                 tracing::warn!(format_id, "Unsupported clipboard format requested");
                 FormatDataResponse::new_error()
@@ -179,7 +191,20 @@ impl CliprdrBackend for MacClipboardBackend {
             return;
         }
 
-        // Image/file handling will be added in later tasks
+        // Try to decode as DIB image
+        let data = response.data();
+        if data.len() >= formats::BITMAPINFOHEADER_SIZE {
+            let header_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if header_size == 40 {
+                if let Ok(png_data) = dib_to_png(data) {
+                    let pb = PasteboardBridge::new();
+                    let new_count = pb.write_image(&png_data);
+                    self.last_change_count.store(new_count, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+
         tracing::debug!(
             "Unhandled format data response ({} bytes)",
             response.data().len()
