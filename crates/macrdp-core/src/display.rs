@@ -191,6 +191,8 @@ impl RdpServerDisplay for MacDisplay {
             last_frame_cache: None,
             bitrate_ctrl,
             last_applied_fps: initial_fps,
+            has_pending_submit: false,
+            pending_frame_time: None,
         }))
     }
 }
@@ -223,6 +225,10 @@ struct MacDisplayUpdates {
     bitrate_ctrl: BitrateController,
     /// Last fps value applied to the capturer (to avoid redundant updates).
     last_applied_fps: u32,
+    /// Whether a pipelined encode has been submitted and not yet collected.
+    has_pending_submit: bool,
+    /// Timestamp of the pending pipelined submit (for encode-time measurement).
+    pending_frame_time: Option<Instant>,
 }
 
 #[async_trait::async_trait]
@@ -320,6 +326,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 macrdp_capture::CaptureEvent::Frame(f) => {
                     // Desktop became active — reset idle counter
                     if self.idle_frame_count > 0 {
+                        // Collect any pending pipelined frame before recovery
+                        if self.has_pending_submit {
+                            let _ = self.collect_and_send_pending(0, 0);
+                        }
+
                         tracing::debug!(
                             idle_frames = self.idle_frame_count,
                             "Desktop active again — forcing keyframe for clean recovery"
@@ -456,6 +467,70 @@ impl MacDisplayUpdates {
         }
     }
 
+    /// Collect a previously submitted async (pipelined) encode result and build a GFX DisplayUpdate.
+    fn collect_and_send_pending(&mut self, frame_width: u16, frame_height: u16) -> Result<Option<DisplayUpdate>> {
+        let encoder = match &mut self.encoder {
+            Some(e) if e.supports_pipelining() => e,
+            _ => return Ok(None),
+        };
+
+        let timeout = std::time::Duration::from_millis(32);
+        match encoder.collect_encoded(timeout)? {
+            Some(encoded) if !encoded.data.is_empty() => {
+                let encode_ms = self.pending_frame_time
+                    .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                let is_keyframe = encoded.is_keyframe;
+
+                tracing::debug!(
+                    h264_bytes = encoded.data.len(),
+                    is_keyframe,
+                    encode_ms = format!("{:.1}", encode_ms),
+                    "Display: collected pipelined GFX frame"
+                );
+                {
+                    let mut st = self.gfx_state.lock().unwrap();
+                    st.last_encode_ms = encode_ms;
+                    st.last_frame_bytes = encoded.data.len() as u32;
+                }
+                self.bitrate_ctrl.record_frame(crate::bitrate_controller::FrameStats {
+                    encode_ms,
+                    frame_bytes: encoded.data.len() as u32,
+                    is_keyframe,
+                });
+                self.apply_adaptive_decision();
+
+                if is_keyframe {
+                    self.last_idr_time = Instant::now();
+                }
+
+                self.has_pending_submit = false;
+                self.pending_frame_time = None;
+
+                Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                    h264_data: encoded.data,
+                    width: frame_width,
+                    height: frame_height,
+                    enc_width: encoded.width as u16,
+                    enc_height: encoded.height as u16,
+                    is_keyframe,
+                    h264_aux: None,
+                })))
+            }
+            Some(_) => {
+                self.has_pending_submit = false;
+                self.pending_frame_time = None;
+                Ok(Some(DisplayUpdate::DefaultPointer))
+            }
+            None => {
+                tracing::warn!("Pipelined collect timed out — frame lost");
+                self.has_pending_submit = false;
+                self.pending_frame_time = None;
+                Ok(Some(DisplayUpdate::DefaultPointer))
+            }
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
@@ -474,7 +549,66 @@ impl MacDisplayUpdates {
         };
 
         if gfx_ready {
-            // GFX H.264 path — always send at capture rate, never block on acks
+            // ── Pipelining fast-path (checked BEFORE borrowing encoder long-term) ──
+            // Check pipelining support with a short borrow, then handle collect/submit
+            // using &mut self methods that don't conflict with the encoder borrow.
+            let supports_pipeline = self.encoder.as_ref().map_or(false, |e| e.supports_pipelining());
+
+            if supports_pipeline {
+                match &frame.data {
+                    FrameData::PixelBuffer(buf) => {
+                        // Pipeline mode: collect previous + submit current
+                        let prev_update = if self.has_pending_submit {
+                            self.collect_and_send_pending(frame.width as u16, frame.height as u16)?
+                        } else {
+                            None
+                        };
+
+                        let t0_pipe = Instant::now();
+                        self.encoder.as_mut().unwrap().submit_pixel_buffer(buf.as_ptr())?;
+                        self.has_pending_submit = true;
+                        self.pending_frame_time = Some(t0_pipe);
+                        self.display_frame_count += 1;
+
+                        // Cache for idle IDR
+                        self.last_frame_cache = Some(CachedFrame::PixelBuffer(
+                            buf.clone_ref(), frame.width, frame.height,
+                        ));
+
+                        // Return previous frame's result (first frame returns DefaultPointer)
+                        return Ok(prev_update.or(Some(DisplayUpdate::DefaultPointer)));
+                    }
+                    FrameData::Raw(_) => {
+                        // AVC444 stays synchronous — only pipeline AVC420.
+                        // If use_444, fall through to the synchronous block below.
+                        if !use_444 || !self.encoder.as_ref().unwrap().supports_444() {
+                            let bgra = frame.data.as_bgra_bytes().unwrap();
+
+                            // AVC420 pipeline: collect previous + submit current
+                            let prev_update = if self.has_pending_submit {
+                                self.collect_and_send_pending(frame.width as u16, frame.height as u16)?
+                            } else {
+                                None
+                            };
+
+                            let t0_pipe = Instant::now();
+                            self.encoder.as_mut().unwrap().submit_bgra(bgra, frame.width, frame.height, frame.stride)?;
+                            self.has_pending_submit = true;
+                            self.pending_frame_time = Some(t0_pipe);
+                            self.display_frame_count += 1;
+
+                            self.last_frame_cache = Some(CachedFrame::Bgra {
+                                data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+                            });
+
+                            return Ok(prev_update.or(Some(DisplayUpdate::DefaultPointer)));
+                        }
+                        // else: AVC444 requested — fall through to synchronous block
+                    }
+                }
+            }
+
+            // ── Synchronous path (original code, also fallback when !supports_pipeline) ──
             if let Some(encoder) = &mut self.encoder {
                 self.display_frame_count += 1;
                 let t0 = std::time::Instant::now();
@@ -482,7 +616,7 @@ impl MacDisplayUpdates {
                 // Route based on frame data type
                 match &frame.data {
                     FrameData::PixelBuffer(buf) => {
-                        // Zero-copy VT path — encode CVPixelBuffer directly
+                        // Zero-copy VT path — synchronous encode
                         match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
                             Ok(encoded) if !encoded.data.is_empty() => {
                                 let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
