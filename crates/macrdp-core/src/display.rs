@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::bitrate_controller::{BitrateController, FrameStats, NetworkQuality, is_private_ip};
+use crate::perf_stats::SharedPerfStats;
 
 /// Maximum tile size for bitmap updates
 const TILE_SIZE: u16 = 64;
@@ -86,6 +87,8 @@ pub struct MacDisplay {
     gfx_state: Arc<Mutex<GfxState>>,
     /// Optional audio channel sender for SCK audio capture
     audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    /// Shared performance statistics collector (None = disabled)
+    perf_stats: Option<SharedPerfStats>,
 }
 
 impl MacDisplay {
@@ -98,6 +101,7 @@ impl MacDisplay {
         bitrate_override: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        perf_stats: Option<SharedPerfStats>,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
@@ -108,6 +112,7 @@ impl MacDisplay {
             fixed_resolution,
             frame_rate, quality, encoder_pref, mode_444, base_bitrate, gfx_state,
             audio_tx,
+            perf_stats,
         }
     }
 }
@@ -193,6 +198,7 @@ impl RdpServerDisplay for MacDisplay {
             last_applied_fps: initial_fps,
             has_pending_submit: false,
             pending_frame_time: None,
+            perf_stats: self.perf_stats.clone(),
         }))
     }
 }
@@ -229,6 +235,8 @@ struct MacDisplayUpdates {
     has_pending_submit: bool,
     /// Timestamp of the pending pipelined submit (for encode-time measurement).
     pending_frame_time: Option<Instant>,
+    /// Shared performance statistics collector (None = disabled)
+    perf_stats: Option<SharedPerfStats>,
 }
 
 #[async_trait::async_trait]
@@ -444,6 +452,9 @@ impl MacDisplayUpdates {
             let gfx = self.gfx_state.lock().unwrap();
             if gfx.rtt_ewma_ms > 0.0 {
                 self.bitrate_ctrl.update_network_rtt(gfx.rtt_ewma_ms);
+                if let Some(ps) = &self.perf_stats {
+                    ps.lock().unwrap().record_rtt(gfx.rtt_ewma_ms);
+                }
             }
         }
 
@@ -498,6 +509,9 @@ impl MacDisplayUpdates {
                     frame_bytes: encoded.data.len() as u32,
                     is_keyframe,
                 });
+                if let Some(ps) = &self.perf_stats {
+                    ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
+                }
                 self.apply_adaptive_decision();
 
                 if is_keyframe {
@@ -638,6 +652,9 @@ impl MacDisplayUpdates {
                                     frame_bytes: encoded.data.len() as u32,
                                     is_keyframe,
                                 });
+                                if let Some(ps) = &self.perf_stats {
+                                    ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
+                                }
                                 self.apply_adaptive_decision();
                                 let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                                 if encode_ms > frame_interval_ms * 0.8 {
@@ -706,6 +723,9 @@ impl MacDisplayUpdates {
                                 frame_bytes: total_bytes as u32,
                                 is_keyframe,
                             });
+                            if let Some(ps) = &self.perf_stats {
+                                ps.lock().unwrap().record_frame(encode_ms, total_bytes as u32, is_keyframe);
+                            }
                             self.apply_adaptive_decision();
                             let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                             if encode_ms > frame_interval_ms * 0.8 {
@@ -769,6 +789,9 @@ impl MacDisplayUpdates {
                             frame_bytes: encoded.data.len() as u32,
                             is_keyframe,
                         });
+                        if let Some(ps) = &self.perf_stats {
+                            ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
+                        }
                         self.apply_adaptive_decision();
                         let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                         if encode_ms > frame_interval_ms * 0.8 {

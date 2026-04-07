@@ -416,6 +416,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             bitrate_override,
             Arc::clone(&args.gfx_state),
             audio_tx,
+            None, // perf_stats: not exposed via macrdp-core API yet
         );
 
         // Build RDP server (this is the !Send type)

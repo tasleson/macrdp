@@ -20,6 +20,10 @@ pub struct Cli {
     /// Log level: trace, debug, info, warn, error
     #[arg(long)]
     pub log_level: Option<String>,
+
+    /// Enable performance statistics collection and print summary on exit
+    #[arg(long, default_value_t = false)]
+    pub perf: bool,
 }
 
 /// Audio forwarding configuration

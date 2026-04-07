@@ -1,6 +1,7 @@
 mod config;
 mod display;
 mod handler;
+mod perf_stats;
 mod tls;
 
 use anyhow::{Context, Result};
@@ -159,8 +160,16 @@ async fn main() -> Result<()> {
     // Bitrate override: convert Mbps to bps, or None for auto-calculate
     let bitrate_override = config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
 
+    // Create shared performance stats (enabled via --perf flag)
+    let perf_stats = if cli.perf {
+        tracing::info!("Performance statistics collection enabled (--perf)");
+        Some(perf_stats::new_shared(true))
+    } else {
+        None
+    };
+
     // Create display with shared GFX state
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state), audio_tx);
+    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state), audio_tx, perf_stats.clone());
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 
@@ -214,9 +223,20 @@ async fn main() -> Result<()> {
     tracing::info!(%bind_addr, "RDP server listening");
     tracing::info!("Connect using an RDP client (e.g., Windows mstsc or Microsoft Remote Desktop)");
 
-    server.run().await.context("RDP server error")?;
+    // Run server; on Ctrl-C print perf summary if enabled
+    let result = tokio::select! {
+        res = server.run() => res.context("RDP server error"),
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received Ctrl-C — shutting down");
+            Ok(())
+        }
+    };
 
-    Ok(())
+    if let Some(ps) = &perf_stats {
+        ps.lock().unwrap().print_summary();
+    }
+
+    result
 }
 
 /// Check and request all required macOS permissions at startup.

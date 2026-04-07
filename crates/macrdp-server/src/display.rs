@@ -11,6 +11,8 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+use crate::perf_stats::SharedPerfStats;
+
 /// Maximum tile size for bitmap updates
 const TILE_SIZE: u16 = 64;
 
@@ -83,6 +85,8 @@ pub struct MacDisplay {
     gfx_state: Arc<Mutex<GfxState>>,
     /// Optional audio channel sender for SCK audio capture
     audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    /// Shared performance statistics collector (None = disabled)
+    perf_stats: Option<SharedPerfStats>,
 }
 
 impl MacDisplay {
@@ -95,6 +99,7 @@ impl MacDisplay {
         bitrate_override: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        perf_stats: Option<SharedPerfStats>,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
@@ -105,6 +110,7 @@ impl MacDisplay {
             fixed_resolution,
             frame_rate, quality, encoder_pref, mode_444, base_bitrate, gfx_state,
             audio_tx,
+            perf_stats,
         }
     }
 }
@@ -173,6 +179,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             display_frame_count: 0,
             skip_next_frame: false,
+            perf_stats: self.perf_stats.clone(),
         }))
     }
 }
@@ -186,6 +193,8 @@ struct MacDisplayUpdates {
     mode_444: bool,
     display_frame_count: u64,
     skip_next_frame: bool,
+    /// Shared performance statistics collector (None = disabled)
+    perf_stats: Option<SharedPerfStats>,
 }
 
 #[async_trait::async_trait]
@@ -271,10 +280,11 @@ impl MacDisplayUpdates {
                         match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
                             Ok(encoded) if !encoded.data.is_empty() => {
                                 let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                let is_keyframe = encoded.is_keyframe;
                                 tracing::debug!(
                                     display_frame = self.display_frame_count,
                                     h264_bytes = encoded.data.len(),
-                                    is_keyframe = encoded.is_keyframe,
+                                    is_keyframe,
                                     encode_ms = format!("{:.1}", encode_ms),
                                     "Display: sending zero-copy GFX frame"
                                 );
@@ -282,6 +292,9 @@ impl MacDisplayUpdates {
                                     let mut st = self.gfx_state.lock().unwrap();
                                     st.last_encode_ms = encode_ms;
                                     st.last_frame_bytes = encoded.data.len() as u32;
+                                }
+                                if let Some(ps) = &self.perf_stats {
+                                    ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
                                 }
                                 let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                                 if encode_ms > frame_interval_ms * 0.8 {
@@ -298,7 +311,7 @@ impl MacDisplayUpdates {
                                     height: frame.height as u16,
                                     enc_width: encoded.width as u16,
                                     enc_height: encoded.height as u16,
-                                    is_keyframe: encoded.is_keyframe,
+                                    is_keyframe,
                                     h264_aux: None,
                                 })));
                             }
@@ -324,11 +337,12 @@ impl MacDisplayUpdates {
                         Ok(encoded) if !encoded.main_view.data.is_empty() => {
                             let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             let total_bytes = encoded.main_view.data.len() + encoded.aux_view.data.len();
+                            let is_keyframe = encoded.main_view.is_keyframe;
                             tracing::debug!(
                                 display_frame = self.display_frame_count,
                                 main_bytes = encoded.main_view.data.len(),
                                 aux_bytes = encoded.aux_view.data.len(),
-                                is_keyframe = encoded.main_view.is_keyframe,
+                                is_keyframe,
                                 encode_ms = format!("{:.1}", encode_ms),
                                 "Display: sending AVC444 GFX frame"
                             );
@@ -336,6 +350,9 @@ impl MacDisplayUpdates {
                                 let mut st = self.gfx_state.lock().unwrap();
                                 st.last_encode_ms = encode_ms;
                                 st.last_frame_bytes = total_bytes as u32;
+                            }
+                            if let Some(ps) = &self.perf_stats {
+                                ps.lock().unwrap().record_frame(encode_ms, total_bytes as u32, is_keyframe);
                             }
                             let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                             if encode_ms > frame_interval_ms * 0.8 {
@@ -352,7 +369,7 @@ impl MacDisplayUpdates {
                                 height: frame.height as u16,
                                 enc_width: encoded.main_view.width as u16,
                                 enc_height: encoded.main_view.height as u16,
-                                is_keyframe: encoded.main_view.is_keyframe,
+                                is_keyframe,
                                 h264_aux: Some(encoded.aux_view.data),
                             })));
                         }
@@ -374,10 +391,11 @@ impl MacDisplayUpdates {
                 match encoder.encode_bgra(bgra, frame.width, frame.height, frame.stride) {
                     Ok(encoded) if !encoded.data.is_empty() => {
                         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        let is_keyframe = encoded.is_keyframe;
                         tracing::debug!(
                             display_frame = self.display_frame_count,
                             h264_bytes = encoded.data.len(),
-                            is_keyframe = encoded.is_keyframe,
+                            is_keyframe,
                             encode_ms = format!("{:.1}", encode_ms),
                             "Display: sending GFX frame"
                         );
@@ -385,6 +403,9 @@ impl MacDisplayUpdates {
                             let mut st = self.gfx_state.lock().unwrap();
                             st.last_encode_ms = encode_ms;
                             st.last_frame_bytes = encoded.data.len() as u32;
+                        }
+                        if let Some(ps) = &self.perf_stats {
+                            ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
                         }
                         let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                         if encode_ms > frame_interval_ms * 0.8 {
@@ -401,7 +422,7 @@ impl MacDisplayUpdates {
                             height: frame.height as u16,
                             enc_width: encoded.width as u16,
                             enc_height: encoded.height as u16,
-                            is_keyframe: encoded.is_keyframe,
+                            is_keyframe,
                             h264_aux: None,
                         })));
                     }

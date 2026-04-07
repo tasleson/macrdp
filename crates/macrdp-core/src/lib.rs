@@ -6,6 +6,7 @@ pub mod config;
 pub mod display;
 pub mod handler;
 pub mod permissions;
+pub mod perf_stats;
 pub mod server;
 pub mod tls;
 
