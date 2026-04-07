@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::bitrate_controller::{BitrateController, FrameStats, NetworkType, detect_network_phase1};
+use crate::bitrate_controller::{BitrateController, FrameStats, NetworkQuality, is_private_ip};
 
 /// Maximum tile size for bitmap updates
 const TILE_SIZE: u16 = 64;
@@ -171,11 +171,11 @@ impl RdpServerDisplay for MacDisplay {
             let gfx = self.gfx_state.lock().unwrap();
             gfx.peer_addr
         };
-        let is_lan = peer_addr
-            .map(|ip| detect_network_phase1(ip) == NetworkType::Lan)
-            .unwrap_or(false);
+        let network = peer_addr
+            .map(|ip| NetworkQuality::from_ip(is_private_ip(ip)))
+            .unwrap_or(NetworkQuality::from_ip(false));
         let initial_fps = capture_config.frame_rate;
-        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, is_lan);
+        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
         Ok(Box::new(MacDisplayUpdates {
             capturer,
@@ -432,7 +432,7 @@ impl MacDisplayUpdates {
         {
             let gfx = self.gfx_state.lock().unwrap();
             if gfx.rtt_ewma_ms > 0.0 {
-                self.bitrate_ctrl.update_network_type(gfx.rtt_ewma_ms);
+                self.bitrate_ctrl.update_network_rtt(gfx.rtt_ewma_ms);
             }
         }
 
