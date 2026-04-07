@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use crate::bitrate_controller::{BitrateController, FrameStats, NetworkType, detect_network_phase1};
+
 /// Maximum tile size for bitmap updates
 const TILE_SIZE: u16 = 64;
 
@@ -165,6 +167,16 @@ impl RdpServerDisplay for MacDisplay {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
 
+        let peer_addr = {
+            let gfx = self.gfx_state.lock().unwrap();
+            gfx.peer_addr
+        };
+        let is_lan = peer_addr
+            .map(|ip| detect_network_phase1(ip) == NetworkType::Lan)
+            .unwrap_or(false);
+        let initial_fps = capture_config.frame_rate;
+        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, is_lan);
+
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
@@ -177,6 +189,8 @@ impl RdpServerDisplay for MacDisplay {
             idle_frame_count: 0,
             last_idr_time: Instant::now(),
             last_frame_cache: None,
+            bitrate_ctrl,
+            last_applied_fps: initial_fps,
         }))
     }
 }
@@ -205,6 +219,10 @@ struct MacDisplayUpdates {
     last_idr_time: Instant,
     /// Cached last frame for idle IDR re-encoding.
     last_frame_cache: Option<CachedFrame>,
+    /// Adaptive bitrate/fps controller.
+    bitrate_ctrl: BitrateController,
+    /// Last fps value applied to the capturer (to avoid redundant updates).
+    last_applied_fps: u32,
 }
 
 #[async_trait::async_trait]
@@ -309,6 +327,17 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         if let Some(enc) = &mut self.encoder {
                             enc.force_keyframe();
                         }
+
+                        // Reset BitrateController and restore initial bitrate/fps
+                        self.bitrate_ctrl.on_idle_recovery();
+                        if let Some(enc) = &mut self.encoder {
+                            enc.set_bitrate(self.bitrate_ctrl.current_bitrate());
+                        }
+                        let target_fps = self.bitrate_ctrl.target_fps();
+                        if self.last_applied_fps != target_fps {
+                            let _ = self.capturer.set_frame_rate(target_fps);
+                            self.last_applied_fps = target_fps;
+                        }
                     }
                     self.idle_frame_count = 0;
                     f
@@ -393,6 +422,40 @@ impl MacDisplayUpdates {
         }
     }
 
+    /// Evaluate the BitrateController window and apply any adaptive bitrate/fps changes.
+    fn apply_adaptive_decision(&mut self) {
+        if !self.bitrate_ctrl.should_evaluate() {
+            return;
+        }
+
+        // Phase 2 RTT check
+        {
+            let gfx = self.gfx_state.lock().unwrap();
+            if gfx.rtt_ewma_ms > 0.0 {
+                self.bitrate_ctrl.update_network_type(gfx.rtt_ewma_ms);
+            }
+        }
+
+        let decision = self.bitrate_ctrl.evaluate();
+
+        if let Some(ref mut enc) = self.encoder {
+            enc.set_bitrate(decision.bitrate_bps);
+        }
+
+        if decision.fps != self.last_applied_fps {
+            if let Err(e) = self.capturer.set_frame_rate(decision.fps) {
+                tracing::warn!("Failed to update frame rate: {e}");
+            } else {
+                self.last_applied_fps = decision.fps;
+                tracing::info!(
+                    fps = decision.fps,
+                    bitrate_mbps = decision.bitrate_bps as f64 / 1_000_000.0,
+                    "Adaptive: fps/bitrate updated"
+                );
+            }
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
@@ -436,6 +499,12 @@ impl MacDisplayUpdates {
                                     st.last_encode_ms = encode_ms;
                                     st.last_frame_bytes = encoded.data.len() as u32;
                                 }
+                                self.bitrate_ctrl.record_frame(FrameStats {
+                                    encode_ms,
+                                    frame_bytes: encoded.data.len() as u32,
+                                    is_keyframe,
+                                });
+                                self.apply_adaptive_decision();
                                 let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                                 if encode_ms > frame_interval_ms * 0.8 {
                                     self.skip_next_frame = true;
@@ -498,6 +567,12 @@ impl MacDisplayUpdates {
                                 st.last_encode_ms = encode_ms;
                                 st.last_frame_bytes = total_bytes as u32;
                             }
+                            self.bitrate_ctrl.record_frame(FrameStats {
+                                encode_ms,
+                                frame_bytes: total_bytes as u32,
+                                is_keyframe,
+                            });
+                            self.apply_adaptive_decision();
                             let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                             if encode_ms > frame_interval_ms * 0.8 {
                                 self.skip_next_frame = true;
@@ -555,6 +630,12 @@ impl MacDisplayUpdates {
                             st.last_encode_ms = encode_ms;
                             st.last_frame_bytes = encoded.data.len() as u32;
                         }
+                        self.bitrate_ctrl.record_frame(FrameStats {
+                            encode_ms,
+                            frame_bytes: encoded.data.len() as u32,
+                            is_keyframe,
+                        });
+                        self.apply_adaptive_decision();
                         let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                         if encode_ms > frame_interval_ms * 0.8 {
                             self.skip_next_frame = true;
