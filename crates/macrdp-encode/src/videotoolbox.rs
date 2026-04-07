@@ -53,6 +53,7 @@ type VTCompressionOutputCallback = extern "C" fn(
 #[link(name = "VideoToolbox", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
+#[link(name = "CoreFoundation", kind = "framework")]
 #[allow(dead_code)]
 extern "C" {
     fn VTCompressionSessionCreate(
