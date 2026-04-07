@@ -142,7 +142,7 @@ impl RdpServerDisplay for MacDisplay {
                 CapturePixelFormat::Bgra
             },
         };
-        let capturer = ScreenCapturer::new(capture_config.clone()).await?;
+        let capturer = ScreenCapturer::new(capture_config.clone(), None).await?;
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(
@@ -198,7 +198,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     let fallback = CgFallbackCapturer::new(&self.capture_config);
                     loop {
                         // Try to restore SCK (faster, has dirty rects)
-                        match ScreenCapturer::new(self.capture_config.clone()).await {
+                        match ScreenCapturer::new(self.capture_config.clone(), None).await {
                             Ok(new_capturer) => {
                                 tracing::info!("SCStream recovered — switching back from CoreGraphics");
                                 self.capturer = new_capturer;

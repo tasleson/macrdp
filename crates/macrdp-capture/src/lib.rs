@@ -1,12 +1,14 @@
 //! macOS screen capture via ScreenCaptureKit
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::prelude::*;
+use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
 use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
@@ -77,6 +79,17 @@ pub struct CapturedFrame {
     pub dirty_rects: Vec<Rect>,
 }
 
+/// Raw audio frame from ScreenCaptureKit audio callback.
+/// Data is interleaved Float32 PCM (L0,R0, L1,R1, ...).
+#[derive(Clone)]
+pub struct AudioFrame {
+    pub data: Vec<f32>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub num_samples: usize,
+    pub timestamp_ms: u64,
+}
+
 /// Configuration for screen capture
 #[derive(Clone)]
 pub struct CaptureConfig {
@@ -92,12 +105,16 @@ pub struct ScreenCapturer {
     frame_rx: mpsc::Receiver<CapturedFrame>,
 }
 
-struct OutputHandler {
+struct VideoOutputHandler {
     frame_tx: mpsc::Sender<CapturedFrame>,
     pixel_format: CapturePixelFormat,
 }
 
-impl SCStreamOutputTrait for OutputHandler {
+struct AudioOutputHandler {
+    audio_tx: Arc<mpsc::Sender<AudioFrame>>,
+}
+
+impl SCStreamOutputTrait for VideoOutputHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
         if of_type != SCStreamOutputType::Screen {
             return;
@@ -111,6 +128,86 @@ impl SCStreamOutputTrait for OutputHandler {
 
         // Non-blocking send — drop frame if channel is full
         let _ = self.frame_tx.try_send(frame);
+    }
+}
+
+impl SCStreamOutputTrait for AudioOutputHandler {
+    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
+        if of_type != SCStreamOutputType::Audio {
+            return;
+        }
+
+        let Some(audio_buffer_list) = sample.audio_buffer_list() else { return };
+
+        let timestamp = sample.presentation_timestamp();
+        let timestamp_ms = if timestamp.timescale > 0 {
+            ((timestamp.value as u128 * 1000) / timestamp.timescale as u128) as u64
+        } else {
+            0
+        };
+
+        // Get sample rate and channel count from format description
+        let (sample_rate, channels) = if let Some(fmt) = sample.format_description() {
+            let sr = fmt.audio_sample_rate().unwrap_or(48000.0) as u32;
+            let ch = fmt.audio_channel_count().unwrap_or(2) as u16;
+            (sr, ch)
+        } else {
+            (48000u32, 2u16)
+        };
+
+        let num_buffers = audio_buffer_list.num_buffers();
+
+        // SCK delivers stereo as a single interleaved buffer (num_buffers == 1, number_channels == 2)
+        // or as separate per-channel buffers (num_buffers == 2, number_channels == 1 each).
+        let interleaved_data = if num_buffers <= 1 {
+            if let Some(buf) = audio_buffer_list.get(0) {
+                let raw = buf.data();
+                let samples: &[f32] = unsafe {
+                    std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4)
+                };
+                samples.to_vec()
+            } else {
+                return;
+            }
+        } else {
+            // Non-interleaved: one buffer per channel — interleave manually
+            let channel_bufs: Vec<&[f32]> = (0..num_buffers)
+                .filter_map(|i| audio_buffer_list.get(i))
+                .map(|buf| {
+                    let raw = buf.data();
+                    unsafe {
+                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4)
+                    }
+                })
+                .collect();
+
+            if channel_bufs.is_empty() {
+                return;
+            }
+            let n = channel_bufs[0].len();
+            let mut out = Vec::with_capacity(n * channel_bufs.len());
+            for i in 0..n {
+                for ch in &channel_bufs {
+                    out.push(ch[i]);
+                }
+            }
+            out
+        };
+
+        let num_samples = if channels > 0 {
+            interleaved_data.len() / channels as usize
+        } else {
+            interleaved_data.len()
+        };
+
+        let frame = AudioFrame {
+            data: interleaved_data,
+            sample_rate,
+            channels,
+            num_samples,
+            timestamp_ms,
+        };
+        let _ = self.audio_tx.try_send(frame);
     }
 }
 
@@ -246,8 +343,14 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
 }
 
 impl ScreenCapturer {
-    /// Create a new screen capturer for the main display
-    pub async fn new(config: CaptureConfig) -> Result<Self> {
+    /// Create a new screen capturer for the main display.
+    ///
+    /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
+    /// to the provided channel as `AudioFrame` (interleaved Float32 PCM, 48 kHz stereo).
+    pub async fn new(
+        config: CaptureConfig,
+        audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    ) -> Result<Self> {
         // SCShareableContent::get() is synchronous, run in blocking task
         let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
             .await?
@@ -277,6 +380,7 @@ impl ScreenCapturer {
 
         let frame_interval = CMTime::new(1, config.frame_rate as i32);
 
+        let captures_audio = audio_tx.is_some();
         let stream_config = SCStreamConfiguration::new()
             .with_width(actual_width)
             .with_height(actual_height)
@@ -285,18 +389,30 @@ impl ScreenCapturer {
                 CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
                 CapturePixelFormat::Bgra => PixelFormat::BGRA,
             })
-            .with_shows_cursor(true);
+            .with_shows_cursor(true)
+            .with_captures_audio(captures_audio)
+            .with_sample_rate(AudioSampleRate::Rate48000)
+            .with_channel_count(AudioChannelCount::Stereo)
+            .with_excludes_current_process_audio(true);
 
         // Channel for frames: buffer 2 frames to allow for jitter
         let (frame_tx, frame_rx) = mpsc::channel(2);
 
-        let handler = OutputHandler {
+        let video_handler = VideoOutputHandler {
             frame_tx,
             pixel_format: config.pixel_format,
         };
 
         let mut stream = SCStream::new(&filter, &stream_config);
-        stream.add_output_handler(handler, SCStreamOutputType::Screen);
+        stream.add_output_handler(video_handler, SCStreamOutputType::Screen);
+
+        // Register audio handler only if a sender was provided
+        if let Some(tx) = audio_tx {
+            let audio_handler = AudioOutputHandler {
+                audio_tx: Arc::new(tx),
+            };
+            stream.add_output_handler(audio_handler, SCStreamOutputType::Audio);
+        }
 
         stream.start_capture().context("Failed to start capture")?;
 
@@ -305,6 +421,7 @@ impl ScreenCapturer {
             height = actual_height,
             fps = config.frame_rate,
             pixel_format = ?config.pixel_format,
+            audio = captures_audio,
             "Screen capture started"
         );
 
