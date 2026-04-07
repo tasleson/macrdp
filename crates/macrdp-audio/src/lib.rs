@@ -3,15 +3,59 @@ pub mod converter;
 #[cfg(feature = "opus")]
 pub mod opus;
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Mutex;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
-use ironrdp_rdpsnd::server::RdpsndServerHandler;
-#[allow(unused_imports)]
-use ironrdp_server::{ServerEvent, RdpsndServerMessage, SoundServerFactory, ServerEventSender};
+use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
+use ironrdp_server::{ServerEvent, SoundServerFactory, ServerEventSender};
 use macrdp_capture::AudioFrame;
 use tokio::sync::mpsc;
+
+/// Audio processing loop: receives AudioFrames from SCK, converts to S16LE,
+/// and sends RdpsndServerMessage::Wave events.
+async fn audio_loop(
+    mut audio_rx: mpsc::Receiver<AudioFrame>,
+    event_sender: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
+    frame_size_interleaved: usize,
+    channels: u16,
+    sample_rate: u32,
+) {
+    let mut ring_buffer: VecDeque<f32> = VecDeque::with_capacity(frame_size_interleaved * 4);
+    let mut base_timestamp_ms: Option<u64> = None;
+    let mut samples_sent: u64 = 0;
+
+    tracing::info!(
+        frame_size_interleaved,
+        "Audio loop started ({}Hz, {}ch)",
+        sample_rate,
+        channels
+    );
+
+    while let Some(frame) = audio_rx.recv().await {
+        if base_timestamp_ms.is_none() {
+            base_timestamp_ms = Some(frame.timestamp_ms);
+        }
+        ring_buffer.extend(frame.data.iter());
+
+        while ring_buffer.len() >= frame_size_interleaved {
+            let chunk: Vec<f32> = ring_buffer.drain(..frame_size_interleaved).collect();
+            let wave_data = converter::AudioConverter::float32_to_s16le(&chunk);
+
+            let samples_per_ch = frame_size_interleaved / channels as usize;
+            let offset_ms = (samples_sent * 1000) / sample_rate as u64;
+            let ts = base_timestamp_ms.unwrap_or(0) + offset_ms;
+
+            let _ = event_sender.send(ServerEvent::Rdpsnd(
+                RdpsndServerMessage::Wave(wave_data, ts as u32),
+            ));
+
+            samples_sent += samples_per_ch as u64;
+        }
+    }
+    tracing::info!("Audio loop ended");
+}
 
 /// Find best matching server format index given client's supported formats.
 /// Iterates server formats in reverse (higher index = higher priority like Opus).
@@ -106,12 +150,19 @@ impl MacAudioFactory {
 
 impl SoundServerFactory for MacAudioFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
-        let _rx = self.audio_rx.lock().unwrap().take()
+        let rx = self.audio_rx.lock().unwrap().take()
             .expect("audio_rx already taken — build_backend called more than once");
+        let sender = self.event_sender.clone()
+            .expect("event sender not set");
 
-        // TODO Task 4: spawn audio_loop with _rx and event_sender
+        let channels = self.channels;
+        let sample_rate = self.sample_rate;
+        // 20ms frame: sample_rate/50 samples per channel * channels
+        let frame_size_interleaved = (sample_rate as usize / 50) * channels as usize;
 
-        Box::new(MacAudioHandler::new(self.sample_rate, self.channels))
+        tokio::spawn(audio_loop(rx, sender, frame_size_interleaved, channels, sample_rate));
+
+        Box::new(MacAudioHandler::new(sample_rate, channels))
     }
 }
 

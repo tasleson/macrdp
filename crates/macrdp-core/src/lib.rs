@@ -9,5 +9,5 @@ pub mod server;
 pub mod tls;
 
 pub use callbacks::*;
-pub use config::{config_dir, ServerConfig};
+pub use config::{config_dir, AudioConfig, ServerConfig};
 pub use server::{start_server, ServerHandle};

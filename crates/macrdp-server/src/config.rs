@@ -1,5 +1,5 @@
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -20,6 +20,25 @@ pub struct Cli {
     /// Log level: trace, debug, info, warn, error
     #[arg(long)]
     pub log_level: Option<String>,
+}
+
+/// Audio forwarding configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    pub enabled: bool,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: 48000,
+            channels: 2,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +82,9 @@ pub struct ServerConfig {
     /// Seconds between keepalive IDR frames during screen idle (default: 2)
     /// Prevents RDP client timeout when no frames are being sent.
     pub idle_keyframe_sec: Option<u32>,
+    /// Audio forwarding configuration
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +107,7 @@ impl Default for ServerConfig {
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,
+            audio: AudioConfig::default(),
         }
     }
 }

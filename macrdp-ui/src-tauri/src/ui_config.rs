@@ -221,6 +221,7 @@ impl UiConfig {
             chroma_mode: Some(self.chroma_mode.clone()),
             hidpi_scale: Some(self.hidpi_scale),
             bitrate_mbps: Some(self.bitrate_mbps),
+            audio: macrdp_core::AudioConfig::default(),
         }
     }
 }

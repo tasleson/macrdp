@@ -3,6 +3,25 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Audio forwarding configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    pub enabled: bool,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: 48000,
+            channels: 2,
+        }
+    }
+}
+
 /// Server configuration (loaded from TOML, shared between CLI and UI)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -30,6 +49,9 @@ pub struct ServerConfig {
     pub hidpi_scale: Option<u32>,
     /// Target bitrate in Mbps (default: auto-calculated)
     pub bitrate_mbps: Option<u32>,
+    /// Audio forwarding configuration
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 impl Default for ServerConfig {
@@ -50,6 +72,7 @@ impl Default for ServerConfig {
             chroma_mode: None,
             hidpi_scale: None,
             bitrate_mbps: None,
+            audio: AudioConfig::default(),
         }
     }
 }

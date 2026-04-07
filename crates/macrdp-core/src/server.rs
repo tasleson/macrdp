@@ -370,6 +370,26 @@ fn run_server_thread(args: ServerThreadArgs) {
         // Create input handler
         let input_handler = MacInputHandler::new(args.mouse_scale_x, args.mouse_scale_y);
 
+        // Audio setup
+        let (audio_tx, audio_rx) = if args.config.audio.enabled {
+            let (tx, rx) = tokio::sync::mpsc::channel::<macrdp_capture::AudioFrame>(32);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Create audio factory
+        let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
+            if let Some(rx) = audio_rx {
+                Some(Box::new(macrdp_audio::MacAudioFactory::new(
+                    rx,
+                    args.config.audio.sample_rate,
+                    args.config.audio.channels,
+                )))
+            } else {
+                None
+            };
+
         // Create display
         let fixed_resolution = args.config.width > 0 && args.config.height > 0;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
@@ -383,6 +403,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.mode_444,
             bitrate_override,
             Arc::clone(&args.gfx_state),
+            audio_tx,
         );
 
         // Build RDP server (this is the !Send type)
@@ -391,6 +412,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             .with_hybrid(tls_acceptor, tls_identity.pub_key)
             .with_input_handler(input_handler)
             .with_display_handler(display)
+            .with_sound_factory(sound_factory)
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));

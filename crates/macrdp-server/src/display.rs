@@ -5,10 +5,11 @@ use ironrdp_server::{
     RdpServerDisplay, RdpServerDisplayUpdates,
     gfx::GfxState,
 };
-use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
+use macrdp_capture::{AudioFrame, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 /// Maximum tile size for bitmap updates
 const TILE_SIZE: u16 = 64;
@@ -80,6 +81,8 @@ pub struct MacDisplay {
     mode_444: bool,
     base_bitrate: u32,
     gfx_state: Arc<Mutex<GfxState>>,
+    /// Optional audio channel sender for SCK audio capture
+    audio_tx: Option<mpsc::Sender<AudioFrame>>,
 }
 
 impl MacDisplay {
@@ -91,6 +94,7 @@ impl MacDisplay {
         mode_444: bool,
         bitrate_override: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
+        audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
@@ -100,6 +104,7 @@ impl MacDisplay {
             max_width: width, max_height: height,
             fixed_resolution,
             frame_rate, quality, encoder_pref, mode_444, base_bitrate, gfx_state,
+            audio_tx,
         }
     }
 }
@@ -142,7 +147,7 @@ impl RdpServerDisplay for MacDisplay {
                 CapturePixelFormat::Bgra
             },
         };
-        let capturer = ScreenCapturer::new(capture_config.clone(), None).await?;
+        let capturer = ScreenCapturer::new(capture_config.clone(), self.audio_tx.clone()).await?;
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(

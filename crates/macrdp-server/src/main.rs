@@ -121,6 +121,26 @@ async fn main() -> Result<()> {
     // Create input handler with auto-computed mouse scale
     let input_handler = MacInputHandler::new(mouse_scale_x, mouse_scale_y);
 
+    // Audio setup
+    let (audio_tx, audio_rx) = if config.audio.enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel::<macrdp_capture::AudioFrame>(32);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Create audio factory
+    let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
+        if let Some(rx) = audio_rx {
+            Some(Box::new(macrdp_audio::MacAudioFactory::new(
+                rx,
+                config.audio.sample_rate,
+                config.audio.channels,
+            )))
+        } else {
+            None
+        };
+
     // fixed_resolution = true when user explicitly set width/height in config
     let fixed_resolution = config.width > 0 && config.height > 0;
 
@@ -128,7 +148,7 @@ async fn main() -> Result<()> {
     let bitrate_override = config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
 
     // Create display with shared GFX state
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state));
+    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state), audio_tx);
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 
@@ -139,6 +159,7 @@ async fn main() -> Result<()> {
         .with_hybrid(tls_acceptor, tls_identity.pub_key)
         .with_input_handler(input_handler)
         .with_display_handler(display)
+        .with_sound_factory(sound_factory)
         .build();
 
     // Share GFX state with the server
