@@ -201,7 +201,7 @@ fn cf_f64(v: f64) -> CFTypeRef {
 // --- Callback context (shared between encoder thread and VT callback thread) ---
 
 struct CallbackCtx {
-    output: std::sync::Mutex<(Vec<u8>, bool)>, // (nal_data, is_keyframe)
+    output: std::sync::Mutex<Option<(Vec<u8>, bool)>>, // (nal_data, is_keyframe)
     ready: std::sync::Condvar,
     has_data: std::sync::atomic::AtomicBool,
 }
@@ -314,7 +314,7 @@ extern "C" fn encode_callback(
     // Signal data ready
     {
         let mut guard = ctx.output.lock().unwrap();
-        *guard = (annex_b, is_keyframe);
+        *guard = Some((annex_b, is_keyframe));
     }
     ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
     ctx.ready.notify_one();
@@ -390,7 +390,7 @@ impl VtEncoder {
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
 
         let callback_ctx = Arc::new(CallbackCtx {
-            output: std::sync::Mutex::new((Vec::new(), false)),
+            output: std::sync::Mutex::new(None),
             ready: std::sync::Condvar::new(),
             has_data: std::sync::atomic::AtomicBool::new(false),
         });
@@ -939,8 +939,7 @@ impl VtEncoder {
         // Reset callback state
         {
             let mut guard = ctx.output.lock().unwrap();
-            guard.0.clear();
-            guard.1 = false;
+            *guard = None;
             ctx.has_data.store(false, std::sync::atomic::Ordering::Release);
         }
 
@@ -982,8 +981,8 @@ impl VtEncoder {
         }
 
         let result = {
-            let guard = ctx.output.lock().unwrap();
-            (guard.0.clone(), guard.1)
+            let mut guard = ctx.output.lock().unwrap();
+            guard.take().unwrap_or_default()
         };
 
         Ok(result)
