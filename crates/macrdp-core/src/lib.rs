@@ -1,5 +1,6 @@
 //! macrdp-core: unified RDP server library
 
+pub mod bitrate_controller;
 pub mod callbacks;
 pub mod config;
 pub mod display;
