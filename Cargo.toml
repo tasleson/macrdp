@@ -6,6 +6,7 @@ members = [
     "crates/macrdp-input",
     "crates/macrdp-encode",
     "crates/macrdp-audio",
+    "crates/macrdp-clipboard",
 ]
 
 [patch.crates-io]
