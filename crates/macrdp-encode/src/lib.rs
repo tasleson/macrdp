@@ -61,6 +61,24 @@ pub trait VideoEncoder: Send {
 
     /// Whether this encoder supports AVC444 dual-stream encoding
     fn supports_444(&self) -> bool;
+
+    /// Whether this encoder supports async submit/collect pipelining.
+    fn supports_pipelining(&self) -> bool { false }
+
+    /// Submit a BGRA frame for async encoding. Returns immediately.
+    fn submit_bgra(&mut self, _data: &[u8], _width: u32, _height: u32, _stride: usize) -> Result<()> {
+        anyhow::bail!("submit_bgra not supported by this encoder")
+    }
+
+    /// Submit a CVPixelBuffer for async encoding. Returns immediately.
+    fn submit_pixel_buffer(&mut self, _ptr: *mut std::ffi::c_void) -> Result<()> {
+        anyhow::bail!("submit_pixel_buffer not supported by this encoder")
+    }
+
+    /// Collect result from a previous submit. Blocks up to timeout.
+    fn collect_encoded(&mut self, _timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
+        Ok(None)
+    }
 }
 
 /// Align a dimension up to the nearest multiple of 16 (H.264 macroblock size)
