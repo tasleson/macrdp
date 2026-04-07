@@ -345,15 +345,17 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         let framed = TokioFramed::new(stream);
 
-        // Reset GFX state for new connection
+        // Reset GFX state for new connection, preserving peer IP
         {
             let mut gs = self.gfx_state.lock().unwrap();
             let w = gs.width;
             let h = gs.height;
             let avc444_enabled = gs.avc444_enabled;
             *gs = GfxState::new(w, h, avc444_enabled);
+            gs.peer_addr = peer_ip;
         }
 
         let size = self.display.lock().await.size().await;

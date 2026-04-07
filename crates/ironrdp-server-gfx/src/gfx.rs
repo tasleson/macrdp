@@ -167,6 +167,8 @@ pub struct GfxState {
     pub total_bytes_sent: u64,
     /// Time of first frame sent
     pub start_time: Option<std::time::Instant>,
+    /// Client peer IP address (set after TCP connection is established)
+    pub peer_addr: Option<std::net::IpAddr>,
     /// Instantaneous bitrate tracking (per-frame Mbps samples since last log)
     bitrate_samples: Vec<f64>,
     bitrate_max: f64,
@@ -196,6 +198,7 @@ impl GfxState {
             last_frame_bytes: 0,
             total_bytes_sent: 0,
             start_time: None,
+            peer_addr: None,
             bitrate_samples: Vec::new(),
             bitrate_max: 0.0,
             bitrate_min: f64::MAX,
