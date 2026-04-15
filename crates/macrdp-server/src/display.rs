@@ -168,6 +168,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             display_frame_count: 0,
             skip_next_frame: false,
+            last_overload_warn: None,
         }))
     }
 }
@@ -181,6 +182,7 @@ struct MacDisplayUpdates {
     mode_444: bool,
     display_frame_count: u64,
     skip_next_frame: bool,
+    last_overload_warn: Option<std::time::Instant>,
 }
 
 #[async_trait::async_trait]
@@ -230,6 +232,26 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Check encode overload and set skip_next_frame if encoding is keeping up.
+    /// Returns true if the warning was logged (rate-limited to once per second).
+    fn check_overload(&mut self, encode_ms: f64) {
+        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
+        if encode_ms > frame_interval_ms {
+            self.skip_next_frame = true;
+            let should_warn = self.last_overload_warn
+                .map(|t| t.elapsed().as_secs_f64() >= 1.0)
+                .unwrap_or(true);
+            if should_warn {
+                self.last_overload_warn = Some(std::time::Instant::now());
+                tracing::warn!(
+                    encode_ms = format!("{:.1}", encode_ms),
+                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                    "encode overload — skipping next frame"
+                );
+            }
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
@@ -272,15 +294,7 @@ impl MacDisplayUpdates {
                                     st.last_encode_ms = encode_ms;
                                     st.last_frame_bytes = encoded.data.len() as u32;
                                 }
-                                let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.8 {
-                                    self.skip_next_frame = true;
-                                    tracing::warn!(
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                        "encode overload — skipping next frame"
-                                    );
-                                }
+                                self.check_overload(encode_ms);
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
@@ -326,15 +340,7 @@ impl MacDisplayUpdates {
                                 st.last_encode_ms = encode_ms;
                                 st.last_frame_bytes = total_bytes as u32;
                             }
-                            let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                            if encode_ms > frame_interval_ms * 0.8 {
-                                self.skip_next_frame = true;
-                                tracing::warn!(
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                    "encode overload — skipping next frame"
-                                );
-                            }
+                            self.check_overload(encode_ms);
                             return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
                                 width: frame.width as u16,
@@ -375,15 +381,7 @@ impl MacDisplayUpdates {
                             st.last_encode_ms = encode_ms;
                             st.last_frame_bytes = encoded.data.len() as u32;
                         }
-                        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                        if encode_ms > frame_interval_ms * 0.8 {
-                            self.skip_next_frame = true;
-                            tracing::warn!(
-                                encode_ms = format!("{:.1}", encode_ms),
-                                frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                "encode overload — skipping next frame"
-                            );
-                        }
+                        self.check_overload(encode_ms);
                         return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
                             width: frame.width as u16,
