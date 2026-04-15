@@ -169,6 +169,7 @@ impl RdpServerDisplay for MacDisplay {
             display_frame_count: 0,
             skip_next_frame: false,
             last_overload_warn: None,
+            gfx_wait_frames: 0,
         }))
     }
 }
@@ -183,6 +184,8 @@ struct MacDisplayUpdates {
     display_frame_count: u64,
     skip_next_frame: bool,
     last_overload_warn: Option<std::time::Instant>,
+    /// Frame counter for rate-limiting "GFX not ready" diagnostic logs
+    gfx_wait_frames: u64,
 }
 
 #[async_trait::async_trait]
@@ -209,7 +212,6 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                             Err(_) => {
                                 // SCK still unavailable — use CGDisplayCreateImage
                                 if let Some(cg_frame) = fallback.capture_frame() {
-                                    // Send this fallback frame through the normal encoding path
                                     return self.encode_and_send(cg_frame);
                                 }
                                 tokio::time::sleep(fallback.frame_interval()).await;
@@ -220,9 +222,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
             };
             // If another frame is already buffered, skip this one and grab the newer one
-            // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
-                Some(_newer) => continue, // drop older frame, grab newer
+                Some(_newer) => continue,
                 None => break frame,
             }
         };
@@ -260,13 +261,15 @@ impl MacDisplayUpdates {
         }
 
         // Check GFX state and AVC444 negotiation
-        let (gfx_ready, use_444) = {
+        let (gfx_ready, use_444, gfx_hopeless, gfx_channel_open, gfx_caps_confirmed) = {
             let state = self.gfx_state.lock().unwrap();
             let ready = state.is_ready() && self.encoder.is_some();
             let use_444 = self.mode_444
                 && state.avc444_supported
                 && state.avc444_enabled;
-            (ready, use_444)
+            // GFX channel is open and caps confirmed but AVC not supported — will never be ready
+            let hopeless = state.channel_id.is_some() && state.caps_confirmed && !state.avc420_supported;
+            (ready, use_444, hopeless, state.channel_id.is_some(), state.caps_confirmed)
         };
 
         if gfx_ready {
@@ -274,6 +277,13 @@ impl MacDisplayUpdates {
             if let Some(encoder) = &mut self.encoder {
                 self.display_frame_count += 1;
                 let t0 = std::time::Instant::now();
+
+                // Force IDR keyframe on the very first GFX frame so the client decoder
+                // always receives a clean SPS+PPS+IDR to initialize from.
+                if self.display_frame_count == 1 {
+                    tracing::info!("First GFX frame — forcing IDR keyframe for clean decoder init");
+                    encoder.force_keyframe();
+                }
 
                 // Route based on frame data type
                 match &frame.data {
@@ -404,18 +414,47 @@ impl MacDisplayUpdates {
                     }
                 }
             }
-        } else if self.encoder.is_some() {
-            // H.264 encoder exists — never send bitmaps, wait for GFX to become ready.
+        } else if self.encoder.is_some() && !gfx_hopeless {
+            // H.264 encoder exists and GFX channel may still become ready — wait for it.
             // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
+            self.gfx_wait_frames += 1;
+            // Log on first frame and every 300 thereafter (~5s at 60fps) to diagnose white screen
+            if self.gfx_wait_frames == 1 || self.gfx_wait_frames % 300 == 0 {
+                tracing::warn!(
+                    frame = self.gfx_wait_frames,
+                    gfx_channel_open,
+                    gfx_caps_confirmed,
+                    "GFX not ready — waiting for DVC channel/capabilities (white screen until ready)"
+                );
+            }
             return Ok(Some(DisplayUpdate::DefaultPointer));
+        } else if gfx_hopeless {
+            // GFX channel opened and caps confirmed, but client does not support AVC.
+            // Fall through to bitmap path — only works if capture is BGRA (not NV12/PixelBuffer).
+            self.gfx_wait_frames += 1;
+            if self.gfx_wait_frames == 1 || self.gfx_wait_frames % 300 == 0 {
+                tracing::warn!(
+                    frame = self.gfx_wait_frames,
+                    "GFX hopeless (client AVC disabled) — falling back to bitmap path"
+                );
+            }
         }
 
-        // Bitmap path (only when GFX is not available at all)
-        // Requires BGRA raw bytes — PixelBuffer frames should not reach here
+        // Bitmap path (only when GFX is not available at all, or gfx_hopeless with BGRA capture)
+        // Requires BGRA raw bytes — PixelBuffer (NV12) frames cannot be bitmap-encoded.
+        // If gfx_hopeless with NV12 capture, restart the server with --encoder software or
+        // without --encoder hardware to get BGRA frames that can use the bitmap path.
         let bgra_bitmap = match &frame.data {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {
-                tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
+                if gfx_hopeless {
+                    tracing::warn!(
+                        "GFX hopeless + NV12 capture: cannot bitmap-encode PixelBuffer frames. \
+                         Use software encoder or BGRA capture to get screen output."
+                    );
+                } else {
+                    tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
+                }
                 return Ok(Some(DisplayUpdate::DefaultPointer));
             }
         };

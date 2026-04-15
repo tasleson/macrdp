@@ -1028,7 +1028,7 @@ impl VideoEncoder for VtEncoder {
 
         self.frame_count += 1;
 
-        // NAL type diagnostic for first 10 frames
+        // NAL type diagnostic for first 10 frames (info level so it's always visible)
         if self.frame_count <= 10 {
             let mut nal_types = Vec::new();
             let mut profile_info = String::new();
@@ -1067,7 +1067,7 @@ impl VideoEncoder for VtEncoder {
                     scan += 1;
                 }
             }
-            tracing::debug!(
+            tracing::info!(
                 frame = self.frame_count,
                 output_bytes = nal_data.len(),
                 is_keyframe,
@@ -1129,6 +1129,34 @@ impl VideoEncoder for VtEncoder {
         }
 
         self.frame_count += 1;
+
+        // NAL diagnostic for first 10 frames (zero-copy path)
+        if self.frame_count <= 10 {
+            let mut nal_types = Vec::new();
+            let mut scan = 0usize;
+            while scan + 4 < nal_data.len() {
+                if nal_data[scan] == 0 && nal_data[scan+1] == 0 && nal_data[scan+2] == 0 && nal_data[scan+3] == 1 {
+                    scan += 4;
+                    if scan < nal_data.len() {
+                        let nal_type = nal_data[scan] & 0x1F;
+                        let nal_name = match nal_type {
+                            1 => "P-slice", 5 => "IDR", 6 => "SEI",
+                            7 => "SPS", 8 => "PPS", 9 => "AUD", _ => "other",
+                        };
+                        nal_types.push(format!("{}({})", nal_name, nal_type));
+                    }
+                } else {
+                    scan += 1;
+                }
+            }
+            tracing::info!(
+                frame = self.frame_count,
+                output_bytes = nal_data.len(),
+                is_keyframe,
+                nal_units = nal_types.join(", "),
+                "VideoToolbox zero-copy NAL diagnostic"
+            );
+        }
 
         Ok(EncodedFrame {
             data: Bytes::from(nal_data),
