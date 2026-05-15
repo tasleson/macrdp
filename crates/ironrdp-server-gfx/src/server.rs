@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsRequest, OwnedFileContentsResponse};
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_core::{decode, encode_vec, impl_as_any};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
@@ -18,7 +19,7 @@ pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
-use ironrdp_svc::{server_encode_svc_messages, StaticChannelId, StaticChannelSet, SvcProcessor};
+use ironrdp_svc::{server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage, SvcProcessor};
 use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
@@ -236,6 +237,8 @@ pub struct RdpServer {
 pub enum ServerEvent {
     Quit(String),
     Clipboard(ClipboardMessage),
+    ClipboardFileContents(OwnedFileContentsResponse),
+    ClipboardFileContentsRequest(FileContentsRequest),
     Rdpsnd(RdpsndServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -538,7 +541,7 @@ impl RdpServer {
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
-                        ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+                        ChannelFlags::SHOW_PROTOCOL,
                     ).context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
@@ -555,6 +558,38 @@ impl RdpServer {
                 drop(state);
                 // GFX not ready yet, fall through to bitmap encoding
                 trace!("GFX not ready, falling back to bitmap path");
+            }
+        }
+
+        // Handle GFX uncompressed dirty rect updates through the DVC channel
+        if let DisplayUpdate::GfxUncompressed(ref uncompressed) = update {
+            let mut state = gfx_state.lock().unwrap();
+            if state.is_ready() {
+                if let Some(drdynvc_id) = drdynvc_channel_id {
+                    let channel_id = state.channel_id.unwrap();
+                    let pdu_data = GfxHandler::create_uncompressed_pdu(&mut state, uncompressed);
+                    drop(state);
+
+                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let svc_messages = dvc::encode_dvc_messages(
+                        channel_id,
+                        dvc_messages,
+                        ChannelFlags::SHOW_PROTOCOL,
+                    ).context("Failed to encode DVC messages")?;
+
+                    let data = server_encode_svc_messages(
+                        svc_messages.into(),
+                        drdynvc_id,
+                        user_channel_id,
+                    )?;
+                    writer.write_all(&data).await
+                        .context("failed to write GFX uncompressed frame")?;
+
+                    return Ok((RunState::Continue, encoder));
+                }
+            } else {
+                drop(state);
+                trace!("GFX not ready for uncompressed, falling back to bitmap path");
             }
         }
 
@@ -615,16 +650,26 @@ impl RdpServer {
                                 continue;
                             }
                             wave_limit -= 1;
-                            rdpsnd.wave(data, ts)
+                            match rdpsnd.wave(data, ts) {
+                                Ok(msgs) => msgs,
+                                Err(e) => {
+                                    // Wave before handshake complete — drop silently
+                                    debug!("Dropping wave: {e}");
+                                    continue;
+                                }
+                            }
                         }
-                        RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
-                        RdpsndServerMessage::Close => rdpsnd.close(),
+                        RdpsndServerMessage::SetVolume { left, right } => {
+                            rdpsnd.set_volume(left, right).context("failed to send rdpsnd event")?
+                        }
+                        RdpsndServerMessage::Close => {
+                            rdpsnd.close().context("failed to send rdpsnd event")?
+                        }
                         RdpsndServerMessage::Error(error) => {
                             error!(?error, "Handling rdpsnd event");
                             continue;
                         }
-                    }
-                    .context("failed to send rdpsnd event")?;
+                    };
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
@@ -650,6 +695,33 @@ impl RdpServer {
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
                     let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                }
+                ServerEvent::ClipboardFileContents(response) => {
+                    let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                        warn!("No clipboard channel, dropping file contents response");
+                        continue;
+                    };
+                    let msgs = cliprdr
+                        .submit_file_contents(response)
+                        .context("failed to submit file contents")?;
+                    let channel_id = self
+                        .get_channel_id_by_type::<CliprdrServer>()
+                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                }
+                ServerEvent::ClipboardFileContentsRequest(request) => {
+                    let channel_id = self
+                        .get_channel_id_by_type::<CliprdrServer>()
+                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    let pdu = ClipboardPdu::FileContentsRequest(request);
+                    let svc_msg = encode_cliprdr_pdu(pdu);
+                    let data = server_encode_svc_messages(
+                        vec![svc_msg].into(),
+                        channel_id,
+                        user_channel_id,
+                    )?;
                     writer.write_all(&data).await?;
                 }
             }
@@ -1121,6 +1193,10 @@ async fn deactivate_all(
     let msg = encode_vec(&X224(pdu))?;
     writer.write_all(&msg).await?;
     Ok(())
+}
+
+fn encode_cliprdr_pdu(pdu: ClipboardPdu<'static>) -> SvcMessage {
+    SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL)
 }
 
 struct SharedWriter<'w, W: FramedWrite> {
