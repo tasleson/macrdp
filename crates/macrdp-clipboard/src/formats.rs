@@ -5,6 +5,12 @@ use std::io::Cursor;
 
 pub const BITMAPINFOHEADER_SIZE: usize = 40;
 
+/// Registered format ID for Windows "HTML Format"
+pub const FORMAT_ID_HTML: u32 = 0xD010;
+
+/// Registered format ID for FileGroupDescriptorW
+pub const FORMAT_ID_FILE_LIST: u32 = 0xD011;
+
 /// Convert PNG/TIFF image bytes to Windows CF_DIB format.
 /// DIB = BITMAPINFOHEADER (40 bytes) + BGRA pixel data (bottom-up row order).
 pub fn png_to_dib(image_data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -116,8 +122,8 @@ pub fn uti_to_rdp_format_id(uti: &str) -> Option<u32> {
     match uti {
         "public.utf8-plain-text" | "public.plain-text" => Some(13), // CF_UNICODETEXT
         "public.png" | "public.tiff" | "public.jpeg" => Some(8),    // CF_DIB
-        "public.html" => Some(0), // registered "HTML Format" name
-        "public.file-url" => Some(0), // registered "FileGroupDescriptorW" name
+        "public.html" => Some(FORMAT_ID_HTML),
+        "public.file-url" => Some(FORMAT_ID_FILE_LIST),
         _ => None,
     }
 }
@@ -127,6 +133,8 @@ pub fn rdp_format_id_to_uti(format_id: u32) -> Option<&'static str> {
     match format_id {
         13 => Some("public.utf8-plain-text"), // CF_UNICODETEXT
         8 => Some("public.png"),              // CF_DIB
+        FORMAT_ID_HTML => Some("public.html"),
+        FORMAT_ID_FILE_LIST => Some("public.file-url"),
         _ => None,
     }
 }
@@ -214,5 +222,20 @@ mod tests {
     fn dib_too_small() {
         let result = dib_to_png(&[0u8; 10]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn uti_to_rdp_html() {
+        assert_eq!(uti_to_rdp_format_id("public.html"), Some(FORMAT_ID_HTML));
+    }
+
+    #[test]
+    fn uti_to_rdp_file_url() {
+        assert_eq!(uti_to_rdp_format_id("public.file-url"), Some(FORMAT_ID_FILE_LIST));
+    }
+
+    #[test]
+    fn rdp_to_uti_html() {
+        assert_eq!(rdp_format_id_to_uti(FORMAT_ID_HTML), Some("public.html"));
     }
 }
