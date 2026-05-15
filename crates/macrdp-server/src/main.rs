@@ -122,19 +122,18 @@ async fn main() -> Result<()> {
     // Create input handler with auto-computed mouse scale
     let input_handler = MacInputHandler::new(mouse_scale_x, mouse_scale_y);
 
-    // Audio setup
-    let (audio_tx, audio_rx) = if config.audio.enabled {
-        let (tx, rx) = tokio::sync::mpsc::channel::<macrdp_capture::AudioFrame>(32);
-        (Some(tx), Some(rx))
+    // Audio setup — shared sender slot, recreated per connection by AudioFactory
+    let shared_audio_tx = if config.audio.enabled {
+        Some(macrdp_audio::new_shared_audio_tx())
     } else {
-        (None, None)
+        None
     };
 
     // Create audio factory
     let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
-        if let Some(rx) = audio_rx {
+        if let Some(ref shared_tx) = shared_audio_tx {
             Some(Box::new(macrdp_audio::MacAudioFactory::new(
-                rx,
+                shared_tx.clone(),
                 config.audio.sample_rate,
                 config.audio.channels,
             )))
@@ -149,7 +148,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("macrdp")
                 .join("clipboard");
-            Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir)))
+            Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir, config.clipboard.max_file_size_mb)))
         } else {
             None
         };
@@ -169,7 +168,7 @@ async fn main() -> Result<()> {
     };
 
     // Create display with shared GFX state
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state), audio_tx, perf_stats.clone());
+    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state), shared_audio_tx, perf_stats.clone());
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 
@@ -240,6 +239,13 @@ async fn main() -> Result<()> {
 }
 
 /// Check and request all required macOS permissions at startup.
+///
+/// Note: `cargo run` produces unsigned debug binaries whose path/hash changes on
+/// every recompile.  macOS TCC ties permissions to the exact binary identity, so
+/// the preflight check may return `false` even after the user has granted access
+/// to a previous build.  We therefore only warn (never auto-open Settings) and
+/// continue — actual capture or input injection will fail at runtime with a clear
+/// error if the permission is truly missing.
 fn check_permissions() {
     tracing::info!("Checking macOS permissions...");
     let mut all_granted = true;
@@ -249,22 +255,11 @@ fn check_permissions() {
         tracing::info!("[OK] Screen Recording permission granted");
     } else {
         all_granted = false;
-        tracing::warn!("[!!] Screen Recording permission NOT granted");
-        tracing::warn!("     Requesting Screen Recording access...");
+        tracing::warn!("[!!] Screen Recording — preflight check returned false");
+        // Trigger the system dialog (no-op if already granted to this binary)
         macrdp_capture::request_screen_recording_permission();
-        // Check again after request
-        if !macrdp_capture::check_screen_recording_permission() {
-            tracing::error!(
-                "     Screen Recording denied. Screen capture will fail."
-            );
-            tracing::error!(
-                "     Go to: System Settings > Privacy & Security > Screen Recording"
-            );
-            tracing::error!(
-                "     Add this app, then RESTART the server."
-            );
-            macrdp_capture::open_screen_recording_settings();
-        }
+        tracing::warn!("     If capture fails: System Settings > Privacy & Security > Screen Recording");
+        tracing::warn!("     Tip: debug builds change binary identity on each compile — re-authorize after rebuild");
     }
 
     // 2. Accessibility (required for keyboard/mouse injection)
@@ -272,33 +267,15 @@ fn check_permissions() {
         tracing::info!("[OK] Accessibility permission granted");
     } else {
         all_granted = false;
-        tracing::warn!("[!!] Accessibility permission NOT granted");
-        tracing::warn!("     Requesting Accessibility access...");
-        // This will show the system prompt dialog
+        tracing::warn!("[!!] Accessibility — preflight check returned false");
         macrdp_input::request_accessibility_permission();
-
-        if !macrdp_input::check_accessibility_permission() {
-            tracing::error!(
-                "     Accessibility denied. Keyboard/mouse input will NOT work."
-            );
-            tracing::error!(
-                "     Go to: System Settings > Privacy & Security > Accessibility"
-            );
-            tracing::error!(
-                "     Add this app, then RESTART the server."
-            );
-            macrdp_input::open_accessibility_settings();
-        }
+        tracing::warn!("     If input fails: System Settings > Privacy & Security > Accessibility");
     }
 
     if all_granted {
         tracing::info!("All permissions granted");
     } else {
-        tracing::warn!(
-            "Some permissions missing — server will start but may have limited functionality."
-        );
-        tracing::warn!(
-            "After granting permissions in System Settings, RESTART the server."
-        );
+        tracing::warn!("Some preflight checks failed — server will start anyway.");
+        tracing::warn!("If you already granted permission, this is likely a debug-build identity change.");
     }
 }

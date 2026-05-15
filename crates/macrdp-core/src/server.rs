@@ -370,19 +370,18 @@ fn run_server_thread(args: ServerThreadArgs) {
         // Create input handler
         let input_handler = MacInputHandler::new(args.mouse_scale_x, args.mouse_scale_y);
 
-        // Audio setup
-        let (audio_tx, audio_rx) = if args.config.audio.enabled {
-            let (tx, rx) = tokio::sync::mpsc::channel::<macrdp_capture::AudioFrame>(32);
-            (Some(tx), Some(rx))
+        // Audio setup — shared sender slot, recreated per connection by AudioFactory
+        let shared_audio_tx = if args.config.audio.enabled {
+            Some(macrdp_audio::new_shared_audio_tx())
         } else {
-            (None, None)
+            None
         };
 
         // Create audio factory
         let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
-            if let Some(rx) = audio_rx {
+            if let Some(ref shared_tx) = shared_audio_tx {
                 Some(Box::new(macrdp_audio::MacAudioFactory::new(
-                    rx,
+                    shared_tx.clone(),
                     args.config.audio.sample_rate,
                     args.config.audio.channels,
                 )))
@@ -397,7 +396,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                     .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                     .join("macrdp")
                     .join("clipboard");
-                Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir)))
+                Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir, args.config.clipboard.max_file_size_mb)))
             } else {
                 None
             };
@@ -415,7 +414,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.mode_444,
             bitrate_override,
             Arc::clone(&args.gfx_state),
-            audio_tx,
+            shared_audio_tx,
             None, // perf_stats: not exposed via macrdp-core API yet
         );
 
