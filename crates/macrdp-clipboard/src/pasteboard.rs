@@ -107,27 +107,109 @@ impl PasteboardBridge {
     }
 
     /// Read file URLs from the pasteboard.
+    ///
+    /// Iterates all pasteboard items to support multi-file copies.
+    /// Falls back to a single `stringForType` read if no items are found.
     pub fn read_file_urls(&self) -> Vec<PathBuf> {
-        let pb = NSPasteboard::generalPasteboard();
-
-        // Use NSPasteboardTypeFileURL to check file URLs.
-        // We rely on `readObjectsForClasses:options:` with NSURL class
-        // but that API is unsafe and complex. Instead, iterate pasteboard
-        // items and read string representation for NSPasteboardTypeFileURL.
         use objc2_app_kit::NSPasteboardTypeFileURL;
+
+        let pb = NSPasteboard::generalPasteboard();
         let file_url_type: &NSString = unsafe { NSPasteboardTypeFileURL };
 
         let mut result = Vec::new();
 
-        // Try reading as a single string (common case: one file copied).
-        if let Some(url_str) = pb.stringForType(file_url_type) {
-            let s = url_str.to_string();
-            if let Some(path) = file_url_str_to_path(&s) {
-                result.push(path);
+        // Iterate pasteboard items for multi-file support.
+        if let Some(items) = pb.pasteboardItems() {
+            let count = items.count();
+            for i in 0..count {
+                let item = items.objectAtIndex(i);
+                if let Some(url_str) = item.stringForType(file_url_type) {
+                    let s = url_str.to_string();
+                    if let Some(path) = file_url_str_to_path(&s) {
+                        result.push(path);
+                    }
+                }
+            }
+        }
+
+        // Fallback: single string read (common case: one file copied).
+        if result.is_empty() {
+            if let Some(url_str) = pb.stringForType(file_url_type) {
+                let s = url_str.to_string();
+                if let Some(path) = file_url_str_to_path(&s) {
+                    result.push(path);
+                }
             }
         }
 
         result
+    }
+
+    /// Read HTML content from the pasteboard (public.html UTI).
+    pub fn read_html(&self) -> Option<String> {
+        let pb = NSPasteboard::generalPasteboard();
+        let html_type = NSString::from_str("public.html");
+        match pb.stringForType(&html_type) {
+            None => {
+                debug!("pasteboard: no HTML data");
+                None
+            }
+            Some(ns_str) => Some(ns_str.to_string()),
+        }
+    }
+
+    /// Write HTML content to the pasteboard.
+    ///
+    /// Returns the new change count, or -1 on failure.
+    pub fn write_html(&self, html: &str) -> i64 {
+        let pb = NSPasteboard::generalPasteboard();
+        let change_count = pb.clearContents();
+
+        let ns_str = NSString::from_str(html);
+        let html_type = NSString::from_str("public.html");
+
+        if !pb.setString_forType(&ns_str, &html_type) {
+            warn!("pasteboard: setString:forType: (HTML) returned false");
+            return -1;
+        }
+
+        change_count as i64
+    }
+
+    /// Write file URLs to the pasteboard.
+    ///
+    /// Returns the new change count, or -1 on failure.
+    /// Currently writes only the first file URL (multi-file requires NSURL writeObjects).
+    pub fn write_file_urls(&self, paths: &[PathBuf]) -> i64 {
+        use objc2_app_kit::NSPasteboardTypeFileURL;
+
+        if paths.is_empty() {
+            return -1;
+        }
+
+        let pb = NSPasteboard::generalPasteboard();
+        let change_count = pb.clearContents();
+
+        let file_url_type: &NSString = unsafe { NSPasteboardTypeFileURL };
+
+        let url = format!("file://{}", paths[0].display());
+        let ns_str = NSString::from_str(&url);
+        if !pb.setString_forType(&ns_str, file_url_type) {
+            warn!(
+                "pasteboard: failed to write file URL: {}",
+                paths[0].display()
+            );
+            return -1;
+        }
+
+        if paths.len() > 1 {
+            warn!(
+                count = paths.len(),
+                "Multiple files received but only first written to pasteboard (multi-file paste not yet supported)"
+            );
+        }
+
+        change_count as i64
     }
 
     /// Write a plain-text string to the pasteboard.
