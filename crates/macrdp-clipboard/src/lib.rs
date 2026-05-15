@@ -2,6 +2,7 @@ pub mod pasteboard;
 pub mod formats;
 pub mod file;
 pub mod html;
+pub mod transfer;
 
 use std::collections::HashMap;
 use std::fmt;
