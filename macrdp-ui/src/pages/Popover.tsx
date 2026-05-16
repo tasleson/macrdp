@@ -16,8 +16,8 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 
 const statusDotColor: Record<string, string> = {
-  running: "bg-macos-green",
-  starting: "bg-macos-blue",
+  running: "bg-green",
+  starting: "bg-accent",
   stopped: "bg-muted-foreground",
   error: "bg-destructive",
 };
@@ -164,7 +164,7 @@ function Popover() {
                     className="flex items-center justify-between text-xs px-2 py-1.5 rounded-md bg-muted/30"
                   >
                     <div className="flex items-center gap-1.5 min-w-0">
-                      <div className="h-1.5 w-1.5 shrink-0 rounded-full bg-macos-green" />
+                      <div className="h-1.5 w-1.5 shrink-0 rounded-full bg-green" />
                       <span className="truncate text-foreground font-medium">
                         {conn.client_name || conn.client_ip}
                       </span>

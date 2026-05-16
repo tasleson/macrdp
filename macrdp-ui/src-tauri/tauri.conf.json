@@ -15,10 +15,10 @@
       {
         "label": "main",
         "title": "macrdp",
-        "width": 900,
-        "height": 600,
-        "minWidth": 720,
-        "minHeight": 480,
+        "width": 960,
+        "height": 620,
+        "minWidth": 800,
+        "minHeight": 500,
         "center": true,
         "decorations": true,
         "resizable": true,
@@ -59,7 +59,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "infoPlist": "Info.plist"
+      "infoPlist": "Info.plist",
+      "signingIdentity": "-"
     }
   }
 }

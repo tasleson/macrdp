@@ -7,10 +7,10 @@ const statusConfig: Record<
   StatusBadgeProps["status"],
   { color: string; label: string }
 > = {
-  running: { color: "bg-macos-green", label: "运行中" },
-  stopped: { color: "bg-macos-secondary", label: "已停止" },
-  starting: { color: "bg-macos-yellow", label: "启动中" },
-  error: { color: "bg-macos-red", label: "错误" },
+  running: { color: "bg-green", label: "运行中" },
+  stopped: { color: "bg-text-muted", label: "已停止" },
+  starting: { color: "bg-yellow", label: "启动中" },
+  error: { color: "bg-red", label: "错误" },
 };
 
 function StatusBadge({ status, text }: StatusBadgeProps) {
@@ -18,7 +18,7 @@ function StatusBadge({ status, text }: StatusBadgeProps) {
   return (
     <div className="flex items-center gap-2">
       <div className={`h-2 w-2 rounded-full ${config.color}`} />
-      <span className="text-sm text-macos-secondary">
+      <span className="text-sm text-text-muted">
         {text ?? config.label}
       </span>
     </div>

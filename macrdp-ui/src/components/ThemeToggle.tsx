@@ -26,10 +26,10 @@ export default function ThemeToggle() {
       <Tooltip>
         <TooltipTrigger
           onClick={cycle}
-          className="fixed bottom-4 right-4 z-50 flex h-9 w-9 items-center justify-center rounded-[10px] border border-macos-border bg-macos-card backdrop-blur-xl shadow-md transition-transform hover:scale-105 active:scale-95"
+          className="fixed bottom-4 right-4 z-50 flex h-9 w-9 items-center justify-center rounded-[10px] border border-border bg-card backdrop-blur-xl shadow-md transition-transform hover:scale-105 active:scale-95"
           render={<button />}
         >
-          <Icon className="h-[18px] w-[18px] text-macos-secondary" />
+          <Icon className="h-[18px] w-[18px] text-text-muted" />
         </TooltipTrigger>
         <TooltipContent side="left">
           <p>{labels[theme]}</p>

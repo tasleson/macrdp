@@ -22,10 +22,10 @@ const navItems = [
 ];
 
 const statusConfig: Record<string, { color: string; label: string }> = {
-  running: { color: "bg-macos-green", label: "运行中" },
-  stopped: { color: "bg-macos-secondary", label: "未运行" },
-  starting: { color: "bg-macos-yellow", label: "启动中" },
-  error: { color: "bg-macos-red", label: "错误" },
+  running: { color: "bg-green", label: "运行中" },
+  stopped: { color: "bg-text-muted", label: "未运行" },
+  starting: { color: "bg-yellow", label: "启动中" },
+  error: { color: "bg-red", label: "错误" },
 };
 
 function Sidebar() {
@@ -45,7 +45,7 @@ function Sidebar() {
   const stConfig = statusConfig[status.state] ?? statusConfig.stopped;
 
   return (
-    <aside className="flex h-full w-52 flex-col border-r border-macos-border bg-macos-card">
+    <aside className="flex h-full w-52 flex-col border-r border-border bg-card">
       {/* Titlebar drag region */}
       <div
         className="h-12 flex-shrink-0"
@@ -63,8 +63,8 @@ function Sidebar() {
             className={({ isActive }) =>
               `flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
                 isActive
-                  ? "bg-macos-blue/10 text-macos-blue"
-                  : "text-macos-secondary hover:bg-macos-bg hover:text-macos-text"
+                  ? "bg-accent/10 text-accent"
+                  : "text-text-muted hover:bg-bg hover:text-text"
               }`
             }
           >
@@ -80,10 +80,10 @@ function Sidebar() {
       </nav>
 
       {/* Bottom status - dynamic */}
-      <div className="border-t border-macos-border p-3">
+      <div className="border-t border-border p-3">
         <div className="flex items-center gap-2">
           <div className={`h-2 w-2 rounded-full ${stConfig.color}`} />
-          <span className="text-xs text-macos-secondary">{stConfig.label}</span>
+          <span className="text-xs text-text-muted">{stConfig.label}</span>
         </div>
       </div>
     </aside>

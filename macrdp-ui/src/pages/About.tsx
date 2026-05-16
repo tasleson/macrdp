@@ -65,7 +65,7 @@ function About() {
                   <p className="text-sm text-muted-foreground">正在检查...</p>
                 )}
                 {updateStatus === "latest" && (
-                  <p className="text-sm text-macos-green">已是最新版本</p>
+                  <p className="text-sm text-green">已是最新版本</p>
                 )}
                 {updateStatus === "available" && (
                   <div>

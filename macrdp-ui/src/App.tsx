@@ -41,8 +41,8 @@ function MainLayout() {
 
   if (!initialized) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-macos-bg">
-        <span className="text-sm text-macos-secondary">加载中...</span>
+      <div className="flex h-screen w-screen items-center justify-center bg-bg">
+        <span className="text-sm text-text-muted">加载中...</span>
       </div>
     );
   }
@@ -52,7 +52,7 @@ function MainLayout() {
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
         <PermissionBanner />
-        <main className="flex-1 overflow-auto bg-macos-bg p-6">
+        <main className="flex-1 overflow-auto bg-bg p-6">
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/settings" element={<Settings />} />
