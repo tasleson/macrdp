@@ -1,28 +1,33 @@
 import { useState, useEffect, useMemo } from "react";
-import { BarChart3, Network, ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { api } from "../lib/ipc";
 import { formatBytes, formatDuration } from "../lib/format";
-import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import MetricCard from "@/components/MetricCard";
+import { ChartPanel } from "@/components/ChartPanel";
+import { BarChart } from "@/components/BarChart";
+import EmptyState from "@/components/EmptyState";
 import type { ConnectionHistory, TrafficStats } from "../lib/types";
 
 const PAGE_SIZE = 20;
+type TimeRange = 7 | 30;
 
 function Statistics() {
+  const [days, setDays] = useState<TimeRange>(7);
+
+  // Traffic stats
+  const [trafficStats, setTrafficStats] = useState<TrafficStats[]>([]);
+
   // Connection history
   const [history, setHistory] = useState<ConnectionHistory[]>([]);
   const [page, setPage] = useState(0);
   const [hasMore, setHasMore] = useState(true);
 
-  // Traffic stats
-  const [trafficStats, setTrafficStats] = useState<TrafficStats[]>([]);
+  useEffect(() => {
+    api.getTrafficStats(days).then(setTrafficStats).catch(console.error);
+  }, [days]);
 
   useEffect(() => {
     fetchHistory(0);
-    api
-      .getTrafficStats(30)
-      .then(setTrafficStats)
-      .catch(console.error);
   }, []);
 
   const fetchHistory = async (p: number) => {
@@ -36,32 +41,34 @@ function Statistics() {
     }
   };
 
-  const totalTraffic = useMemo(
-    () => trafficStats.reduce((sum, d) => sum + d.bytes_sent, 0),
-    [trafficStats],
-  );
-
   const totalConnections = useMemo(
     () => trafficStats.reduce((sum, d) => sum + d.connection_count, 0),
     [trafficStats],
   );
 
-  const maxBytes = useMemo(
-    () => Math.max(...trafficStats.map((d) => d.bytes_sent), 1),
+  const totalTraffic = useMemo(
+    () => trafficStats.reduce((sum, d) => sum + d.bytes_sent, 0),
     [trafficStats],
   );
 
-  const formatDate = (dateStr: string) => {
-    try {
-      const d = new Date(dateStr);
-      return d.toLocaleDateString("zh-CN", {
-        month: "2-digit",
-        day: "2-digit",
-      });
-    } catch {
-      return dateStr;
-    }
-  };
+  const avgSessionDuration = useMemo(() => {
+    if (history.length === 0) return null;
+    const total = history.reduce((sum, c) => sum + c.duration_secs, 0);
+    return Math.round(total / history.length);
+  }, [history]);
+
+  const chartData = useMemo(
+    () =>
+      trafficStats.map((d) => {
+        const dt = new Date(d.date);
+        const label = dt.toLocaleDateString("zh-CN", {
+          month: "2-digit",
+          day: "2-digit",
+        });
+        return { label, value: d.bytes_sent };
+      }),
+    [trafficStats],
+  );
 
   const formatDateTime = (dateStr: string) => {
     try {
@@ -78,176 +85,121 @@ function Statistics() {
     }
   };
 
+  const pillBase =
+    "text-[10px] px-2 py-0.5 rounded-[4px] cursor-pointer transition-colors";
+  const pillActive =
+    "bg-accent/15 border border-accent/30 text-accent";
+  const pillDefault =
+    "bg-card border border-border-subtle text-text-muted";
+
   return (
-    <div className="space-y-6">
-      {/* Traffic stats section */}
-      <section>
-        <h2 className="mb-3 text-base font-medium text-foreground">
-          流量统计
-        </h2>
-
-        {/* Summary */}
-        <div className="mb-4 grid grid-cols-2 gap-4">
-          <Card size="sm">
-            <CardContent className="flex items-center gap-3">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted">
-                <BarChart3 className="h-4 w-4 text-muted-foreground" />
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">30 天总流量</div>
-                <div className="mt-0.5 text-lg font-semibold text-foreground">
-                  {formatBytes(totalTraffic)}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-          <Card size="sm">
-            <CardContent className="flex items-center gap-3">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted">
-                <Network className="h-4 w-4 text-muted-foreground" />
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">30 天总连接数</div>
-                <div className="mt-0.5 text-lg font-semibold text-foreground">
-                  {totalConnections}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+    <div className="flex flex-col gap-3 p-4 overflow-y-auto">
+      {/* 1. Header + time range toggle */}
+      <div className="flex items-center justify-between">
+        <h1 className="text-base font-semibold">统计</h1>
+        <div className="flex gap-1">
+          <button
+            className={`${pillBase} ${days === 7 ? pillActive : pillDefault}`}
+            onClick={() => setDays(7)}
+          >
+            7天
+          </button>
+          <button
+            className={`${pillBase} ${days === 30 ? pillActive : pillDefault}`}
+            onClick={() => setDays(30)}
+          >
+            30天
+          </button>
         </div>
+      </div>
 
-        {/* Bar chart */}
-        {trafficStats.length === 0 ? (
-          <Card size="sm">
-            <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              暂无流量数据
-            </CardContent>
-          </Card>
-        ) : (
-          <Card size="sm">
-            <CardContent>
-              <div className="space-y-1.5">
-                {trafficStats.map((day) => (
-                  <div key={day.date} className="flex items-center gap-3">
-                    <span className="w-12 flex-shrink-0 text-right font-mono text-xs text-muted-foreground">
-                      {formatDate(day.date)}
-                    </span>
-                    <div className="flex-1">
-                      <div
-                        className="h-5 rounded bg-primary/60 transition-all"
-                        style={{
-                          width: `${Math.max((day.bytes_sent / maxBytes) * 100, 1)}%`,
-                        }}
-                      />
-                    </div>
-                    <span className="w-20 flex-shrink-0 text-right font-mono text-xs text-muted-foreground">
-                      {formatBytes(day.bytes_sent)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        )}
-      </section>
+      {/* 2. Summary cards */}
+      <div className="flex gap-2">
+        <MetricCard
+          value={totalConnections}
+          label="总连接数"
+          color="blue"
+        />
+        <MetricCard
+          value={totalTraffic}
+          label="总流量"
+          color="green"
+          formatter={formatBytes}
+        />
+        <MetricCard
+          value={avgSessionDuration}
+          label="平均会话时长"
+          color="orange"
+          formatter={formatDuration}
+        />
+      </div>
 
-      {/* Connection history table */}
-      <section>
-        <h2 className="mb-3 text-base font-medium text-foreground">
-          连接历史
-        </h2>
+      {/* 3. Traffic trend chart */}
+      <ChartPanel
+        title="流量趋势"
+        empty={chartData.length === 0}
+        emptyText="暂无流量数据"
+      >
+        <BarChart data={chartData} color="var(--color-accent)" />
+      </ChartPanel>
 
+      {/* 4. Connection history table */}
+      <div className="bg-card rounded-[8px] p-3">
         {history.length === 0 && page === 0 ? (
-          <Card size="sm">
-            <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              暂无连接记录
-            </CardContent>
-          </Card>
+          <EmptyState message="暂无连接记录" />
         ) : (
           <>
-            <div className="overflow-hidden rounded-lg border border-border">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-border bg-muted/50">
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">
-                      客户端
-                    </th>
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">
-                      IP
-                    </th>
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">
-                      连接时间
-                    </th>
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">
-                      断开时间
-                    </th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">
-                      时长
-                    </th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">
-                      流量
-                    </th>
+            <table className="w-full">
+              <thead>
+                <tr className="text-[10px] text-text-muted font-medium">
+                  <th className="text-left pb-2">用户</th>
+                  <th className="text-left pb-2">时间</th>
+                  <th className="text-left pb-2">时长</th>
+                  <th className="text-right pb-2">流量</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((conn) => (
+                  <tr
+                    key={conn.id}
+                    className="text-[11px] text-text-secondary border-b border-border"
+                  >
+                    <td className="py-1.5">{conn.client_name || conn.client_ip}</td>
+                    <td className="py-1.5">{formatDateTime(conn.connected_at)}</td>
+                    <td className="py-1.5">{formatDuration(conn.duration_secs)}</td>
+                    <td className="py-1.5 text-right">{formatBytes(conn.bytes_total)}</td>
                   </tr>
-                </thead>
-                <tbody className="divide-y divide-border/50">
-                  {history.map((conn) => (
-                    <tr
-                      key={conn.id}
-                      className="bg-card transition-colors hover:bg-muted/30"
-                    >
-                      <td className="px-3 py-2 text-foreground">
-                        {conn.client_name || "-"}
-                      </td>
-                      <td className="px-3 py-2 font-mono text-xs text-muted-foreground">
-                        {conn.client_ip}
-                      </td>
-                      <td className="px-3 py-2 text-xs text-muted-foreground">
-                        {formatDateTime(conn.connected_at)}
-                      </td>
-                      <td className="px-3 py-2 text-xs text-muted-foreground">
-                        {formatDateTime(conn.disconnected_at)}
-                      </td>
-                      <td className="px-3 py-2 text-right text-xs text-muted-foreground">
-                        {formatDuration(conn.duration_secs)}
-                      </td>
-                      <td className="px-3 py-2 text-right text-xs text-muted-foreground">
-                        {formatBytes(conn.bytes_total)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                ))}
+              </tbody>
+            </table>
 
             {/* Pagination */}
-            <div className="mt-3 flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">
+            <div className="mt-2 flex items-center justify-between">
+              <span className="text-[10px] text-text-muted">
                 第 {page + 1} 页
               </span>
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
+              <div className="flex gap-1.5">
+                <button
+                  className="text-[10px] text-text-muted disabled:opacity-30 flex items-center gap-0.5"
                   disabled={page === 0}
                   onClick={() => fetchHistory(page - 1)}
                 >
-                  <ChevronLeft className="h-3.5 w-3.5" />
+                  <ChevronLeft className="h-3 w-3" />
                   上一页
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
+                </button>
+                <button
+                  className="text-[10px] text-text-muted disabled:opacity-30 flex items-center gap-0.5"
                   disabled={!hasMore}
                   onClick={() => fetchHistory(page + 1)}
                 >
                   下一页
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </Button>
+                  <ChevronRight className="h-3 w-3" />
+                </button>
               </div>
             </div>
           </>
         )}
-      </section>
+      </div>
     </div>
   );
 }
