@@ -7,7 +7,7 @@ import {
   TooltipTrigger,
 } from "./ui/tooltip";
 
-const modes = ["system", "light", "dark"] as const;
+const modes = ["light", "dark", "system"] as const;
 const labels = { system: "跟随系统", light: "浅色模式", dark: "深色模式" };
 const icons = { system: Monitor, light: Sun, dark: Moon };
 
@@ -26,12 +26,12 @@ export default function ThemeToggle() {
       <Tooltip>
         <TooltipTrigger
           onClick={cycle}
-          className="fixed bottom-4 right-4 z-50 flex h-9 w-9 items-center justify-center rounded-[10px] border border-border bg-card backdrop-blur-xl shadow-md transition-transform hover:scale-105 active:scale-95"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-accent/8 hover:text-text-secondary"
           render={<button />}
         >
-          <Icon className="h-[18px] w-[18px] text-text-muted" />
+          <Icon size={16} />
         </TooltipTrigger>
-        <TooltipContent side="left">
+        <TooltipContent side="top">
           <p>{labels[theme]}</p>
         </TooltipContent>
       </Tooltip>

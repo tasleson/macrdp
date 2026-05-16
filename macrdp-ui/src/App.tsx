@@ -10,7 +10,6 @@ import About from "./pages/About";
 import Popover from "./pages/Popover";
 import { api } from "./lib/ipc";
 import { ThemeProvider } from "./contexts/ThemeContext";
-import ThemeToggle from "./components/ThemeToggle";
 import PermissionBanner from "./components/PermissionBanner";
 
 function MainLayout() {
@@ -63,7 +62,6 @@ function MainLayout() {
           </Routes>
         </main>
       </div>
-      <ThemeToggle />
     </div>
   );
 }

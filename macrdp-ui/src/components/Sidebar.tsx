@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
-import { NavLink } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
-  LayoutDashboard,
+  Monitor,
   Settings,
   Shield,
   FileText,
@@ -9,28 +9,33 @@ import {
   Info,
 } from "lucide-react";
 import { api } from "../lib/ipc";
-import { useServerStatus } from "../hooks/useServerStatus";
 import type { PermissionStatus } from "../lib/types";
+import ThemeToggle from "./ThemeToggle";
 
-const navItems = [
-  { to: "/", icon: LayoutDashboard, label: "仪表盘" },
-  { to: "/settings", icon: Settings, label: "设置" },
-  { to: "/permissions", icon: Shield, label: "权限" },
-  { to: "/logs", icon: FileText, label: "日志" },
-  { to: "/statistics", icon: Activity, label: "统计" },
-  { to: "/about", icon: Info, label: "关于" },
+const navGroups = [
+  {
+    label: "服务",
+    items: [{ path: "/", icon: Monitor, label: "控制台" }],
+  },
+  {
+    label: "配置",
+    items: [
+      { path: "/settings", icon: Settings, label: "设置" },
+      { path: "/permissions", icon: Shield, label: "权限" },
+    ],
+  },
+  {
+    label: "诊断",
+    items: [
+      { path: "/logs", icon: FileText, label: "日志" },
+      { path: "/statistics", icon: Activity, label: "统计" },
+    ],
+  },
 ];
-
-const statusConfig: Record<string, { color: string; label: string }> = {
-  running: { color: "bg-green", label: "运行中" },
-  stopped: { color: "bg-text-muted", label: "未运行" },
-  starting: { color: "bg-yellow", label: "启动中" },
-  error: { color: "bg-red", label: "错误" },
-};
 
 function Sidebar() {
   const [perms, setPerms] = useState<PermissionStatus | null>(null);
-  const status = useServerStatus();
+  const location = useLocation();
 
   useEffect(() => {
     const check = () => api.getPermissions().then(setPerms).catch(() => {});
@@ -42,48 +47,70 @@ function Sidebar() {
   const hasPermissionIssue =
     perms !== null && (!perms.screen_capture || !perms.accessibility);
 
-  const stConfig = statusConfig[status.state] ?? statusConfig.stopped;
+  const isActive = (path: string) =>
+    path === "/" ? location.pathname === "/" : location.pathname.startsWith(path);
 
   return (
-    <aside className="flex h-full w-52 flex-col border-r border-border bg-card">
+    <aside className="flex h-full w-[180px] flex-shrink-0 flex-col border-r border-border bg-sidebar">
       {/* Titlebar drag region */}
       <div
-        className="h-12 flex-shrink-0"
+        className="h-7 flex-shrink-0"
         data-tauri-drag-region
         style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
       />
 
       {/* Navigation */}
-      <nav className="flex-1 space-y-1 px-3">
-        {navItems.map(({ to, icon: Icon, label }) => (
-          <NavLink
-            key={to}
-            to={to}
-            end={to === "/"}
-            className={({ isActive }) =>
-              `flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                isActive
-                  ? "bg-accent/10 text-accent"
-                  : "text-text-muted hover:bg-bg hover:text-text"
-              }`
-            }
-          >
-            <span className="relative">
-              <Icon size={18} />
-              {to === "/permissions" && hasPermissionIssue && (
-                <span className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-red-500" />
-              )}
-            </span>
-            <span>{label}</span>
-          </NavLink>
+      <nav role="navigation" className="flex-1 overflow-y-auto px-3">
+        {navGroups.map((group) => (
+          <div key={group.label} className="mb-3">
+            <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-text-muted">
+              {group.label}
+            </div>
+            <div className="space-y-0.5">
+              {group.items.map(({ path, icon: Icon, label }) => {
+                const active = isActive(path);
+                return (
+                  <Link
+                    key={path}
+                    to={path}
+                    aria-current={active ? "page" : undefined}
+                    className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
+                      active
+                        ? "bg-accent/15 text-accent"
+                        : "text-text-secondary hover:bg-accent/8"
+                    }`}
+                  >
+                    <span className="relative flex-shrink-0">
+                      <Icon size={16} />
+                      {path === "/permissions" && hasPermissionIssue && (
+                        <span className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-red-500" />
+                      )}
+                    </span>
+                    <span>{label}</span>
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
         ))}
       </nav>
 
-      {/* Bottom status - dynamic */}
-      <div className="border-t border-border p-3">
-        <div className="flex items-center gap-2">
-          <div className={`h-2 w-2 rounded-full ${stConfig.color}`} />
-          <span className="text-xs text-text-muted">{stConfig.label}</span>
+      {/* Bottom fixed area */}
+      <div className="flex-shrink-0 border-t border-border px-3 py-2">
+        <Link
+          to="/about"
+          aria-current={isActive("/about") ? "page" : undefined}
+          className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
+            isActive("/about")
+              ? "bg-accent/15 text-accent"
+              : "text-text-secondary hover:bg-accent/8"
+          }`}
+        >
+          <Info size={16} />
+          <span>关于</span>
+        </Link>
+        <div className="mt-2 flex items-center px-2">
+          <ThemeToggle />
         </div>
       </div>
     </aside>
