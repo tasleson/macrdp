@@ -183,6 +183,22 @@
     --sidebar-accent-foreground: oklch(0.985 0 0);
     --sidebar-border: oklch(1 0 0 / 10%);
     --sidebar-ring: oklch(0.556 0 0);
+
+    /* Custom design tokens */
+    --color-bg: #1a1a1a;
+    --color-sidebar: #202020;
+    --color-card: #252525;
+    --color-border: #2d2d2d;
+    --color-border-subtle: #3a3a3a;
+    --color-text: #ffffff;
+    --color-text-secondary: #cccccc;
+    --color-text-muted: #8e8e93;
+    --color-accent: #0a84ff;
+    --color-green: #30d158;
+    --color-orange: #ff9f0a;
+    --color-red: #ff453a;
+    --color-purple: #bf5af2;
+    --color-yellow: #ffd60a;
   }
 }
 
@@ -199,11 +215,6 @@ body {
   user-select: none;
 }
 
-/* Global transition */
-* {
-  transition: color 150ms ease-out, background-color 150ms ease-out, border-color 150ms ease-out;
-}
-
 /* Focus indicator for a11y */
 :focus-visible {
   outline: 2px solid var(--color-accent);
@@ -213,9 +224,6 @@ body {
 @layer base {
   * {
     @apply border-border outline-ring/50;
-  }
-  body {
-    @apply bg-background text-foreground;
   }
   html {
     @apply font-sans;

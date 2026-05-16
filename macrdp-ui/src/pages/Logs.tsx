@@ -8,19 +8,19 @@ import type { LogEntry } from "../lib/types";
 const LEVELS = ["trace", "debug", "info", "warn", "error"] as const;
 
 const levelColors: Record<LogEntry["level"], string> = {
-  error: "text-red-500",
-  warn: "text-orange-500",
+  error: "text-red",
+  warn: "text-orange",
   info: "text-accent",
-  debug: "text-gray-400",
-  trace: "text-gray-300",
+  debug: "text-text-muted",
+  trace: "text-text-muted",
 };
 
 const levelBadgeColors: Record<LogEntry["level"], string> = {
-  error: "bg-red-500/10 text-red-500 border-red-500/20",
-  warn: "bg-orange-500/10 text-orange-500 border-orange-500/20",
+  error: "bg-red/10 text-red border-red/20",
+  warn: "bg-orange/10 text-orange border-orange/20",
   info: "bg-accent/10 text-accent border-accent/20",
-  debug: "bg-gray-400/10 text-gray-400 border-gray-400/20",
-  trace: "bg-gray-300/10 text-gray-300 border-gray-300/20",
+  debug: "bg-text-muted/10 text-text-muted border-text-muted/20",
+  trace: "bg-text-muted/10 text-text-muted border-text-muted/20",
 };
 
 function Logs() {
