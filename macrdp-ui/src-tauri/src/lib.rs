@@ -14,9 +14,21 @@ use tauri_plugin_autostart::MacosLauncher;
 use database::Database;
 
 pub fn run() {
-    // 初始化日志输出到 stderr（开发模式下可见）
-    tracing_subscriber::fmt()
-        .with_env_filter("macrdp_ui=debug,macrdp_core=debug,info")
+    // Load UI config early to get log level
+    let ui_config = ui_config::UiConfig::load().unwrap_or_default();
+    let log_level = ui_config.log_level.clone();
+    let filter = format!("macrdp_ui={log_level},macrdp_core={log_level},{log_level}");
+
+    // Initialize log file + tracing with log bridge layer
+    let log_path = macrdp_core::init_log_file();
+    eprintln!("Log file: {} (level: {})", log_path.display(), log_level);
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(&filter))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(macrdp_core::LogBridgeLayer::new())
         .init();
 
     tracing::info!("macrdp-ui starting...");
@@ -35,7 +47,7 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // Initialize application state (includes SharedServerHandle)
+            // Initialize application state
             state::init_app_state(&handle)?;
 
             // Request permissions proactively on startup (non-blocking)

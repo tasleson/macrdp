@@ -351,14 +351,30 @@ impl RdpServer {
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         let framed = TokioFramed::new(stream);
 
-        // Reset GFX state for new connection, preserving peer IP
-        {
+        // Reset GFX state for new connection, preserving peer IP and hot-updated resolution
+        let pending_resolution = {
             let mut gs = self.gfx_state.lock().unwrap();
             let w = gs.width;
             let h = gs.height;
             let avc444_enabled = gs.avc444_enabled;
+            let res = gs.resolution.take();
             *gs = GfxState::new(w, h, avc444_enabled);
             gs.peer_addr = peer_ip;
+            res
+        };
+
+        // Apply hot-updated resolution for this new connection
+        if let Some(ref res) = pending_resolution {
+            if let Some((w, h)) = res.split_once('x').and_then(|(w, h)| {
+                Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
+            }) {
+                info!(w, h, "Applying hot-updated resolution for new connection");
+                // Use set_size (bypasses fixed_resolution check, since this is server-initiated)
+                self.display.lock().await.set_size(w, h);
+                let mut gs = self.gfx_state.lock().unwrap();
+                gs.width = w;
+                gs.height = h;
+            }
         }
 
         let size = self.display.lock().await.size().await;

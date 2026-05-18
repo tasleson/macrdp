@@ -12,7 +12,7 @@ pub fn check_permissions() -> PermissionStatus {
 }
 
 /// Request all required macOS permissions (may trigger system dialogs).
-/// Returns the updated permission status.
+/// Does NOT auto-open System Settings — the UI should handle that based on returned status.
 pub fn request_permissions() -> PermissionStatus {
     tracing::info!("Checking macOS permissions...");
 
@@ -23,10 +23,9 @@ pub fn request_permissions() -> PermissionStatus {
         tracing::warn!("[!!] Screen Recording permission NOT granted");
         macrdp_capture::request_screen_recording_permission();
         if !macrdp_capture::check_screen_recording_permission() {
-            tracing::error!(
+            tracing::warn!(
                 "Screen Recording denied. Go to: System Settings > Privacy & Security > Screen Recording"
             );
-            macrdp_capture::open_screen_recording_settings();
         }
     }
 
@@ -37,10 +36,9 @@ pub fn request_permissions() -> PermissionStatus {
         tracing::warn!("[!!] Accessibility permission NOT granted");
         macrdp_input::request_accessibility_permission();
         if !macrdp_input::check_accessibility_permission() {
-            tracing::error!(
+            tracing::warn!(
                 "Accessibility denied. Go to: System Settings > Privacy & Security > Accessibility"
             );
-            macrdp_input::open_accessibility_settings();
         }
     }
 

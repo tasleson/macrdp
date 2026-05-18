@@ -24,7 +24,8 @@ pub struct UiConfig {
     pub password: String,
 
     // ── Display ─────────────────────────────────────────────
-    pub hidpi_scale: u32,
+    #[serde(alias = "hidpi_scale")]
+    pub resolution: String,
     pub show_cursor: bool,
 
     // ── Application ─────────────────────────────────────────
@@ -46,7 +47,7 @@ impl Default for UiConfig {
             idle_timeout_secs: 1800,
             username: "macrdp".to_string(),
             password: String::new(),
-            hidpi_scale: 2,
+            resolution: "auto".to_string(),
             show_cursor: false,
             log_level: "warn".to_string(),
             theme: "system".to_string(),
@@ -160,11 +161,15 @@ impl UiConfig {
                     .ok_or("password must be a string")?
                     .to_string();
             }
-            "hidpi_scale" => {
-                self.hidpi_scale = value
-                    .as_u64()
-                    .ok_or("hidpi_scale must be a number")?
-                    as u32;
+            "resolution" | "hidpi_scale" => {
+                self.resolution = value
+                    .as_str()
+                    .or_else(|| value.as_u64().map(|_| ""))
+                    .ok_or("resolution must be a string")?
+                    .to_string();
+                if self.resolution.is_empty() {
+                    self.resolution = value.as_u64().unwrap().to_string();
+                }
             }
             "show_cursor" => {
                 self.show_cursor = value
@@ -192,10 +197,9 @@ impl UiConfig {
         }
 
         // Hot-updatable fields do NOT require a restart.
-        let restart_required = !matches!(
-            key,
-            "frame_rate" | "bitrate_mbps" | "log_level" | "theme" | "autostart"
-        );
+        // Only "theme" and "autostart" are pure UI settings.
+        // All other server settings are hot-updatable or auto-restarted.
+        let restart_required = false;
         Ok(restart_required)
     }
 
@@ -219,7 +223,8 @@ impl UiConfig {
             quality: None,
             encoder: Some(self.encoder.clone()),
             chroma_mode: Some(self.chroma_mode.clone()),
-            hidpi_scale: Some(self.hidpi_scale),
+            resolution: Some(self.resolution.clone()),
+            show_cursor: Some(self.show_cursor),
             bitrate_mbps: Some(self.bitrate_mbps),
             audio: macrdp_core::AudioConfig::default(),
             clipboard: macrdp_core::ClipboardConfig::default(),

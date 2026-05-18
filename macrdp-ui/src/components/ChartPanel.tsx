@@ -18,7 +18,7 @@ export function ChartPanel({
   children,
 }: ChartPanelProps) {
   return (
-    <div className="bg-card rounded-[8px] p-3">
+    <div className="bg-card rounded-[8px] p-3 flex-1 min-w-0">
       {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <span className="text-[11px] text-text-muted">{title}</span>

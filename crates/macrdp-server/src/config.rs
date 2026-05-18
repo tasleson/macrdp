@@ -91,10 +91,11 @@ pub struct ServerConfig {
     /// - avc420: standard 4:2:0 chroma (compatible with all RDP clients)
     /// - avc444: full 4:4:4 chroma via dual-stream AVC444 (requires V10+ client, best quality)
     pub chroma_mode: Option<String>,
-    /// HiDPI scale factor (default: 1)
-    /// Multiplies the capture resolution for sharper image on Retina displays.
-    /// e.g. scale=2 on a 1920x1080 logical display → captures at 3840x2160
-    pub hidpi_scale: Option<u32>,
+    /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")
+    #[serde(alias = "hidpi_scale")]
+    pub resolution: Option<String>,
+    /// Show cursor in capture (default: true)
+    pub show_cursor: Option<bool>,
     /// Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
     /// Override this to force a specific bitrate, e.g. 50 for 50 Mbps.
     pub bitrate_mbps: Option<u32>,
@@ -129,7 +130,8 @@ impl Default for ServerConfig {
             quality: None,
             encoder: None,
             chroma_mode: None,
-            hidpi_scale: None,
+            resolution: None,
+            show_cursor: None,
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,

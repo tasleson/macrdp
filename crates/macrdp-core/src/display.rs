@@ -5,14 +5,15 @@ use ironrdp_server::{
     RdpServerDisplay, RdpServerDisplayUpdates,
     gfx::GfxState,
 };
-use macrdp_capture::{AudioFrame, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, SafePixelBuffer, ScreenCapturer};
+use macrdp_audio::SharedAudioTx;
+use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, SafePixelBuffer, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 
 use crate::bitrate_controller::{BitrateController, FrameStats, NetworkQuality, is_private_ip};
+use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
 
 /// Maximum tile size for bitmap updates
@@ -83,10 +84,12 @@ pub struct MacDisplay {
     encoder_pref: macrdp_encode::EncoderPreference,
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
+    show_cursor: bool,
     base_bitrate: u32,
     gfx_state: Arc<Mutex<GfxState>>,
-    /// Optional audio channel sender for SCK audio capture
-    audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    coord_mapper: MouseCoordMapper,
+    /// Shared audio sender slot — updated per connection by AudioFactory
+    shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
 }
@@ -98,21 +101,48 @@ impl MacDisplay {
         frame_rate: u32, quality: Quality,
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
+        show_cursor: bool,
         bitrate_override: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
-        audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        coord_mapper: MouseCoordMapper,
+        shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
         tracing::info!(base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0, "Base bitrate");
+        let (max_w, max_h) = macrdp_capture::detect_display_scale()
+            .map(|scale| (width.max((width as u32 * scale) as u16), height.max((height as u32 * scale) as u16)))
+            .unwrap_or((width.max(3840), height.max(2160)));
         Self {
             width, height,
-            max_width: width, max_height: height,
+            max_width: max_w, max_height: max_h,
             fixed_resolution,
-            frame_rate, quality, encoder_pref, mode_444, base_bitrate, gfx_state,
-            audio_tx,
+            frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
+            coord_mapper,
+            shared_audio_tx,
             perf_stats,
+        }
+    }
+}
+
+impl MacDisplay {
+    fn apply_resize(&mut self, width: u16, height: u16, source: &str) {
+        let w = width.min(self.max_width);
+        let h = height.min(self.max_height);
+        if w > 0 && h > 0 && (w != self.width || h != self.height) {
+            tracing::info!(
+                old_w = self.width, old_h = self.height,
+                new_w = w, new_h = h,
+                source,
+                "Applying resolution change"
+            );
+            self.width = w;
+            self.height = h;
+            self.base_bitrate = macrdp_encode::screen_bitrate(
+                w as u32, h as u32, self.frame_rate as f32, self.quality,
+            );
+            self.coord_mapper.update_rdp_size(w, h);
         }
     }
 }
@@ -128,20 +158,12 @@ impl RdpServerDisplay for MacDisplay {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
         }
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
-        if w > 0 && h > 0 && (w != self.width || h != self.height) {
-            tracing::info!(
-                old_w = self.width, old_h = self.height,
-                new_w = w, new_h = h,
-                "Adopting client-requested resolution"
-            );
-            self.width = w;
-            self.height = h;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
-                w as u32, h as u32, self.frame_rate as f32, self.quality,
-            );
-        }
+        self.apply_resize(width, height, "client-requested");
+    }
+
+    fn set_size(&mut self, width: u16, height: u16) {
+        self.apply_resize(width, height, "server-config");
+        self.fixed_resolution = true;
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -154,8 +176,12 @@ impl RdpServerDisplay for MacDisplay {
             } else {
                 CapturePixelFormat::Bgra
             },
+            show_cursor: self.show_cursor,
         };
-        let capturer = ScreenCapturer::new(capture_config.clone(), self.audio_tx.clone()).await?;
+        // Read the current audio sender from the shared slot (set by AudioFactory per connection)
+        let audio_tx = self.shared_audio_tx.as_ref()
+            .and_then(|shared| shared.lock().unwrap().clone());
+        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(
@@ -191,6 +217,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             display_frame_count: 0,
             skip_next_frame: false,
+            overload_count: 0,
             idle_frame_count: 0,
             last_idr_time: Instant::now(),
             last_frame_cache: None,
@@ -221,6 +248,8 @@ struct MacDisplayUpdates {
     mode_444: bool,
     display_frame_count: u64,
     skip_next_frame: bool,
+    /// Counter for rate-limiting encode overload warnings
+    overload_count: u64,
     /// Consecutive idle events from SCK (desktop unchanged).
     idle_frame_count: u32,
     /// When the last IDR keyframe was sent (natural or keepalive).
@@ -657,13 +686,17 @@ impl MacDisplayUpdates {
                                 }
                                 self.apply_adaptive_decision();
                                 let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.8 {
+                                if encode_ms > frame_interval_ms * 0.95 {
                                     self.skip_next_frame = true;
-                                    tracing::warn!(
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                        "encode overload — skipping next frame"
-                                    );
+                                    self.overload_count += 1;
+                                    if self.overload_count % 60 == 1 {
+                                        tracing::warn!(
+                                            encode_ms = format!("{:.1}", encode_ms),
+                                            frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                                            overload_total = self.overload_count,
+                                            "encode overload — skipping frames"
+                                        );
+                                    }
                                 }
                                 // Cache frame for idle IDR re-encoding
                                 self.last_frame_cache = Some(CachedFrame::PixelBuffer(

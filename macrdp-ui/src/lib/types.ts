@@ -65,7 +65,7 @@ export interface UiConfig {
   idle_timeout_secs: number;
   username: string;
   password: string;
-  hidpi_scale: number;
+  resolution: string;
   show_cursor: boolean;
   log_level: string;
   theme: string;

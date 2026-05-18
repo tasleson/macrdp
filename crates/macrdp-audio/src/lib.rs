@@ -1,11 +1,7 @@
 pub mod converter;
 
-#[cfg(feature = "opus")]
-pub mod opus;
-
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Mutex;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
@@ -58,7 +54,6 @@ async fn audio_loop(
 }
 
 /// Find best matching server format index given client's supported formats.
-/// Iterates server formats in reverse (higher index = higher priority like Opus).
 pub fn find_matching_format(
     server_formats: &[AudioFormat],
     client_formats: &[AudioFormat],
@@ -129,18 +124,28 @@ impl RdpsndServerHandler for MacAudioHandler {
     }
 }
 
+/// Shared audio sender that can be swapped on each connection.
+/// Display reads the current sender; AudioFactory replaces it with a fresh one per connection.
+pub type SharedAudioTx = std::sync::Arc<std::sync::Mutex<Option<mpsc::Sender<AudioFrame>>>>;
+
+/// Create a shared audio sender slot for use by both MacDisplay and MacAudioFactory.
+pub fn new_shared_audio_tx() -> SharedAudioTx {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
 /// Factory that creates MacAudioHandler instances.
+/// Creates a fresh audio channel for each connection so the server survives reconnects.
 pub struct MacAudioFactory {
-    audio_rx: Mutex<Option<mpsc::Receiver<AudioFrame>>>,
+    shared_tx: SharedAudioTx,
     event_sender: Option<tokio::sync::mpsc::UnboundedSender<ServerEvent>>,
     sample_rate: u32,
     channels: u16,
 }
 
 impl MacAudioFactory {
-    pub fn new(audio_rx: mpsc::Receiver<AudioFrame>, sample_rate: u32, channels: u16) -> Self {
+    pub fn new(shared_tx: SharedAudioTx, sample_rate: u32, channels: u16) -> Self {
         Self {
-            audio_rx: Mutex::new(Some(audio_rx)),
+            shared_tx,
             event_sender: None,
             sample_rate,
             channels,
@@ -150,8 +155,6 @@ impl MacAudioFactory {
 
 impl SoundServerFactory for MacAudioFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
-        let rx = self.audio_rx.lock().unwrap().take()
-            .expect("audio_rx already taken — build_backend called more than once");
         let sender = self.event_sender.clone()
             .expect("event sender not set");
 
@@ -159,6 +162,11 @@ impl SoundServerFactory for MacAudioFactory {
         let sample_rate = self.sample_rate;
         // 20ms frame: sample_rate/50 samples per channel * channels
         let frame_size_interleaved = (sample_rate as usize / 50) * channels as usize;
+
+        // Create a fresh channel for this connection
+        let (tx, rx) = mpsc::channel::<AudioFrame>(32);
+        // Store the new sender so the display capturer uses it
+        *self.shared_tx.lock().unwrap() = Some(tx);
 
         tokio::spawn(audio_loop(rx, sender, frame_size_interleaved, channels, sample_rate));
 

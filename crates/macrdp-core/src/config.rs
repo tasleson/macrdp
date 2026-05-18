@@ -64,8 +64,11 @@ pub struct ServerConfig {
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,
-    /// HiDPI scale factor (default: 1)
-    pub hidpi_scale: Option<u32>,
+    /// Resolution: "auto", or "WxH" like "3840x2160" (default: "auto")
+    #[serde(alias = "hidpi_scale")]
+    pub resolution: Option<String>,
+    /// Show cursor in capture (default: true)
+    pub show_cursor: Option<bool>,
     /// Target bitrate in Mbps (default: auto-calculated)
     pub bitrate_mbps: Option<u32>,
     /// Audio forwarding configuration
@@ -92,7 +95,8 @@ impl Default for ServerConfig {
             quality: None,
             encoder: None,
             chroma_mode: None,
-            hidpi_scale: None,
+            resolution: None,
+            show_cursor: None,
             bitrate_mbps: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),

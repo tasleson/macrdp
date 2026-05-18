@@ -60,23 +60,42 @@ async fn main() -> Result<()> {
     // Check and request required macOS permissions
     check_permissions();
 
-    // Always detect macOS logical display size (needed for mouse coordinate mapping)
-    let (logical_w, logical_h) = match macrdp_capture::detect_display_size() {
+    // Detect macOS display sizes:
+    // - SCK logical: from ScreenCaptureKit SCDisplay, used for capture sizing
+    // - CG logical: from CoreGraphics CGDisplay.bounds(), used for mouse mapping
+    //   CGEvent operates in the CG coordinate space, so mouse mapping MUST use CG dimensions.
+    let (sck_w, sck_h) = match macrdp_capture::detect_display_size() {
         Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "Detected macOS logical display size");
+            tracing::info!(width = w, height = h, "SCK logical display size");
             (w as u16, h as u16)
         }
         Err(e) => {
-            tracing::warn!("Failed to detect display size: {e}, defaulting to 1920x1080");
+            tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
             (1920u16, 1080u16)
         }
     };
+    let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
+        Ok((w, h)) => {
+            tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
+            (w as u16, h as u16)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
+            (sck_w, sck_h)
+        }
+    };
+    if sck_w != cg_w || sck_h != cg_h {
+        tracing::warn!(
+            sck_w, sck_h, cg_w, cg_h,
+            "SCK and CG display sizes differ! Using CG for mouse mapping, SCK for capture."
+        );
+    }
 
     // Determine RDP desktop resolution (what we capture and send)
     let (width, height) = if config.width > 0 && config.height > 0 {
         (config.width as u16, config.height as u16)
     } else {
-        (logical_w, logical_h)
+        (sck_w, sck_h)
     };
 
     // Parse quality setting
@@ -94,33 +113,46 @@ async fn main() -> Result<()> {
     let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
     tracing::info!(chroma_mode = config.chroma_mode.as_deref().unwrap_or("avc420"), mode_444, "Chroma mode");
 
-    // HiDPI scale: multiply resolution for sharper capture on Retina displays
-    let hidpi_scale = config.hidpi_scale.unwrap_or(1).max(1).min(4);
-    let (width, height) = (width * hidpi_scale as u16, height * hidpi_scale as u16);
-    if hidpi_scale > 1 {
-        tracing::info!(hidpi_scale, width, height, "HiDPI scaling enabled");
-    }
+    // Resolution: "auto", "WxH" (e.g. "3840x2160"), or legacy scale (e.g. "2")
+    let res_mode = config.resolution.as_deref().unwrap_or("auto");
+    let res_auto = res_mode == "auto";
+    let (width, height) = if res_mode == "auto" {
+        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
+        tracing::info!(scale, width, height, "Resolution auto: display scale");
+        (width * scale as u16, height * scale as u16)
+    } else if let Some((w, h)) = res_mode.split_once('x').and_then(|(w, h)| {
+        Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
+    }) {
+        tracing::info!(w, h, "Resolution: explicit WxH");
+        (w, h)
+    } else if let Ok(scale) = res_mode.parse::<u32>() {
+        let scale = scale.max(1).min(4);
+        let (rw, rh) = (width as u32 * scale, height as u32 * scale);
+        tracing::info!(scale, rw, rh, "Resolution: legacy hidpi_scale → {}x{}", rw, rh);
+        (rw as u16, rh as u16)
+    } else {
+        tracing::warn!(res_mode, "Resolution: unrecognized, using logical");
+        (width, height)
+    };
 
     // Mouse coordinate mapping: RDP desktop coords → macOS logical coords
-    // Auto-computed from the ratio, works correctly for all combinations:
-    //   - hidpi_scale=2 on 1080p logical → RDP 3840x2160, mouse ÷2 → 1920x1080
-    //   - width=3840 on 1080p logical (no hidpi_scale) → mouse ÷2 → 1920x1080
-    //   - width=1920 on 1080p logical → mouse ÷1 → 1920x1080
-    let mouse_scale_x = width as f64 / logical_w as f64;
-    let mouse_scale_y = height as f64 / logical_h as f64;
+    // MouseCoordMapper maps proportionally: mac = rdp × logical ÷ rdp_desktop
+    // Completely independent of capture/encode resolution.
+    // Updated by MacDisplay::request_resize() when the client negotiates a
+    // different resolution.
+    let coord_mapper = handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
     tracing::info!(
         rdp_w = width, rdp_h = height,
-        logical_w, logical_h,
-        mouse_scale_x = format!("{:.2}", mouse_scale_x),
-        mouse_scale_y = format!("{:.2}", mouse_scale_y),
+        cg_logical_w = cg_w, cg_logical_h = cg_h,
+        sck_w, sck_h,
         "Display resolution configured"
     );
 
     // Create shared GFX state
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
 
-    // Create input handler with auto-computed mouse scale
-    let input_handler = MacInputHandler::new(mouse_scale_x, mouse_scale_y);
+    // Create input handler with coordinate mapper
+    let input_handler = MacInputHandler::new(coord_mapper.clone());
 
     // Audio setup — shared sender slot, recreated per connection by AudioFactory
     let shared_audio_tx = if config.audio.enabled {
@@ -153,8 +185,8 @@ async fn main() -> Result<()> {
             None
         };
 
-    // fixed_resolution = true when user explicitly set width/height in config
-    let fixed_resolution = config.width > 0 && config.height > 0;
+    // fixed_resolution = true when user explicitly set resolution (not "auto")
+    let fixed_resolution = (config.width > 0 && config.height > 0) || !res_auto;
 
     // Bitrate override: convert Mbps to bps, or None for auto-calculate
     let bitrate_override = config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
@@ -168,7 +200,8 @@ async fn main() -> Result<()> {
     };
 
     // Create display with shared GFX state
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, bitrate_override, Arc::clone(&gfx_state), shared_audio_tx, perf_stats.clone());
+    let show_cursor = config.show_cursor.unwrap_or(true);
+    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone());
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 

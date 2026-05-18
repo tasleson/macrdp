@@ -153,6 +153,7 @@ pub async fn get_config(
 
 #[tauri::command]
 pub async fn set_config(
+    app: tauri::AppHandle,
     key: String,
     value: serde_json::Value,
     state: State<'_, Arc<AppState>>,
@@ -166,9 +167,57 @@ pub async fn set_config(
         restart
     };
 
-    // TODO: If hot-updatable and the server is running, dispatch ConfigUpdate
-    // via ServerHandle::update_config() once that method is implemented.
-    // For now, hot-update dispatch is deferred.
+    // Hot-update: push changes to running server
+    {
+        let guard = state.server_handle.lock().await;
+        if let Some(handle) = guard.as_ref() {
+            let config = state.ui_config.lock().await;
+            match key.as_str() {
+                "frame_rate" => handle.update_config(macrdp_core::ConfigUpdate::FrameRate(config.frame_rate)),
+                "bitrate_mbps" => handle.update_config(macrdp_core::ConfigUpdate::BitrateKbps(config.bitrate_mbps * 1000)),
+                "log_level" => handle.update_config(macrdp_core::ConfigUpdate::LogLevel(config.log_level.clone())),
+                "show_cursor" => handle.update_config(macrdp_core::ConfigUpdate::ShowCursor(config.show_cursor)),
+                "resolution" | "hidpi_scale" => handle.update_config(macrdp_core::ConfigUpdate::Resolution(config.resolution.clone())),
+                "encoder" => handle.update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
+                "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(config.chroma_mode.clone())),
+                "username" | "password" => handle.update_config(macrdp_core::ConfigUpdate::Credentials {
+                    username: config.username.clone(),
+                    password: config.password.clone(),
+                }),
+                // port: auto-restart needed (can't rebind TCP listener)
+                "port" => { /* handled below */ }
+                _ => {}
+            }
+        }
+    }
+
+    // Seamless port migration: start new port first, then stop old
+    if key == "port" {
+        let old_handle = state.server_handle.lock().await.clone();
+        if old_handle.is_some() {
+            tracing::info!("Port changed, starting new listener before releasing old");
+            let config = state.ui_config.lock().await.to_server_config();
+            let bridge = TauriEventBridge::new(app.clone());
+            match macrdp_core::start_server(config, bridge).await {
+                Ok(new_handle) => {
+                    let new_port = new_handle.port();
+                    // Swap: store new handle, then stop old
+                    let old = {
+                        let mut guard = state.server_handle.lock().await;
+                        guard.replace(new_handle)
+                    };
+                    if let Some(old) = old {
+                        let old_port = old.port();
+                        let _ = old.stop().await;
+                        tracing::info!(old_port, new_port, "Seamless port migration complete");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start on new port: {e}, keeping old");
+                }
+            }
+        }
+    }
 
     Ok(SetConfigResponse { restart_required })
 }
@@ -176,25 +225,21 @@ pub async fn set_config(
 #[tauri::command]
 pub async fn get_logs(
     limit: Option<usize>,
-    state: State<'_, Arc<AppState>>,
-    db: State<'_, Arc<Database>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let limit = limit.unwrap_or(100);
+    let limit = limit.unwrap_or(500);
 
-    // Try in-memory logs first
-    let logs = state.logs.lock().await;
-    if !logs.is_empty() {
-        let entries: Vec<serde_json::Value> = logs
-            .iter()
-            .rev()
-            .take(limit)
-            .map(|e| serde_json::to_value(e).unwrap_or_default())
-            .collect();
-        return Ok(entries);
-    }
-
-    // Fall back to database
-    db.get_logs(limit)
+    // Read from log file (lock-free read, writer holds its own lock)
+    let Some(path) = macrdp_core::log_file_path() else {
+        return Ok(Vec::new());
+    };
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let entries: Vec<serde_json::Value> = content
+        .lines()
+        .rev()
+        .take(limit)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    Ok(entries)
 }
 
 #[tauri::command]

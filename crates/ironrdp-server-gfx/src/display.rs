@@ -22,6 +22,8 @@ pub enum DisplayUpdate {
     Bitmap(BitmapUpdate),
     /// GFX H.264 frame update (requires RDPGFX channel)
     GfxFrame(GfxFrameUpdate),
+    /// GFX uncompressed dirty rect update (small changes, zero encode latency)
+    GfxUncompressed(GfxUncompressedUpdate),
     PointerPosition(PointerPositionAttribute),
     ColorPointer(ColorPointer),
     RGBAPointer(RGBAPointer),
@@ -47,6 +49,27 @@ pub struct GfxFrameUpdate {
     /// AVC444 Auxiliary View H.264 data (stream2).
     /// None = AVC420 mode, Some = AVC444 mode.
     pub h264_aux: Option<Bytes>,
+}
+
+/// Single uncompressed dirty rectangle for GFX pipeline
+#[derive(Debug, Clone)]
+pub struct UncompressedRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Pixel data in BGRA format (= RDP XRGB on little-endian), tightly packed per row
+    pub pixel_data: Bytes,
+}
+
+/// GFX uncompressed frame update — sends raw pixels for small dirty regions
+#[derive(Debug, Clone)]
+pub struct GfxUncompressedUpdate {
+    pub rects: Vec<UncompressedRect>,
+    /// Surface width (for first-frame setup)
+    pub width: u16,
+    /// Surface height (for first-frame setup)
+    pub height: u16,
 }
 
 #[derive(Clone)]
@@ -318,9 +341,16 @@ pub trait RdpServerDisplay: Send {
         debug!(?layout, "Requesting layout")
     }
 
-    /// Request a specific resolution (called during client capability negotiation)
+    /// Request a specific resolution (called during client capability negotiation).
+    /// May be ignored if the display has a fixed resolution.
     fn request_resize(&mut self, _width: u16, _height: u16) {
         // Default: ignore. Override in display implementations that support dynamic resolution.
+    }
+
+    /// Force-set display size (server-initiated, bypasses fixed_resolution check).
+    /// Used for hot-config resolution changes that apply on next connection.
+    fn set_size(&mut self, _width: u16, _height: u16) {
+        // Default: delegate to request_resize
     }
 }
 

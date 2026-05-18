@@ -53,6 +53,20 @@ function applyTheme(theme: Theme) {
     root.classList.add("dark");
   } else if (theme === "light") {
     root.setAttribute("data-theme", "light");
+  } else {
+    // "system" — sync .dark class with OS preference
+    if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      root.classList.add("dark");
+    }
   }
-  // "system" — let prefers-color-scheme media query handle it
+}
+
+// Listen for OS theme changes and re-apply when in "system" mode
+if (typeof window !== "undefined") {
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    const root = document.documentElement;
+    if (!root.hasAttribute("data-theme")) {
+      root.classList.toggle("dark", window.matchMedia("(prefers-color-scheme: dark)").matches);
+    }
+  });
 }

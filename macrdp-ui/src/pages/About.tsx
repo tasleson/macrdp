@@ -1,8 +1,6 @@
 import { useState } from "react";
-import { Monitor, RefreshCw, Github, ExternalLink, Scale, Cpu, ChevronRight } from "lucide-react";
+import { Monitor } from "lucide-react";
 import { api } from "../lib/ipc";
-import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 
 function About() {
   const [updateStatus, setUpdateStatus] = useState<
@@ -29,123 +27,77 @@ function About() {
     }
   };
 
+  const updateLabel = () => {
+    switch (updateStatus) {
+      case "checking":
+        return "检查中...";
+      case "latest":
+        return "已是最新";
+      case "available":
+        return `新版本 ${updateInfo.version ?? ""}`;
+      case "error":
+        return "检查失败";
+      default:
+        return "检查更新";
+    }
+  };
+
   return (
-    <div className="space-y-6">
-      {/* App info card */}
-      <Card>
-        <CardContent className="text-center">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10">
-            <Monitor className="h-8 w-8 text-primary" />
-          </div>
-          <h1 className="text-xl font-semibold text-foreground">macrdp</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            macOS 远程桌面服务端
-          </p>
-          <p className="mt-2 font-mono text-xs text-muted-foreground">
-            版本 1.0.0
-          </p>
-        </CardContent>
-      </Card>
+    <div className="flex h-full flex-col items-center justify-center p-4">
+      <div className="w-full max-w-sm rounded-[10px] bg-card p-6 text-center">
+        {/* App icon */}
+        <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent/10">
+          <Monitor size={32} className="text-accent" />
+        </div>
 
-      {/* Check for updates */}
-      <section>
-        <h2 className="mb-3 text-base font-medium text-foreground">
-          软件更新
-        </h2>
-        <Card size="sm">
-          <CardContent>
-            <div className="flex items-center justify-between">
-              <div>
-                {updateStatus === "idle" && (
-                  <p className="text-sm text-muted-foreground">
-                    点击检查是否有新版本
-                  </p>
-                )}
-                {updateStatus === "checking" && (
-                  <p className="text-sm text-muted-foreground">正在检查...</p>
-                )}
-                {updateStatus === "latest" && (
-                  <p className="text-sm text-green">已是最新版本</p>
-                )}
-                {updateStatus === "available" && (
-                  <div>
-                    <p className="text-sm text-foreground">
-                      发现新版本: {updateInfo.version}
-                    </p>
-                    {updateInfo.url && (
-                      <a
-                        href={updateInfo.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline"
-                      >
-                        <ExternalLink className="h-3 w-3" />
-                        前往下载
-                      </a>
-                    )}
-                  </div>
-                )}
-                {updateStatus === "error" && (
-                  <p className="text-sm text-destructive">检查更新失败</p>
-                )}
-              </div>
-              <Button
-                disabled={updateStatus === "checking"}
-                onClick={handleCheckUpdate}
-              >
-                <RefreshCw className={`h-4 w-4 ${updateStatus === "checking" ? "animate-spin" : ""}`} />
-                检查更新
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </section>
+        {/* App name */}
+        <div className="text-lg font-semibold text-text">MacRDP</div>
 
-      {/* Links section */}
-      <section>
-        <h2 className="mb-3 text-base font-medium text-foreground">
-          相关链接
-        </h2>
-        <Card size="sm" className="py-0">
-          <div className="divide-y divide-border">
+        {/* Version */}
+        <div className="mt-0.5 text-xs text-text-muted">版本 1.0.0</div>
+
+        {/* Separator */}
+        <div className="my-3 border-t border-border" />
+
+        {/* Tech stack */}
+        <div className="text-[11px] text-text-muted">
+          IronRDP &middot; OpenH264 &middot; ScreenCaptureKit
+        </div>
+
+        {/* Links row */}
+        <div className="mt-3 flex items-center justify-center gap-3">
+          <a
+            href="https://github.com/aspect-build/macrdp"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-accent hover:underline"
+          >
+            GitHub
+          </a>
+          <span className="text-xs text-text-muted">MIT License</span>
+          <button
+            onClick={handleCheckUpdate}
+            disabled={updateStatus === "checking"}
+            className="text-xs text-accent hover:underline disabled:opacity-50"
+          >
+            {updateLabel()}
+          </button>
+        </div>
+
+        {/* Update download link */}
+        {updateStatus === "available" && updateInfo.url && (
+          <div className="mt-2">
             <a
-              href="https://github.com/aspect-build/macrdp"
+              href={updateInfo.url}
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center justify-between px-4 py-3 transition-colors hover:bg-muted/50"
+              className="text-xs text-accent hover:underline"
             >
-              <span className="flex items-center gap-2 text-sm text-foreground">
-                <Github className="h-4 w-4 text-muted-foreground" />
-                GitHub 项目
-              </span>
-              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              前往下载
             </a>
-            <div className="flex items-center justify-between px-4 py-3">
-              <span className="flex items-center gap-2 text-sm text-foreground">
-                <Scale className="h-4 w-4 text-muted-foreground" />
-                许可证
-              </span>
-              <span className="text-sm text-muted-foreground">MIT</span>
-            </div>
-            <div className="flex items-center justify-between px-4 py-3">
-              <span className="flex items-center gap-2 text-sm text-foreground">
-                <ExternalLink className="h-4 w-4 text-muted-foreground" />
-                协议栈
-              </span>
-              <span className="text-sm text-muted-foreground">IronRDP</span>
-            </div>
-            <div className="flex items-center justify-between px-4 py-3">
-              <span className="flex items-center gap-2 text-sm text-foreground">
-                <Cpu className="h-4 w-4 text-muted-foreground" />
-                编码器
-              </span>
-              <span className="text-sm text-muted-foreground">
-                OpenH264 (H.264)
-              </span>
-            </div>
           </div>
-        </Card>
-      </section>
+        )}
+      </div>
     </div>
   );
 }

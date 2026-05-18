@@ -1,5 +1,41 @@
 //! RDP server lifecycle: start, stop, metrics, connections
 
+/// Parse "WxH" resolution string, e.g. "3840x2160" → Some((3840, 2160))
+fn parse_resolution(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+/// Resolve resolution config value to (width, height).
+///
+/// Supports three formats:
+/// - "auto": detect display scale and multiply logical resolution
+/// - "WxH" (e.g. "3840x2160"): use directly
+/// - legacy numeric scale (e.g. "2"): multiply logical resolution by scale factor
+pub fn resolve_resolution(
+    res_mode: &str,
+    logical_w: u16,
+    logical_h: u16,
+) -> (u16, u16) {
+    if res_mode == "auto" {
+        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
+        tracing::info!(scale, logical_w, logical_h, "Resolution auto: display scale");
+        (logical_w * scale as u16, logical_h * scale as u16)
+    } else if let Some((w, h)) = parse_resolution(res_mode) {
+        tracing::info!(w, h, "Resolution: explicit WxH");
+        (w as u16, h as u16)
+    } else if let Ok(scale) = res_mode.parse::<u32>() {
+        // Legacy hidpi_scale: 1, 2, 3, 4 → multiply logical resolution
+        let scale = scale.max(1).min(4);
+        let (w, h) = (logical_w as u32 * scale, logical_h as u32 * scale);
+        tracing::info!(scale, w, h, logical_w, logical_h, "Resolution: legacy hidpi_scale → {}x{}", w, h);
+        (w as u16, h as u16)
+    } else {
+        tracing::warn!(res_mode, "Resolution: unrecognized value, using logical resolution");
+        (logical_w, logical_h)
+    }
+}
+
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -27,6 +63,7 @@ pub struct ServerHandle {
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
+    config_tx: tokio::sync::mpsc::UnboundedSender<ConfigUpdate>,
 }
 
 impl ServerHandle {
@@ -73,6 +110,11 @@ impl ServerHandle {
         }
     }
 
+    /// Push a hot config update to the running server.
+    pub fn update_config(&self, update: ConfigUpdate) {
+        let _ = self.config_tx.send(update);
+    }
+
     /// Gracefully stop the server.
     pub async fn stop(&self) -> Result<()> {
         if self.stopped.swap(true, Ordering::Relaxed) {
@@ -113,20 +155,16 @@ struct ServerThreadArgs {
     bind_addr: SocketAddr,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
-    #[allow(dead_code)]
-    logical_w: u16,
-    #[allow(dead_code)]
-    logical_h: u16,
     width: u16,
     height: u16,
     quality: macrdp_encode::Quality,
     encoder_pref: macrdp_encode::EncoderPreference,
     mode_444: bool,
-    mouse_scale_x: f64,
-    mouse_scale_y: f64,
+    coord_mapper: crate::handler::MouseCoordMapper,
     gfx_state: Arc<Mutex<GfxState>>,
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
+    config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
 }
 
 /// Try to bind to the given address. If the port is in use, try the next 99 ports.
@@ -186,23 +224,36 @@ pub async fn start_server(
     let (cert_path, key_path) =
         tls::ensure_tls_files(config.cert_path.as_deref(), config.key_path.as_deref())?;
 
-    // Display detection
-    let (logical_w, logical_h) = match permissions::detect_display_size() {
+    // Display detection — SCK for capture sizing, CG for mouse mapping
+    let (sck_w, sck_h) = match permissions::detect_display_size() {
         Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "Detected macOS logical display size");
+            tracing::info!(width = w, height = h, "SCK logical display size");
             (w as u16, h as u16)
         }
         Err(e) => {
-            tracing::warn!("Failed to detect display size: {e}, defaulting to 1920x1080");
+            tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
             (1920u16, 1080u16)
         }
     };
+    let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
+        Ok((w, h)) => {
+            tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
+            (w as u16, h as u16)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
+            (sck_w, sck_h)
+        }
+    };
+    if sck_w != cg_w || sck_h != cg_h {
+        tracing::warn!(sck_w, sck_h, cg_w, cg_h, "SCK and CG display sizes differ!");
+    }
 
     // Resolution
     let (width, height) = if config.width > 0 && config.height > 0 {
         (config.width as u16, config.height as u16)
     } else {
-        (logical_w, logical_h)
+        (sck_w, sck_h)
     };
 
     // Quality / encoder / chroma
@@ -214,13 +265,13 @@ pub async fn start_server(
     let encoder_pref = macrdp_encode::EncoderPreference::from_str_opt(config.encoder.as_deref());
     let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
 
-    // HiDPI
-    let hidpi_scale = config.hidpi_scale.unwrap_or(1).max(1).min(4);
-    let (width, height) = (width * hidpi_scale as u16, height * hidpi_scale as u16);
+    // Resolution
+    let res_mode = config.resolution.as_deref().unwrap_or("auto");
+    let res_auto = res_mode == "auto";
+    let (width, height) = resolve_resolution(res_mode, width, height);
 
-    // Mouse coordinate mapping
-    let mouse_scale_x = width as f64 / logical_w as f64;
-    let mouse_scale_y = height as f64 / logical_h as f64;
+    // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
+    let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
@@ -232,6 +283,7 @@ pub async fn start_server(
     // a pre-bound TcpListener. The TOCTOU window is microsecond-level.
     drop(listener);
     let shutdown_notify = Arc::new(Notify::new());
+    let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel::<ConfigUpdate>();
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
@@ -239,18 +291,16 @@ pub async fn start_server(
         bind_addr,
         cert_path,
         key_path,
-        logical_w,
-        logical_h,
         width,
         height,
         quality,
         encoder_pref,
         mode_444,
-        mouse_scale_x,
-        mouse_scale_y,
+        coord_mapper,
         gfx_state: Arc::clone(&gfx_state),
         shutdown_notify: Arc::clone(&shutdown_notify),
         handler: Arc::clone(&handler),
+        config_rx,
     };
 
     // Spawn RDP server on a dedicated OS thread.
@@ -314,6 +364,7 @@ pub async fn start_server(
         stopped: AtomicBool::new(false),
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
+        config_tx,
     });
 
     // Notify handler: running
@@ -341,6 +392,8 @@ fn run_server_thread(args: ServerThreadArgs) {
 
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
+        let mut config_rx = args.config_rx;
+
         // Load TLS identity (on this thread)
         let tls_identity = match TlsIdentityCtx::init_from_paths(&args.cert_path, &args.key_path) {
             Ok(id) => id,
@@ -367,8 +420,8 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         };
 
-        // Create input handler
-        let input_handler = MacInputHandler::new(args.mouse_scale_x, args.mouse_scale_y);
+        // Create input handler (clone coord_mapper — shared with display for resize sync)
+        let input_handler = MacInputHandler::new(args.coord_mapper.clone());
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
         let shared_audio_tx = if args.config.audio.enabled {
@@ -402,8 +455,10 @@ fn run_server_thread(args: ServerThreadArgs) {
             };
 
         // Create display
-        let fixed_resolution = args.config.width > 0 && args.config.height > 0;
+        let res_fixed = args.config.resolution.as_deref().unwrap_or("auto") != "auto";
+        let fixed_resolution = (args.config.width > 0 && args.config.height > 0) || res_fixed;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
+        let show_cursor = args.config.show_cursor.unwrap_or(true);
         let display = MacDisplay::new(
             args.width,
             args.height,
@@ -412,8 +467,10 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.quality,
             args.encoder_pref,
             args.mode_444,
+            show_cursor,
             bitrate_override,
             Arc::clone(&args.gfx_state),
+            args.coord_mapper,
             shared_audio_tx,
             None, // perf_stats: not exposed via macrdp-core API yet
         );
@@ -470,6 +527,51 @@ fn run_server_thread(args: ServerThreadArgs) {
         tracing::info!("Authentication configured for user: {}", username);
 
         tracing::info!(%args.bind_addr, "RDP server listening");
+
+        // Spawn config hot-update listener
+        let gfx_for_config = Arc::clone(&args.gfx_state);
+        let ev_sender = server.event_sender().clone();
+        tokio::task::spawn_local(async move {
+            while let Some(update) = config_rx.recv().await {
+                match update {
+                    ConfigUpdate::FrameRate(fps) => {
+                        tracing::info!(fps, "Hot-update: frame_rate (next connection)");
+                    }
+                    ConfigUpdate::BitrateKbps(kbps) => {
+                        let bps = kbps * 1000;
+                        tracing::info!(bitrate_kbps = kbps, "Hot-update: bitrate");
+                        gfx_for_config.lock().unwrap().target_bitrate = Some(bps);
+                    }
+                    ConfigUpdate::LogLevel(level) => {
+                        tracing::info!(%level, "Hot-update: log_level");
+                    }
+                    ConfigUpdate::ShowCursor(show) => {
+                        tracing::info!(show_cursor = show, "Hot-update: show_cursor (next connection)");
+                        gfx_for_config.lock().unwrap().show_cursor = Some(show);
+                    }
+                    ConfigUpdate::Resolution(res) => {
+                        tracing::info!(%res, "Hot-update: resolution (next connection)");
+                        gfx_for_config.lock().unwrap().resolution = Some(res);
+                    }
+                    ConfigUpdate::Encoder(enc) => {
+                        tracing::info!(%enc, "Hot-update: encoder (next connection)");
+                        gfx_for_config.lock().unwrap().encoder_pref = Some(enc);
+                    }
+                    ConfigUpdate::ChromaMode(mode) => {
+                        let avc444 = mode == "avc444";
+                        tracing::info!(%mode, avc444, "Hot-update: chroma_mode (next connection)");
+                        gfx_for_config.lock().unwrap().chroma_mode = Some(mode);
+                    }
+                    ConfigUpdate::Credentials { username, password } => {
+                        tracing::info!(%username, "Hot-update: credentials");
+                        let _ = ev_sender.send(ironrdp_server::ServerEvent::SetCredentials(
+                            ironrdp_server::Credentials { username, password, domain: None }
+                        ));
+                    }
+                }
+            }
+        });
+
         tokio::select! {
             result = server.run() => {
                 if let Err(e) = result {

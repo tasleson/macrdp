@@ -13,11 +13,3 @@ macrdp-capture = { path = "../macrdp-capture" }
 
 [dev-dependencies]
 approx = "0.5"
-
-[features]
-default = []
-opus = ["dep:opus"]
-
-[dependencies.opus]
-version = "0.3"
-optional = true

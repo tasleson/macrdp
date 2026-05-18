@@ -262,19 +262,31 @@ function Settings() {
 
         {activeCategory === "display" && (
           <CategorySection title="显示">
-            <SettingRow label="HiDPI 缩放">
+            <SettingRow label="分辨率" description="新连接生效，Auto 跟随屏幕">
               <Select
-                value={String(config.hidpi_scale)}
-                onValueChange={(v) => updateConfig("hidpi_scale", Number(v))}
+                value={config.resolution || "auto"}
+                onValueChange={(v) => updateConfig("resolution", v)}
               >
-                <SelectTrigger className="h-7 w-[120px] text-xs">
+                <SelectTrigger className="h-7 w-[180px] text-xs">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="1">1x</SelectItem>
-                  <SelectItem value="2">2x</SelectItem>
-                  <SelectItem value="3">3x</SelectItem>
-                  <SelectItem value="4">4x</SelectItem>
+                  <SelectItem value="auto">Auto</SelectItem>
+                  <SelectItem value="7680x4320">7680 × 4320</SelectItem>
+                  <SelectItem value="5120x2880">5120 × 2880</SelectItem>
+                  <SelectItem value="3840x2160">3840 × 2160</SelectItem>
+                  <SelectItem value="2560x1600">2560 × 1600</SelectItem>
+                  <SelectItem value="2560x1440">2560 × 1440</SelectItem>
+                  <SelectItem value="2048x1536">2048 × 1536</SelectItem>
+                  <SelectItem value="1920x1440">1920 × 1440</SelectItem>
+                  <SelectItem value="1920x1200">1920 × 1200</SelectItem>
+                  <SelectItem value="1920x1080">1920 × 1080</SelectItem>
+                  <SelectItem value="1680x1050">1680 × 1050</SelectItem>
+                  <SelectItem value="1600x1200">1600 × 1200</SelectItem>
+                  <SelectItem value="1600x1024">1600 × 1024</SelectItem>
+                  <SelectItem value="1600x900">1600 × 900</SelectItem>
+                  <SelectItem value="1440x1080">1440 × 1080</SelectItem>
+                  <SelectItem value="1366x768">1366 × 768</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>

@@ -1,20 +1,26 @@
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, PixelFormat as RdpPixelFormat,
-    RdpServerDisplay, RdpServerDisplayUpdates,
-    gfx::GfxState,
+    BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
+    PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
+    UncompressedRect, gfx::GfxState,
 };
-use macrdp_capture::{AudioFrame, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
+use macrdp_audio::SharedAudioTx;
+use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 
+use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
 
 /// Maximum tile size for bitmap updates
 const TILE_SIZE: u16 = 64;
+
+/// Maximum total dirty area (in pixels) for the uncompressed GFX path.
+/// Below this threshold, raw pixels are sent instead of H.264 encoding.
+/// 65536 pixels ≈ 256×256 rect ≈ 256 KB of raw BGRA data.
+const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
 
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
@@ -71,9 +77,12 @@ pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<Bit
 pub struct MacDisplay {
     width: u16,
     height: u16,
-    /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
+    /// Maximum capture resolution (physical display resolution).
+    /// Client can resize freely up to this limit.
     max_width: u16,
     max_height: u16,
+    /// Shared mouse coordinate mapper — updated on resize
+    coord_mapper: MouseCoordMapper,
     /// Whether resolution is fixed by config (true) or follows client (false)
     fixed_resolution: bool,
     frame_rate: u32,
@@ -81,10 +90,11 @@ pub struct MacDisplay {
     encoder_pref: macrdp_encode::EncoderPreference,
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
+    show_cursor: bool,
     base_bitrate: u32,
     gfx_state: Arc<Mutex<GfxState>>,
-    /// Optional audio channel sender for SCK audio capture
-    audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    /// Shared audio sender slot — updated per connection by AudioFactory
+    shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
 }
@@ -96,20 +106,28 @@ impl MacDisplay {
         frame_rate: u32, quality: Quality,
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
+        show_cursor: bool,
         bitrate_override: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
-        audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        coord_mapper: MouseCoordMapper,
+        shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
         tracing::info!(base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0, "Base bitrate");
+        // Max resolution: use physical display size so clients can resize freely.
+        // SCK scales_to_fit handles any resolution.
+        let (max_w, max_h) = macrdp_capture::detect_display_scale()
+            .map(|scale| (width.max((width as u32 * scale) as u16), height.max((height as u32 * scale) as u16)))
+            .unwrap_or((width.max(3840), height.max(2160)));
         Self {
             width, height,
-            max_width: width, max_height: height,
+            max_width: max_w, max_height: max_h,
+            coord_mapper,
             fixed_resolution,
-            frame_rate, quality, encoder_pref, mode_444, base_bitrate, gfx_state,
-            audio_tx,
+            frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
+            shared_audio_tx,
             perf_stats,
         }
     }
@@ -139,6 +157,7 @@ impl RdpServerDisplay for MacDisplay {
             self.base_bitrate = macrdp_encode::screen_bitrate(
                 w as u32, h as u32, self.frame_rate as f32, self.quality,
             );
+            self.coord_mapper.update_rdp_size(w, h);
         }
     }
 
@@ -152,8 +171,12 @@ impl RdpServerDisplay for MacDisplay {
             } else {
                 CapturePixelFormat::Bgra
             },
+            show_cursor: self.show_cursor,
         };
-        let capturer = ScreenCapturer::new(capture_config.clone(), self.audio_tx.clone()).await?;
+        // Read the current audio sender from the shared slot (set by AudioFactory per connection)
+        let audio_tx = self.shared_audio_tx.as_ref()
+            .and_then(|shared| shared.lock().unwrap().clone());
+        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(
@@ -179,6 +202,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             display_frame_count: 0,
             skip_next_frame: false,
+            overload_count: 0,
             perf_stats: self.perf_stats.clone(),
         }))
     }
@@ -193,6 +217,8 @@ struct MacDisplayUpdates {
     mode_444: bool,
     display_frame_count: u64,
     skip_next_frame: bool,
+    /// Counter for rate-limiting encode overload warnings
+    overload_count: u64,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
 }
@@ -268,6 +294,71 @@ impl MacDisplayUpdates {
         };
 
         if gfx_ready {
+            // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
+            if !frame.dirty_rects.is_empty() {
+                let total_area: u32 = frame.dirty_rects.iter()
+                    .map(|r| r.width * r.height)
+                    .sum();
+
+                if total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS {
+                    if let Some(bgra) = frame.data.as_bgra_bytes() {
+                        let rects: Vec<UncompressedRect> = frame.dirty_rects.iter()
+                            .filter(|r| r.width > 0 && r.height > 0)
+                            .filter_map(|r| {
+                                // Clamp to frame bounds
+                                let x = r.x.min(frame.width.saturating_sub(1));
+                                let y = r.y.min(frame.height.saturating_sub(1));
+                                let w = r.width.min(frame.width - x);
+                                let h = r.height.min(frame.height - y);
+                                if w == 0 || h == 0 { return None; }
+
+                                let bpp = 4usize;
+                                let row_bytes = w as usize * bpp;
+                                let mut pixels = Vec::with_capacity(h as usize * row_bytes);
+                                for row in 0..h as usize {
+                                    let src_y = y as usize + row;
+                                    let offset = src_y * frame.stride + x as usize * bpp;
+                                    let end = offset + row_bytes;
+                                    if end <= bgra.len() {
+                                        pixels.extend_from_slice(&bgra[offset..end]);
+                                    }
+                                }
+                                Some(UncompressedRect {
+                                    x: x as u16,
+                                    y: y as u16,
+                                    width: w as u16,
+                                    height: h as u16,
+                                    pixel_data: Bytes::from(pixels),
+                                })
+                            })
+                            .collect();
+
+                        if !rects.is_empty() {
+                            self.display_frame_count += 1;
+                            let total_bytes: usize = rects.iter().map(|r| r.pixel_data.len()).sum();
+                            {
+                                let mut st = self.gfx_state.lock().unwrap();
+                                st.last_encode_ms = 0.0; // zero encode time
+                                st.last_frame_bytes = total_bytes as u32;
+                            }
+                            tracing::debug!(
+                                display_frame = self.display_frame_count,
+                                rects = rects.len(),
+                                total_pixels = total_area,
+                                total_bytes,
+                                "Display: sending GFX uncompressed dirty rects"
+                            );
+                            return Ok(Some(DisplayUpdate::GfxUncompressed(GfxUncompressedUpdate {
+                                rects,
+                                width: frame.width as u16,
+                                height: frame.height as u16,
+                            })));
+                        }
+                    }
+                    // PixelBuffer frames or extraction failure — fall through to H.264
+                }
+            }
+
             // GFX H.264 path — always send at capture rate, never block on acks
             if let Some(encoder) = &mut self.encoder {
                 self.display_frame_count += 1;
@@ -297,13 +388,18 @@ impl MacDisplayUpdates {
                                     ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
                                 }
                                 let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.8 {
+                                if encode_ms > frame_interval_ms * 0.95 {
                                     self.skip_next_frame = true;
-                                    tracing::warn!(
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                        "encode overload — skipping next frame"
-                                    );
+                                    self.overload_count += 1;
+                                    // Rate-limit log: warn once per ~60 overloads, debug otherwise
+                                    if self.overload_count % 60 == 1 {
+                                        tracing::warn!(
+                                            encode_ms = format!("{:.1}", encode_ms),
+                                            frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                                            overload_total = self.overload_count,
+                                            "encode overload — skipping frames"
+                                        );
+                                    }
                                 }
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
@@ -355,13 +451,17 @@ impl MacDisplayUpdates {
                                 ps.lock().unwrap().record_frame(encode_ms, total_bytes as u32, is_keyframe);
                             }
                             let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                            if encode_ms > frame_interval_ms * 0.8 {
+                            if encode_ms > frame_interval_ms * 0.95 {
                                 self.skip_next_frame = true;
-                                tracing::warn!(
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                    "encode overload — skipping next frame"
-                                );
+                                self.overload_count += 1;
+                                if self.overload_count % 60 == 1 {
+                                    tracing::warn!(
+                                        encode_ms = format!("{:.1}", encode_ms),
+                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                                        overload_total = self.overload_count,
+                                        "encode overload — skipping frames"
+                                    );
+                                }
                             }
                             return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
@@ -408,13 +508,17 @@ impl MacDisplayUpdates {
                             ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
                         }
                         let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                        if encode_ms > frame_interval_ms * 0.8 {
+                        if encode_ms > frame_interval_ms * 0.95 {
                             self.skip_next_frame = true;
-                            tracing::warn!(
-                                encode_ms = format!("{:.1}", encode_ms),
-                                frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                "encode overload — skipping next frame"
-                            );
+                            self.overload_count += 1;
+                            if self.overload_count % 60 == 1 {
+                                tracing::warn!(
+                                    encode_ms = format!("{:.1}", encode_ms),
+                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                                    overload_total = self.overload_count,
+                                    "encode overload — skipping frames"
+                                );
+                            }
                         }
                         return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,

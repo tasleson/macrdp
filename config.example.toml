@@ -43,7 +43,7 @@ frame_rate = 60
 # Multiplies capture resolution for sharper image on Retina displays.
 # e.g. scale=2 on a 1920x1080 logical display → captures at 3840x2160 (4K)
 # Mouse coordinates are automatically mapped back to logical points.
-# hidpi_scale = 2
+# resolution = "3840x2160"
 
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 

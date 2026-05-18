@@ -1,7 +1,9 @@
-import { Play, Square } from "lucide-react";
+import { useRef, useCallback } from "react";
+import { Play, Square, Loader2 } from "lucide-react";
 
 interface StatusBarProps {
   state: "running" | "starting" | "stopped" | "error";
+  loading?: boolean;
   port?: number;
   uptimeSeconds?: number;
   errorMessage?: string;
@@ -29,7 +31,7 @@ const statusConfig: Record<
   starting: {
     dotClass: "bg-yellow",
     glowColor: "0 0 6px var(--color-yellow)",
-    label: "启动中",
+    label: "启动中...",
   },
   stopped: {
     dotClass: "bg-text-muted",
@@ -43,8 +45,11 @@ const statusConfig: Record<
   },
 };
 
+const DEBOUNCE_MS = 1500;
+
 function StatusBar({
   state,
+  loading = false,
   port,
   uptimeSeconds,
   errorMessage,
@@ -53,7 +58,20 @@ function StatusBar({
 }: StatusBarProps) {
   const config = statusConfig[state];
   const isError = state === "error";
-  const showStop = state === "running" || state === "starting";
+  const isLoading = loading || state === "starting";
+  const showStop = state === "running" || state === "starting" || (loading && state !== "stopped");
+  const buttonsDisabled = isLoading;
+  const lastClickRef = useRef(0);
+
+  const debounced = useCallback(
+    (fn: () => void) => {
+      const now = Date.now();
+      if (now - lastClickRef.current < DEBOUNCE_MS) return;
+      lastClickRef.current = now;
+      fn();
+    },
+    []
+  );
 
   const wrapperClass = isError
     ? "flex items-center h-9 bg-red/10 border border-red/20 rounded-[8px] px-3"
@@ -61,12 +79,15 @@ function StatusBar({
 
   return (
     <div className={wrapperClass} role="status" aria-live="polite">
-      {/* Left: status dot + text + aux */}
       <div className="flex items-center gap-2 flex-1 min-w-0">
-        <span
-          className={`inline-block h-2 w-2 rounded-full shrink-0 ${config.dotClass}`}
-          style={{ boxShadow: config.glowColor }}
-        />
+        {isLoading ? (
+          <Loader2 className="h-3.5 w-3.5 text-yellow animate-spin shrink-0" />
+        ) : (
+          <span
+            className={`inline-block h-2 w-2 rounded-full shrink-0 ${config.dotClass}`}
+            style={{ boxShadow: config.glowColor }}
+          />
+        )}
         <span className="text-sm font-medium truncate">
           {isError && errorMessage ? errorMessage : config.label}
         </span>
@@ -80,24 +101,32 @@ function StatusBar({
         )}
       </div>
 
-      {/* Right: start/stop button */}
       <div className="shrink-0 ml-2">
         {showStop ? (
           <button
-            onClick={onStop}
-            disabled={state === "starting"}
+            onClick={() => debounced(onStop)}
+            disabled={buttonsDisabled}
             className="inline-flex items-center gap-1.5 rounded-md bg-red/10 px-2.5 py-1 text-xs font-medium text-red hover:bg-red/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <Square className="h-3 w-3" />
-            停止
+            {isLoading ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Square className="h-3 w-3" />
+            )}
+            {isLoading ? "处理中..." : "停止"}
           </button>
         ) : (
           <button
-            onClick={onStart}
-            className="inline-flex items-center gap-1.5 rounded-md bg-green/10 px-2.5 py-1 text-xs font-medium text-green hover:bg-green/20 transition-colors"
+            onClick={() => debounced(onStart)}
+            disabled={buttonsDisabled}
+            className="inline-flex items-center gap-1.5 rounded-md bg-green/10 px-2.5 py-1 text-xs font-medium text-green hover:bg-green/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <Play className="h-3 w-3" />
-            启动
+            {isLoading ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Play className="h-3 w-3" />
+            )}
+            {isLoading ? "处理中..." : "启动"}
           </button>
         )}
       </div>

@@ -91,6 +91,11 @@ pub enum ConfigUpdate {
     FrameRate(u32),
     BitrateKbps(u32),
     LogLevel(String),
+    ShowCursor(bool),
+    Resolution(String),
+    Encoder(String),
+    ChromaMode(String),
+    Credentials { username: String, password: String },
 }
 
 /// Callback trait for receiving server events.

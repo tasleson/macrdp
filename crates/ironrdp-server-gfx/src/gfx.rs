@@ -18,7 +18,7 @@ use ironrdp_pdu::{decode, PduResult};
 type DvcMessage = ironrdp_dvc::DvcMessage;
 use tracing::{debug, info};
 
-use crate::display::GfxFrameUpdate;
+use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -174,6 +174,16 @@ pub struct GfxState {
     bitrate_max: f64,
     bitrate_min: f64,
     last_frame_time: Option<std::time::Instant>,
+    /// Hot-updatable: target bitrate override (set via ConfigUpdate)
+    pub target_bitrate: Option<u32>,
+    /// Hot-updatable: show cursor flag (set via ConfigUpdate)
+    pub show_cursor: Option<bool>,
+    /// Hot-updatable: resolution (set via ConfigUpdate)
+    pub resolution: Option<String>,
+    /// Hot-updatable: encoder preference (set via ConfigUpdate)
+    pub encoder_pref: Option<String>,
+    /// Hot-updatable: chroma mode (set via ConfigUpdate)
+    pub chroma_mode: Option<String>,
 }
 
 impl GfxState {
@@ -203,6 +213,11 @@ impl GfxState {
             bitrate_max: 0.0,
             bitrate_min: f64::MAX,
             last_frame_time: None,
+            target_bitrate: None,
+            show_cursor: None,
+            resolution: None,
+            encoder_pref: None,
+            chroma_mode: None,
         }
     }
 
@@ -296,6 +311,20 @@ impl GfxHandler {
         let enc_w = frame.enc_width;
         let enc_h = frame.enc_height;
 
+        // Detect resolution change (e.g. client resize or HiDPI mismatch) — rebuild surface
+        if state.surface_created
+            && (state.width != frame.width || state.height != frame.height)
+        {
+            info!(
+                old_w = state.width, old_h = state.height,
+                new_w = frame.width, new_h = frame.height,
+                "GFX resolution changed, rebuilding surface"
+            );
+            state.width = frame.width;
+            state.height = frame.height;
+            state.surface_created = false;
+        }
+
         // First frame: surface setup (CapConfirm already sent by DVC handler)
         if !state.surface_created {
             if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
@@ -314,8 +343,8 @@ impl GfxHandler {
 
             if let Ok(data) = encode_vec(&ServerPdu::CreateSurface(CreateSurfacePdu {
                 surface_id: 0,
-                width: enc_w,
-                height: enc_h,
+                width: state.width,
+                height: state.height,
                 pixel_format: GfxPixelFormat::XRgb,
             })) {
                 raw_pdus.extend_from_slice(&data);
@@ -358,8 +387,8 @@ impl GfxHandler {
         let make_dest_rect = || InclusiveRectangle {
             left: 0,
             top: 0,
-            right: enc_w,   // RDPGFX_RECT16 exclusive bound = encoder-aligned
-            bottom: enc_h,  // RDPGFX_RECT16 exclusive bound = encoder-aligned
+            right: frame.width,   // RDPGFX_RECT16 exclusive bound = match surface/desktop
+            bottom: frame.height, // RDPGFX_RECT16 exclusive bound = match surface/desktop
         };
 
         let make_qq = || QuantQuality {
@@ -435,6 +464,113 @@ impl GfxHandler {
         );
 
         // Single ZGFX wrap for all concatenated PDUs
+        wrap_zgfx(&raw_pdus)
+    }
+
+    /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
+    /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
+    /// First call also includes surface setup PDUs.
+    pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
+        let mut raw_pdus = Vec::new();
+
+        // Detect resolution change — rebuild surface
+        if state.surface_created
+            && (state.width != update.width || state.height != update.height)
+        {
+            info!(
+                old_w = state.width, old_h = state.height,
+                new_w = update.width, new_h = update.height,
+                "GFX uncompressed resolution changed, rebuilding surface"
+            );
+            state.width = update.width;
+            state.height = update.height;
+            state.surface_created = false;
+        }
+
+        // First frame: surface setup (same as H.264 path)
+        if !state.surface_created {
+            if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
+                width: state.width as u32,
+                height: state.height as u32,
+                monitors: vec![Monitor {
+                    left: 0,
+                    top: 0,
+                    right: state.width as i32 - 1,
+                    bottom: state.height as i32 - 1,
+                    flags: MonitorFlags::PRIMARY,
+                }],
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
+
+            if let Ok(data) = encode_vec(&ServerPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 0,
+                width: update.width,
+                height: update.height,
+                pixel_format: GfxPixelFormat::XRgb,
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
+
+            if let Ok(data) = encode_vec(&ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: 0,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
+
+            state.surface_created = true;
+            info!("GFX surface created (uncompressed): {}x{}", update.width, update.height);
+        }
+
+        let frame_id = state.next_frame_id();
+
+        // StartFrame
+        if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
+            timestamp: Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id,
+        })) {
+            raw_pdus.extend_from_slice(&data);
+        }
+
+        // WireToSurface1 per dirty rect with Codec1Type::Uncompressed
+        let mut total_bytes = 0usize;
+        for rect in &update.rects {
+            if let Ok(data) = encode_vec(&ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 0,
+                codec_id: Codec1Type::Uncompressed,
+                pixel_format: GfxPixelFormat::XRgb,
+                destination_rectangle: InclusiveRectangle {
+                    left: rect.x,
+                    top: rect.y,
+                    right: rect.x + rect.width,
+                    bottom: rect.y + rect.height,
+                },
+                bitmap_data: rect.pixel_data.to_vec(),
+            })) {
+                total_bytes += rect.pixel_data.len();
+                raw_pdus.extend_from_slice(&data);
+            }
+        }
+
+        // EndFrame
+        if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
+            raw_pdus.extend_from_slice(&data);
+        }
+
+        debug!(
+            frame_id,
+            rects = update.rects.len(),
+            raw_bytes = total_bytes,
+            "GFX uncompressed frame PDU created",
+        );
+
         wrap_zgfx(&raw_pdus)
     }
 }

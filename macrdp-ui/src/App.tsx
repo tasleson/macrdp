@@ -10,7 +10,6 @@ import About from "./pages/About";
 import Popover from "./pages/Popover";
 import { api } from "./lib/ipc";
 import { ThemeProvider } from "./contexts/ThemeContext";
-import PermissionBanner from "./components/PermissionBanner";
 
 function MainLayout() {
   const [initialized, setInitialized] = useState(false);
@@ -50,7 +49,6 @@ function MainLayout() {
     <div className="flex h-screen w-screen overflow-hidden">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
-        <PermissionBanner />
         <main className="flex-1 overflow-auto bg-bg p-6">
           <Routes>
             <Route path="/" element={<Dashboard />} />

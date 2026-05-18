@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { LogEntry } from "../lib/types";
 
-const MAX_LOGS = 5000;
+const POLL_INTERVAL = 1000; // 1 second
 
 export function useLogs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -10,18 +10,24 @@ export function useLogs() {
   const logsRef = useRef<LogEntry[]>([]);
 
   useEffect(() => {
-    const unlisten = listen<LogEntry>("log", (event) => {
-      const newLog = event.payload;
-      logsRef.current = [...logsRef.current, newLog];
-      if (logsRef.current.length > MAX_LOGS) {
-        logsRef.current = logsRef.current.slice(-MAX_LOGS);
-      }
-      setLogs([...logsRef.current]);
-    });
+    let active = true;
 
-    return () => {
-      unlisten.then((fn) => fn());
+    const poll = async () => {
+      if (!active) return;
+      try {
+        const entries = await invoke<LogEntry[]>("get_logs", { limit: 2000 });
+        if (active && entries.length > 0) {
+          // get_logs returns newest first, reverse for display
+          const ordered = entries.reverse();
+          logsRef.current = ordered;
+          setLogs(ordered);
+        }
+      } catch {}
+      if (active) setTimeout(poll, POLL_INTERVAL);
     };
+
+    poll();
+    return () => { active = false; };
   }, []);
 
   const clearLogs = useCallback(() => {

@@ -1,5 +1,60 @@
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use std::sync::{Arc, Mutex};
+
+/// Maps RDP desktop coordinates to macOS logical coordinates.
+///
+/// Completely independent of capture/encode resolution — only cares about
+/// the RDP desktop size (what the client thinks) and the macOS logical
+/// display size (what CGEvent expects).
+///
+/// Formula: `mac = rdp × logical ÷ rdp_desktop`
+#[derive(Debug, Clone)]
+pub struct MouseCoordMapper(Arc<Mutex<CoordState>>);
+
+#[derive(Debug)]
+struct CoordState {
+    logical_w: f64,
+    logical_h: f64,
+    rdp_w: f64,
+    rdp_h: f64,
+}
+
+impl MouseCoordMapper {
+    pub fn new(logical_w: u16, logical_h: u16, rdp_w: u16, rdp_h: u16) -> Self {
+        tracing::info!(
+            logical_w, logical_h, rdp_w, rdp_h,
+            "MouseCoordMapper initialized"
+        );
+        Self(Arc::new(Mutex::new(CoordState {
+            logical_w: logical_w as f64,
+            logical_h: logical_h as f64,
+            rdp_w: rdp_w.max(1) as f64,
+            rdp_h: rdp_h.max(1) as f64,
+        })))
+    }
+
+    pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
+        let s = self.0.lock().unwrap();
+        let mac_x = (rdp_x as f64 * s.logical_w / s.rdp_w) as u16;
+        let mac_y = (rdp_y as f64 * s.logical_h / s.rdp_h) as u16;
+        (mac_x, mac_y)
+    }
+
+    pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
+        let mut s = self.0.lock().unwrap();
+        let old_w = s.rdp_w;
+        let old_h = s.rdp_h;
+        s.rdp_w = rdp_w.max(1) as f64;
+        s.rdp_h = rdp_h.max(1) as f64;
+        tracing::info!(
+            old_rdp_w = old_w, old_rdp_h = old_h,
+            new_rdp_w = rdp_w, new_rdp_h = rdp_h,
+            logical_w = s.logical_w, logical_h = s.logical_h,
+            "MouseCoordMapper: RDP desktop size updated"
+        );
+    }
+}
 
 /// Bridges RDP input events to macOS CGEvent injection
 pub struct MacInputHandler {
@@ -7,13 +62,11 @@ pub struct MacInputHandler {
     mouse: Option<MouseInjector>,
     last_mouse_x: u16,
     last_mouse_y: u16,
-    /// RDP-to-macOS coordinate scale (RDP coords ÷ scale = macOS logical points)
-    mouse_scale_x: f64,
-    mouse_scale_y: f64,
+    coord_mapper: MouseCoordMapper,
 }
 
 impl MacInputHandler {
-    pub fn new(mouse_scale_x: f64, mouse_scale_y: f64) -> Self {
+    pub fn new(coord_mapper: MouseCoordMapper) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -32,8 +85,7 @@ impl MacInputHandler {
             mouse,
             last_mouse_x: 0,
             last_mouse_y: 0,
-            mouse_scale_x: mouse_scale_x.max(1.0),
-            mouse_scale_y: mouse_scale_y.max(1.0),
+            coord_mapper,
         }
     }
 }
@@ -63,9 +115,7 @@ impl RdpServerInputHandler for MacInputHandler {
 
         let result = match event {
             MouseEvent::Move { x, y } => {
-                // Scale RDP desktop coordinates to macOS logical points
-                let mx = (x as f64 / self.mouse_scale_x) as u16;
-                let my = (y as f64 / self.mouse_scale_y) as u16;
+                let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
                 m.move_to(mx, my)

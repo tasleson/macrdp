@@ -65,23 +65,28 @@ clean-ui:
 
 # === 发布 ===
 
-# 完整发布：全优化编译 + 打包 dmg
-release:
-	@echo "=== 完整发布构建 (CLI release + UI release) ==="
-	MACRDP_CLI_PROFILE=release cd macrdp-ui && npm run tauri build
-	@echo ""
-	@echo "=== 构建完成 ==="
-	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
-	@ls -lh macrdp-ui/src-tauri/target/release/bundle/macos/*.app
+BUNDLE_ID := com.macrdp.app
+SIGN_IDENTITY := macrdp-dev
+APP_BUNDLE := macrdp-ui/src-tauri/target/release/bundle/macos/macrdp.app
 
-# 快速发布：关闭优化，加快编译，仍打包 dmg
-release-fast:
-	@echo "=== 快速发布构建 (CLI debug + UI 无优化) ==="
-	MACRDP_CLI_PROFILE=debug cd macrdp-ui && npm run tauri build
+# Tauri 自动签名：设置此环境变量后 tauri build 会自动 codesign
+export APPLE_SIGNING_IDENTITY := $(SIGN_IDENTITY)
+
+# 完整发布：全优化编译 + 自动签名 + 打包 dmg
+release:
+	@echo "=== 完整发布构建 (签名: $(SIGN_IDENTITY)) ==="
+	cd macrdp-ui && MACRDP_CLI_PROFILE=release npm run tauri -- build
 	@echo ""
 	@echo "=== 构建完成 ==="
 	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
-	@ls -lh macrdp-ui/src-tauri/target/release/bundle/macos/*.app
+
+# 快速发布：关闭优化 + 自动签名 + 打包 dmg
+release-fast:
+	@echo "=== 快速发布构建 (签名: $(SIGN_IDENTITY)) ==="
+	cd macrdp-ui && MACRDP_CLI_PROFILE=debug npm run tauri -- build
+	@echo ""
+	@echo "=== 构建完成 ==="
+	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
 
 # === 全局 ===
 
