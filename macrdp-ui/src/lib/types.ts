@@ -61,7 +61,6 @@ export interface UiConfig {
   encoder: string;
   chroma_mode: string;
   bind_address: string;
-  max_connections: number;
   idle_timeout_secs: number;
   username: string;
   password: string;

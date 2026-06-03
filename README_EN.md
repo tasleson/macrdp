@@ -25,6 +25,7 @@ A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or
 - **Configurable** — resolution, frame rate, bitrate, encoder, quality presets, all via simple TOML config
 - **Secure** — NLA/CredSSP authentication with auto-generated TLS certificates
 - **Lock screen capture** — automatic CoreGraphics fallback when the screen is locked
+- **Single-client v1** — one active RDP session is supported; concurrent sessions are not supported
 
 ---
 
@@ -49,6 +50,10 @@ cargo run --release --bin macrdp-server
 # Connect from any RDP client → your-mac-ip:3389
 ```
 
+macrdp v1 supports one active RDP client at a time. Starting a second concurrent
+session is unsupported; disconnect the active client before reconnecting from
+another device.
+
 ---
 
 ## Configuration
@@ -58,10 +63,12 @@ Copy `config.example.toml` to `config.toml` and edit as needed:
 ```toml
 # Network
 port = 13389
+bind_address = "0.0.0.0"
 
 # Authentication
 username = "admin"
 password = "123456"
+allow_generated_credentials = false
 
 # Display
 width = 0          # 0 = auto-detect
@@ -77,12 +84,77 @@ bitrate_mbps = 50           # target bitrate (Mbps)
 
 # Logging
 log_level = "info"          # trace / debug / info / warn / error
+log_path = "/path/to/macrdp.log"
 ```
 
-Config search order:
-1. `./config.toml`
-2. `~/.config/macrdp/config.toml`
-3. `~/Library/Application Support/macrdp/config.toml`
+All daemon files live under a single base directory:
+
+- macOS: `~/Library/Application Support/macrdp/`
+- Linux/BSD: `$XDG_CONFIG_HOME/macrdp/` (or `~/.config/macrdp/`)
+
+Default layout:
+
+| File                     | Purpose                                       |
+| ------------------------ | --------------------------------------------- |
+| `<base>/config.toml`     | Daemon configuration                          |
+| `<base>/tls/cert.pem`    | TLS certificate (auto-generated if missing)   |
+| `<base>/tls/key.pem`     | TLS private key (auto-generated, mode `0600`) |
+| `<base>/logs/macrdp.log` | Daemon log                                    |
+
+Each path can be overridden via the matching config field (`cert_path`, `key_path`, `log_path`) or CLI flag (`--cert-path`, `--key-path`, `--log-path`).
+
+---
+
+## Running as a launchd LaunchAgent
+
+macrdp ships a sample plist at `packaging/launchd/com.macrdp.daemon.plist`. It is designed for a per-user **LaunchAgent** (not a system LaunchDaemon) because macOS Screen Recording and Accessibility permissions are tied to the logged-in GUI session.
+
+**Install**
+
+```bash
+# 1. Build a release binary and put it somewhere persistent
+cargo build --release
+sudo install -m 0755 target/release/macrdp-server /usr/local/bin/macrdp-server
+
+# 2. Lay down config + log directories
+mkdir -p "$HOME/Library/Application Support/macrdp/logs"
+cp config.example.toml "$HOME/Library/Application Support/macrdp/config.toml"
+# Edit the config — at minimum set username/password (or allow_generated_credentials)
+
+# 3. Materialize the plist with absolute paths (no tilde expansion in plists)
+mkdir -p "$HOME/Library/LaunchAgents"
+sed \
+  -e "s|__MACRDP_BIN__|/usr/local/bin/macrdp-server|g" \
+  -e "s|__HOME__|$HOME|g" \
+  packaging/launchd/com.macrdp.daemon.plist \
+  > "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+
+# 4. Load and start
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+launchctl kickstart -k "gui/$(id -u)/com.macrdp.daemon"
+```
+
+The first time launchd starts the daemon, macOS will prompt the user session for **Screen Recording** and **Accessibility** permission against the `macrdp-server` binary. Grant both in System Settings > Privacy & Security and then restart the service.
+
+**Status, stop, restart**
+
+```bash
+launchctl print "gui/$(id -u)/com.macrdp.daemon"          # status + last exit
+launchctl kill SIGTERM "gui/$(id -u)/com.macrdp.daemon"   # graceful stop (auto-restarted if crashed)
+launchctl kickstart -k "gui/$(id -u)/com.macrdp.daemon"   # force restart
+```
+
+**Uninstall**
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+rm "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+# Optionally remove state:
+# rm -rf "$HOME/Library/Application Support/macrdp"
+# sudo rm /usr/local/bin/macrdp-server
+```
+
+The plist uses `KeepAlive = { SuccessfulExit = false; Crashed = true; }` so a clean SIGTERM (e.g. from `launchctl bootout`) stays stopped, while a crash is retried after `ThrottleInterval` (10s).
 
 ---
 

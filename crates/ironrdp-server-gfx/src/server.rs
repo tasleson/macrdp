@@ -1,4 +1,5 @@
 use core::net::SocketAddr;
+use std::net::TcpListener as StdTcpListener;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -36,9 +37,9 @@ use crate::gfx::{GfxHandler, GfxState};
 use crate::handler::RdpServerInputHandler;
 use crate::{builder, capabilities, SoundServerFactory};
 
-#[derive(Clone)]
 pub struct RdpServerOptions {
     pub addr: SocketAddr,
+    pub listener: Option<StdTcpListener>,
     pub security: RdpServerSecurity,
     pub codecs: BitmapCodecs,
 }
@@ -417,7 +418,11 @@ impl RdpServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let listener = TcpListener::bind(self.opts.addr).await?;
+        let listener = if let Some(listener) = self.opts.listener.take() {
+            TcpListener::from_std(listener)?
+        } else {
+            TcpListener::bind(self.opts.addr).await?
+        };
         let local_addr = listener.local_addr()?;
 
         debug!("Listening for connections on {local_addr}");
@@ -669,7 +674,34 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = self.display.lock().await.updates().await?;
+        let mut display_updates = match self.display.lock().await.updates().await {
+            Ok(u) => u,
+            Err(e) => {
+                // The display backend (e.g. ScreenCaptureKit) refused to start
+                // streaming. Without an explicit notification the client sits
+                // on a blank canvas because the TCP socket is closed mid-
+                // handshake. Send a ServerSetErrorInfoPdu so the client shows
+                // "server denied connection" instead of an indefinite white
+                // screen, then propagate the error.
+                warn!(
+                    error = format!("{e:#}"),
+                    "display updates unavailable; notifying client and disconnecting"
+                );
+                if let Err(send_err) = send_server_denied(
+                    io_channel_id,
+                    user_channel_id,
+                    writer,
+                )
+                .await
+                {
+                    warn!(
+                        error = format!("{send_err:#}"),
+                        "failed to send ServerDeniedConnection to client"
+                    );
+                }
+                return Err(e);
+            }
+        };
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -1111,6 +1143,30 @@ async fn deactivate_all(
         share_control_pdu: pdu,
     };
     let user_data = encode_vec(&pdu)?.into();
+    let pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: io_channel_id,
+        user_data,
+    };
+    let msg = encode_vec(&X224(pdu))?;
+    writer.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send a `ServerSetErrorInfoPdu(ServerDeniedConnection)` so a client that
+/// has already passed the handshake gets an explicit "denied" instead of a
+/// silent TCP close. Used when the server-side display backend cannot start
+/// streaming (e.g. ScreenCaptureKit returned zero displays).
+async fn send_server_denied(
+    io_channel_id: u16,
+    user_channel_id: u16,
+    writer: &mut impl FramedWrite,
+) -> Result<(), anyhow::Error> {
+    use rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+    let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+        ProtocolIndependentCode::ServerDeniedConnection,
+    ));
+    let user_data = encode_vec(&info)?.into();
     let pdu = SendDataIndication {
         initiator_id: user_channel_id,
         channel_id: io_channel_id,

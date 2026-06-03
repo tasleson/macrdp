@@ -13,7 +13,7 @@ categories.workspace = true
 
 [lib]
 doctest = false
-test = false
+test = true
 
 [dependencies]
 ironrdp-core = { path = "../ironrdp-core", version = "0.1", features = ["alloc"] } # public
@@ -25,4 +25,3 @@ tracing = { version = "0.1", features = ["log"] }
 
 [lints]
 workspace = true
-

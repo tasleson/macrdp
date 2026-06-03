@@ -22,9 +22,7 @@ impl MacInputHandler {
             .ok();
 
         if keyboard.is_none() || mouse.is_none() {
-            tracing::warn!(
-                "Input injection may fail — ensure Accessibility permission is granted"
-            );
+            tracing::warn!("Input injection may fail — ensure Accessibility permission is granted");
         }
 
         Self {
@@ -70,24 +68,42 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.last_mouse_y = my;
                 m.move_to(mx, my)
             }
-            MouseEvent::LeftPressed => {
-                m.button_event(MouseButton::Left, true, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::LeftReleased => {
-                m.button_event(MouseButton::Left, false, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::RightPressed => {
-                m.button_event(MouseButton::Right, true, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::RightReleased => {
-                m.button_event(MouseButton::Right, false, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::MiddlePressed => {
-                m.button_event(MouseButton::Middle, true, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::MiddleReleased => {
-                m.button_event(MouseButton::Middle, false, self.last_mouse_x, self.last_mouse_y)
-            }
+            MouseEvent::LeftPressed => m.button_event(
+                MouseButton::Left,
+                true,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::LeftReleased => m.button_event(
+                MouseButton::Left,
+                false,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::RightPressed => m.button_event(
+                MouseButton::Right,
+                true,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::RightReleased => m.button_event(
+                MouseButton::Right,
+                false,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::MiddlePressed => m.button_event(
+                MouseButton::Middle,
+                true,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::MiddleReleased => m.button_event(
+                MouseButton::Middle,
+                false,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
             MouseEvent::VerticalScroll { value } => m.scroll(value),
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");

@@ -199,20 +199,6 @@ function Settings() {
               />
             </div>
 
-            {/* Max connections */}
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                最大连接数
-                <span className="ml-1 text-xs text-muted-foreground/60">(重启服务生效)</span>
-              </label>
-              <Input
-                type="number"
-                value={config.max_connections}
-                onChange={(e) => updateConfig("max_connections", parseInt(e.target.value, 10))}
-                className="h-8 text-sm"
-              />
-            </div>
-
             {/* Idle timeout */}
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">

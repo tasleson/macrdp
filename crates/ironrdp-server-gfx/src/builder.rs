@@ -1,4 +1,5 @@
 use core::net::SocketAddr;
+use std::net::TcpListener as StdTcpListener;
 
 use anyhow::Result;
 use ironrdp_pdu::rdp::capability_sets::{server_codecs_capabilities, BitmapCodecs};
@@ -13,18 +14,22 @@ use crate::{DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
 pub struct WantsAddr {}
 pub struct WantsSecurity {
     addr: SocketAddr,
+    listener: Option<StdTcpListener>,
 }
 pub struct WantsHandler {
     addr: SocketAddr,
+    listener: Option<StdTcpListener>,
     security: RdpServerSecurity,
 }
 pub struct WantsDisplay {
     addr: SocketAddr,
+    listener: Option<StdTcpListener>,
     security: RdpServerSecurity,
     handler: Box<dyn RdpServerInputHandler>,
 }
 pub struct BuilderDone {
     addr: SocketAddr,
+    listener: Option<StdTcpListener>,
     security: RdpServerSecurity,
     codecs: BitmapCodecs,
     handler: Box<dyn RdpServerInputHandler>,
@@ -45,8 +50,24 @@ impl RdpServerBuilder<WantsAddr> {
     #[expect(clippy::unused_self)] // ensuring state transition from WantsAddr
     pub fn with_addr(self, addr: impl Into<SocketAddr>) -> RdpServerBuilder<WantsSecurity> {
         RdpServerBuilder {
-            state: WantsSecurity { addr: addr.into() },
+            state: WantsSecurity {
+                addr: addr.into(),
+                listener: None,
+            },
         }
+    }
+
+    #[expect(clippy::unused_self)] // ensuring state transition from WantsAddr
+    pub fn with_listener(self, listener: StdTcpListener) -> Result<RdpServerBuilder<WantsSecurity>> {
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+
+        Ok(RdpServerBuilder {
+            state: WantsSecurity {
+                addr,
+                listener: Some(listener),
+            },
+        })
     }
 }
 
@@ -61,6 +82,7 @@ impl RdpServerBuilder<WantsSecurity> {
         RdpServerBuilder {
             state: WantsHandler {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: RdpServerSecurity::None,
             },
         }
@@ -70,6 +92,7 @@ impl RdpServerBuilder<WantsSecurity> {
         RdpServerBuilder {
             state: WantsHandler {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: RdpServerSecurity::Tls(acceptor.into()),
             },
         }
@@ -79,6 +102,7 @@ impl RdpServerBuilder<WantsSecurity> {
         RdpServerBuilder {
             state: WantsHandler {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: RdpServerSecurity::Hybrid((acceptor.into(), pub_key)),
             },
         }
@@ -93,6 +117,7 @@ impl RdpServerBuilder<WantsHandler> {
         RdpServerBuilder {
             state: WantsDisplay {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: self.state.security,
                 handler: Box::new(handler),
             },
@@ -103,6 +128,7 @@ impl RdpServerBuilder<WantsHandler> {
         RdpServerBuilder {
             state: WantsDisplay {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: self.state.security,
                 handler: Box::new(NoopInputHandler),
             },
@@ -118,6 +144,7 @@ impl RdpServerBuilder<WantsDisplay> {
         RdpServerBuilder {
             state: BuilderDone {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: self.state.security,
                 handler: self.state.handler,
                 display: Box::new(display),
@@ -132,6 +159,7 @@ impl RdpServerBuilder<WantsDisplay> {
         RdpServerBuilder {
             state: BuilderDone {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: self.state.security,
                 handler: self.state.handler,
                 display: Box::new(NoopDisplay),
@@ -163,6 +191,7 @@ impl RdpServerBuilder<BuilderDone> {
         RdpServer::new(
             RdpServerOptions {
                 addr: self.state.addr,
+                listener: self.state.listener,
                 security: self.state.security,
                 codecs: self.state.codecs,
             },

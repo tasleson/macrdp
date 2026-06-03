@@ -21,6 +21,45 @@ pub fn request_screen_recording_permission() -> bool {
     ScreenCaptureAccess::default().request()
 }
 
+/// Result of an SCK-based capture preflight.
+#[derive(Debug)]
+pub enum SckPreflight {
+    /// `SCShareableContent.get()` succeeded and reported at least N displays.
+    Ok { display_count: usize },
+    /// `SCShareableContent.get()` succeeded but reported zero displays.
+    /// This is the empirical signature of a missing SCK TCC grant for the
+    /// running binary on macOS — the CoreGraphics permission can read
+    /// "granted" while ScreenCaptureKit silently filters everything out.
+    NoDisplays,
+    /// `SCShareableContent.get()` itself failed (TCC denial or other error).
+    Error(String),
+}
+
+/// Stronger preflight than [`check_screen_recording_permission`]: actually
+/// asks ScreenCaptureKit how many displays are visible to this process.
+///
+/// `CGPreflightScreenCaptureAccess` and `SCShareableContent` check distinct
+/// TCC scopes. macOS routinely answers "granted" via the CoreGraphics path
+/// for a terminal/CLI binary while withholding SCK access from that same
+/// binary, in which case `SCShareableContent.displays()` returns an empty
+/// list and downstream capture fails the moment a client connects. Running
+/// this preflight at startup surfaces the disagreement up front rather than
+/// after the first client sees a blank canvas.
+pub fn check_screen_recording_via_sck() -> SckPreflight {
+    use screencapturekit::shareable_content::SCShareableContent;
+    match SCShareableContent::get() {
+        Ok(content) => {
+            let n = content.displays().len();
+            if n == 0 {
+                SckPreflight::NoDisplays
+            } else {
+                SckPreflight::Ok { display_count: n }
+            }
+        }
+        Err(e) => SckPreflight::Error(format!("{e}")),
+    }
+}
+
 /// Open System Settings to Privacy & Security page
 pub fn open_screen_recording_settings() {
     let _ = std::process::Command::new("open")
@@ -73,8 +112,11 @@ pub struct CapturedFrame {
     pub stride: usize,
     pub timestamp_us: u64,
     /// Regions that changed since the last frame.
-    /// Empty means info unavailable — treat as full frame change.
+    /// Empty means no changed regions only when `dirty_rects_available` is true.
     pub dirty_rects: Vec<Rect>,
+    /// Whether `dirty_rects` came from authoritative capture metadata.
+    /// When false, callers must treat empty dirty rects as unknown/full-frame.
+    pub dirty_rects_available: bool,
 }
 
 /// Configuration for screen capture
@@ -119,8 +161,10 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
 
     // Skip non-complete frames (idle, blank, suspended, etc.)
     match sample.frame_status() {
-        Some(SCFrameStatus::Idle) | Some(SCFrameStatus::Blank)
-        | Some(SCFrameStatus::Suspended) | Some(SCFrameStatus::Stopped) => {
+        Some(SCFrameStatus::Idle)
+        | Some(SCFrameStatus::Blank)
+        | Some(SCFrameStatus::Suspended)
+        | Some(SCFrameStatus::Stopped) => {
             return None;
         }
         _ => {}
@@ -139,20 +183,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         return None;
     }
 
-    // Extract dirty rects from the sample buffer
-    // Extract dirty rects — screencapturekit's CGRect has x/y/width/height fields
-    let dirty_rects = sample
-        .dirty_rects()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.width > 0.0 && r.height > 0.0)
-        .map(|r| Rect {
-            x: r.x.max(0.0) as u32,
-            y: r.y.max(0.0) as u32,
-            width: r.width as u32,
-            height: r.height as u32,
-        })
-        .collect::<Vec<_>>();
+    let (dirty_rects, dirty_rects_available) = extract_dirty_rects(sample);
 
     let data = Bytes::copy_from_slice(pixels);
 
@@ -170,6 +201,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         stride,
         timestamp_us,
         dirty_rects,
+        dirty_rects_available,
     })
 }
 
@@ -199,19 +231,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         return None;
     }
 
-    // Extract dirty rects (same logic as the BGRA path)
-    let dirty_rects = sample
-        .dirty_rects()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.width > 0.0 && r.height > 0.0)
-        .map(|r| Rect {
-            x: r.x.max(0.0) as u32,
-            y: r.y.max(0.0) as u32,
-            width: r.width as u32,
-            height: r.height as u32,
-        })
-        .collect::<Vec<_>>();
+    let (dirty_rects, dirty_rects_available) = extract_dirty_rects(sample);
 
     let t = sample.presentation_timestamp();
     let timestamp_us = if t.timescale > 0 {
@@ -230,13 +250,32 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         stride: 0, // Not applicable for NV12 PixelBuffer mode
         timestamp_us,
         dirty_rects,
+        dirty_rects_available,
     })
+}
+
+fn extract_dirty_rects(sample: &CMSampleBuffer) -> (Vec<Rect>, bool) {
+    match sample.dirty_rects() {
+        Some(rects) => (
+            rects
+                .into_iter()
+                .filter(|r| r.width > 0.0 && r.height > 0.0)
+                .map(|r| Rect {
+                    x: r.x.max(0.0) as u32,
+                    y: r.y.max(0.0) as u32,
+                    width: r.width as u32,
+                    height: r.height as u32,
+                })
+                .collect(),
+            true,
+        ),
+        None => (Vec::new(), false),
+    }
 }
 
 /// Query the main display's resolution
 pub fn detect_display_size() -> Result<(u32, u32)> {
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
     let display = content
         .displays()
         .into_iter()
@@ -339,7 +378,11 @@ impl CgFallbackCapturer {
     /// Create a fallback capturer for the main display
     pub fn new(config: &CaptureConfig) -> Self {
         let display_id = core_graphics::display::CGDisplay::main().id;
-        let fps = if config.frame_rate > 0 { config.frame_rate } else { 30 };
+        let fps = if config.frame_rate > 0 {
+            config.frame_rate
+        } else {
+            30
+        };
         Self {
             display_id,
             width: config.width,
@@ -369,6 +412,7 @@ impl CgFallbackCapturer {
                 .unwrap_or_default()
                 .as_micros() as u64,
             dirty_rects: vec![],
+            dirty_rects_available: false,
         })
     }
 

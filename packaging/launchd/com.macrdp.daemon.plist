@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sample LaunchAgent plist for macrdp.
+
+  macrdp must run as a user LaunchAgent (not a system LaunchDaemon) because
+  macOS Screen Recording and Accessibility permissions are bound to the
+  logged-in GUI session.
+
+  Before installing:
+    1. Replace __MACRDP_BIN__ with the absolute path to the macrdp-server
+       binary (e.g., /usr/local/bin/macrdp-server or
+       /Users/<you>/.cargo/bin/macrdp-server).
+    2. Replace __HOME__ with the absolute path to your home directory
+       (`echo $HOME`). Tilde expansion is not performed in plists.
+    3. Grant Screen Recording and Accessibility permission to the
+       macrdp-server binary in System Settings > Privacy & Security.
+
+  Install / uninstall: see packaging/launchd/README in the repo, or the
+  "Running as a launchd LaunchAgent" section of the project README.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.macrdp.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__MACRDP_BIN__</string>
+        <string>--config</string>
+        <string>__HOME__/Library/Application Support/macrdp/config.toml</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/Library/Application Support/macrdp</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Application Support/macrdp/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Application Support/macrdp/logs/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_BACKTRACE</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

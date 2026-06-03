@@ -25,6 +25,7 @@
 - **灵活配置** — 分辨率、帧率、码率、编码器、质量预设，简单 TOML 配置
 - **安全连接** — NLA/CredSSP 认证 + 自动生成 TLS 证书
 - **锁屏采集** — 锁屏时自动切换 CoreGraphics 回退
+- **v1 单客户端** — 支持一个活跃 RDP 会话，暂不支持并发会话
 
 ---
 
@@ -49,6 +50,9 @@ cargo run --release --bin macrdp-server
 # 从任意 RDP 客户端连接 → Mac-IP:3389
 ```
 
+macrdp v1 一次只支持一个活跃 RDP 客户端。不支持并发会话；如需从其他
+设备连接，请先断开当前客户端。
+
 ---
 
 ## 配置
@@ -58,10 +62,12 @@ cargo run --release --bin macrdp-server
 ```toml
 # 网络
 port = 13389
+bind_address = "0.0.0.0"
 
 # 认证
 username = "admin"
 password = "123456"
+allow_generated_credentials = false
 
 # 显示
 width = 0          # 0 = 自动检测
@@ -77,12 +83,77 @@ bitrate_mbps = 50           # 目标码率 (Mbps)
 
 # 日志
 log_level = "info"          # trace / debug / info / warn / error
+log_path = "/path/to/macrdp.log"
 ```
 
-配置搜索顺序:
-1. `./config.toml`
-2. `~/.config/macrdp/config.toml`
-3. `~/Library/Application Support/macrdp/config.toml`
+所有守护进程文件位于同一基础目录下:
+
+- macOS: `~/Library/Application Support/macrdp/`
+- Linux/BSD: `$XDG_CONFIG_HOME/macrdp/` (或 `~/.config/macrdp/`)
+
+默认目录结构:
+
+| 文件                     | 用途                                  |
+| ------------------------ | ------------------------------------- |
+| `<base>/config.toml`     | 守护进程配置                          |
+| `<base>/tls/cert.pem`    | TLS 证书 (缺失时自动生成)             |
+| `<base>/tls/key.pem`     | TLS 私钥 (随证书一起生成, 权限 `0600`) |
+| `<base>/logs/macrdp.log` | 守护进程日志                          |
+
+每个路径都可以通过对应的配置字段 (`cert_path`、`key_path`、`log_path`) 或 CLI 参数 (`--cert-path`、`--key-path`、`--log-path`) 进行覆盖。
+
+---
+
+## 作为 launchd LaunchAgent 运行
+
+仓库中提供了示例 plist: `packaging/launchd/com.macrdp.daemon.plist`。它被设计为按用户运行的 **LaunchAgent** (而非系统级 LaunchDaemon),因为 macOS 的"屏幕录制"和"辅助功能"权限绑定在已登录的图形会话上。
+
+**安装**
+
+```bash
+# 1. 编译 release 二进制并放到一个持久路径
+cargo build --release
+sudo install -m 0755 target/release/macrdp-server /usr/local/bin/macrdp-server
+
+# 2. 准备配置和日志目录
+mkdir -p "$HOME/Library/Application Support/macrdp/logs"
+cp config.example.toml "$HOME/Library/Application Support/macrdp/config.toml"
+# 编辑配置 — 至少设置 username/password (或启用 allow_generated_credentials)
+
+# 3. 将 plist 中的占位符替换为绝对路径 (plist 中不会展开 ~)
+mkdir -p "$HOME/Library/LaunchAgents"
+sed \
+  -e "s|__MACRDP_BIN__|/usr/local/bin/macrdp-server|g" \
+  -e "s|__HOME__|$HOME|g" \
+  packaging/launchd/com.macrdp.daemon.plist \
+  > "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+
+# 4. 加载并启动
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+launchctl kickstart -k "gui/$(id -u)/com.macrdp.daemon"
+```
+
+launchd 首次启动守护进程时,macOS 会针对 `macrdp-server` 二进制弹出"屏幕录制"和"辅助功能"授权对话框。在"系统设置 > 隐私与安全性"中授予后重启服务即可。
+
+**查看状态、停止、重启**
+
+```bash
+launchctl print "gui/$(id -u)/com.macrdp.daemon"          # 状态 + 上次退出码
+launchctl kill SIGTERM "gui/$(id -u)/com.macrdp.daemon"   # 优雅停止 (崩溃才会自动重启)
+launchctl kickstart -k "gui/$(id -u)/com.macrdp.daemon"   # 强制重启
+```
+
+**卸载**
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+rm "$HOME/Library/LaunchAgents/com.macrdp.daemon.plist"
+# 如需清理状态:
+# rm -rf "$HOME/Library/Application Support/macrdp"
+# sudo rm /usr/local/bin/macrdp-server
+```
+
+plist 使用 `KeepAlive = { SuccessfulExit = false; Crashed = true; }`: 干净的 SIGTERM (例如来自 `launchctl bootout`) 不会触发重启,而崩溃则会在 `ThrottleInterval` (10 秒) 后被重新拉起。
 
 ---
 

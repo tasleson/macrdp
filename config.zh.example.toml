@@ -1,6 +1,15 @@
 # macrdp 服务端配置文件
 # 将此文件复制为 config.toml 并根据需要修改
-# 配置文件搜索顺序: ./config.toml → ~/.config/macrdp/ → ~/Library/Application Support/macrdp/
+#
+# 所有守护进程文件位于同一基础目录下:
+#   macOS:     ~/Library/Application Support/macrdp/
+#   Linux/BSD: $XDG_CONFIG_HOME/macrdp/ (或 ~/.config/macrdp/)
+#
+# 默认目录结构:
+#   <base>/config.toml      本配置文件
+#   <base>/tls/cert.pem     TLS 证书 (缺失时自动生成)
+#   <base>/tls/key.pem      TLS 私钥 (随证书一起生成, 权限 0600)
+#   <base>/logs/macrdp.log  守护进程日志
 
 # ─── 网络 ─────────────────────────────────────────────────────────────────────
 
@@ -9,12 +18,25 @@
 # 可选值: 任意有效端口号 (建议 1024-65535)
 port = 13389
 
+# 监听 IP 地址
+# 默认值: 0.0.0.0 (所有 IPv4 网络接口)
+# 设置为 127.0.0.1 则仅接受本机连接
+bind_address = "0.0.0.0"
+
+# v1 一次只支持一个活跃 RDP 会话
+# 暂不支持多个客户端并发会话
+
 # ─── 认证 ─────────────────────────────────────────────────────────────────────
 
 # RDP 登录凭据 (NLA/Hybrid/CredSSP 认证)
-# 两个字段均为可选 — 不设置则接受任意凭据
+# 作为无人值守守护进程运行时必须设置这两个字段
 username = "admin"
 password = "123456"
+
+# 仅用于开发的临时凭据回退
+# 默认值: false。设置为 true 且未配置 username/password 时, macrdp 会使用
+# 操作系统 CSPRNG 生成一次性密码。密码绝不会写入日志。
+# allow_generated_credentials = false
 
 # ─── 显示 ─────────────────────────────────────────────────────────────────────
 
@@ -72,11 +94,11 @@ encoder = "hardware"
 # ─── TLS 证书 ──────────────────────────────────────────────────────────────────
 
 # TLS 证书文件路径 (PEM 格式)
-# 默认值: 自动生成自签名证书
+# 默认值: <base>/tls/cert.pem (缺失时自动生成自签名证书)
 # cert_path = "/path/to/cert.pem"
 
 # TLS 私钥文件路径 (PEM 格式)
-# 默认值: 随证书一起自动生成
+# 默认值: <base>/tls/key.pem (随证书一起生成, 权限 0600)
 # key_path = "/path/to/key.pem"
 
 # ─── 日志 ─────────────────────────────────────────────────────────────────────
@@ -86,8 +108,25 @@ encoder = "hardware"
 # 可选值: trace, debug, info, warn, error
 log_level = "info"
 
+# 日志格式
+# 默认值: text (易读文本). 设为 "json" 时每行输出一个 JSON 对象,
+# 适用于 Vector、Loki、Splunk 等日志聚合系统。
+# log_format = "json"
+
+# 追加写入的守护进程日志路径
+# 默认值: <base>/logs/macrdp.log
+# log_path = "/path/to/macrdp.log"
+
 # ─── 会话 ─────────────────────────────────────────────────────────────────────
 
 # 空闲超时时间 (秒), 无输入操作后自动断开连接
 # 默认值: 1800 (30 分钟)
 idle_timeout_secs = 1800
+
+# 跳过 ScreenCaptureKit 报告为未变化的帧，避免空闲时持续编码
+# 默认值: false，除非配置了 idle_keyframe_sec
+# skip_unchanged = true
+
+# 启用未变化帧跳过后，每隔多少秒发送一次空闲关键帧/保活帧
+# skip_unchanged = true 时的默认值: 5
+# idle_keyframe_sec = 5

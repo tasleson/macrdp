@@ -6,11 +6,11 @@ use ironrdp_core::{encode_vec, impl_as_any, Encode, WriteCursor, EncodeResult};
 use ironrdp_dvc::{DvcEncode, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
-    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
-    CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
-    CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
-    MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
-    ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu,
+    CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags,
+    CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, ClientPdu, Codec1Type,
+    CreateSurfacePdu, EndFramePdu, Encoding, MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat,
+    QuantQuality, ResetGraphicsPdu, ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::{decode, PduResult};
@@ -132,6 +132,115 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
     let data = encode_vec(pdu).map_err(|e| ironrdp_pdu::custom_err!("GfxEncode", e))?;
     let wrapped = wrap_zgfx(&data);
     Ok(Box::new(RawGfxPdu(wrapped)))
+}
+
+/// Lenient parser for an RDPGFX `CapabilitiesAdvertisePDU` that tolerates
+/// unknown capability versions instead of failing the whole PDU.
+///
+/// Wire format (all little-endian):
+///
+/// ```text
+///  pduType:     u16   (0x0012 = CapabilitiesAdvertise)
+///  flags:       u16
+///  pduLength:   u32   (total bytes including this 8-byte header)
+///  count:       u16
+///  capsSets[count]: { version: u32, dataLength: u32, data: dataLength bytes }
+/// ```
+///
+/// Each cap set carries an explicit `dataLength`, so an unknown version
+/// can be skipped without losing framing for the rest of the list — this
+/// fixes the regression where FreeRDP 3.x advertises a version beyond
+/// the vendored `ironrdp_pdu` 0.7.0's enum, the upstream decoder bails
+/// on the first unknown entry, and the older V10_x sets the same client
+/// advertised are never seen.
+///
+/// Known versions are decoded into their typed `CapabilitySet` variants
+/// so the existing match in `process()` lights up `avc420_supported`
+/// just as if upstream had parsed them. Unknown versions are preserved
+/// as `CapabilitySet::Unknown(data)`.
+///
+/// Returns `None` if `data` is not a CapabilitiesAdvertise or is
+/// truncated/malformed at the envelope level — caller falls through to
+/// the upstream error handling.
+fn parse_caps_advertise_lenient(data: &[u8]) -> Option<Vec<CapabilitySet>> {
+    fn read_u16_le(b: &[u8], off: usize) -> Option<u16> {
+        b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn read_u32_le(b: &[u8], off: usize) -> Option<u32> {
+        b.get(off..off + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    // PDU header
+    if read_u16_le(data, 0)? != 0x0012 {
+        return None;
+    }
+    // skip flags (u16) at offset 2, pduLength (u32) at offset 4
+    let count = read_u16_le(data, 8)? as usize;
+    let mut off = 10;
+
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let version = read_u32_le(data, off)?;
+        let data_len = read_u32_le(data, off + 4)? as usize;
+        off += 8;
+        let body = data.get(off..off.checked_add(data_len)?)?;
+        off += data_len;
+
+        // The upstream decoder reads exactly `data_len` bytes for the cap
+        // body, then a u32 flag word for V8/V8_1/V10/V10_2..V10_7. We only
+        // try to decode the flag word when the body is at least 4 bytes.
+        let flag_word = if body.len() >= 4 {
+            Some(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+        } else {
+            None
+        };
+
+        let cap_set = match version {
+            0x0008_0004 => CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x0008_0105 => CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0002 => CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0100 => CapabilitySet::V10_1,
+            0x000a_0200 => CapabilitySet::V10_2 {
+                flags: CapabilitiesV10Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0301 => CapabilitySet::V10_3 {
+                flags: CapabilitiesV103Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0400 => CapabilitySet::V10_4 {
+                flags: CapabilitiesV104Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0502 => CapabilitySet::V10_5 {
+                flags: CapabilitiesV104Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0600 => CapabilitySet::V10_6 {
+                flags: CapabilitiesV104Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0601 => CapabilitySet::V10_6Err {
+                flags: CapabilitiesV104Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            0x000a_0701 => CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::from_bits_truncate(flag_word.unwrap_or(0)),
+            },
+            other => {
+                debug!(
+                    version = format!("0x{other:08x}"),
+                    data_len,
+                    "GFX: cap set version unknown to ironrdp_pdu 0.7.0; preserving as Unknown"
+                );
+                CapabilitySet::Unknown(body.to_vec())
+            }
+        };
+        out.push(cap_set);
+    }
+
+    Some(out)
 }
 
 /// Shared state between GfxHandler and the server
@@ -456,14 +565,43 @@ impl DvcProcessor for GfxHandler {
         let client_pdu: ClientPdu = match decode(data) {
             Ok(pdu) => pdu,
             Err(e) => {
-                // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16, CacheImportOffer 0x10)
-                // Log and ignore rather than crashing the connection
-                debug!(
-                    payload_len = data.len(),
-                    first_bytes = ?&data[..data.len().min(8)],
-                    "GFX: ignoring unknown client PDU: {e}"
-                );
-                return Ok(Vec::new());
+                // Upstream `ClientPdu::decode` errors as soon as any inner
+                // `CapabilitySet` reports a version the vendored
+                // `ironrdp_pdu` doesn't know about. Modern clients (FreeRDP
+                // 3.x, recent mstsc) advertise newer capability versions
+                // mixed in alongside the older ones we *do* understand,
+                // which means a single unknown entry blows away the whole
+                // CapabilitiesAdvertise — caps_confirmed never flips,
+                // the client times out, and the user gets a white screen.
+                //
+                // Salvage CapsAdvertise (PDU type 0x12) by walking the wire
+                // format manually and tolerating unknown versions. Other
+                // PDUs (QoE FrameAck 0x16, CacheImportOffer 0x10, …)
+                // continue to be silently ignored as before.
+                if data.first() == Some(&0x12) {
+                    if let Some(cap_sets) = parse_caps_advertise_lenient(data) {
+                        debug!(
+                            sets = cap_sets.len(),
+                            "GFX: salvaged CapabilitiesAdvertise via lenient \
+                             parser (upstream decode failed: {e})"
+                        );
+                        ClientPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(cap_sets))
+                    } else {
+                        debug!(
+                            payload_len = data.len(),
+                            first_bytes = ?&data[..data.len().min(8)],
+                            "GFX: failed to lenient-parse CapabilitiesAdvertise: {e}"
+                        );
+                        return Ok(Vec::new());
+                    }
+                } else {
+                    debug!(
+                        payload_len = data.len(),
+                        first_bytes = ?&data[..data.len().min(8)],
+                        "GFX: ignoring unknown client PDU: {e}"
+                    );
+                    return Ok(Vec::new());
+                }
             }
         };
 

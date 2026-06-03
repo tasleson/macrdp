@@ -9,5 +9,13 @@ pub mod server;
 pub mod tls;
 
 pub use callbacks::*;
-pub use config::{config_dir, ServerConfig};
-pub use server::{start_server, ServerHandle};
+pub use config::{
+    config_dir, default_cert_path, default_config_path, default_key_path, default_log_path,
+    default_tls_dir, ServerConfig,
+};
+pub use permissions::{
+    check_permissions, format_report, permission_report, PermissionEntry, PermissionReport,
+    ReportFormat,
+};
+pub use server::{start_server, start_server_with_options, ServerHandle, ServerStartupOptions};
+pub use tls::{ensure_tls_files, generate_self_signed_cert};

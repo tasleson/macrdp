@@ -16,7 +16,6 @@ pub struct UiConfig {
     pub encoder: String,
     pub chroma_mode: String,
     pub bind_address: String,
-    pub max_connections: u32,
     pub idle_timeout_secs: u64,
 
     // ── Auth ────────────────────────────────────────────────
@@ -42,7 +41,6 @@ impl Default for UiConfig {
             encoder: "auto".to_string(),
             chroma_mode: "avc420".to_string(),
             bind_address: "0.0.0.0".to_string(),
-            max_connections: 3,
             idle_timeout_secs: 1800,
             username: "macrdp".to_string(),
             password: String::new(),
@@ -137,12 +135,6 @@ impl UiConfig {
                     .ok_or("bind_address must be a string")?
                     .to_string();
             }
-            "max_connections" => {
-                self.max_connections = value
-                    .as_u64()
-                    .ok_or("max_connections must be a number")?
-                    as u32;
-            }
             "idle_timeout_secs" => {
                 self.idle_timeout_secs = value
                     .as_u64()
@@ -202,6 +194,7 @@ impl UiConfig {
     /// Convert to the core library's `ServerConfig` used to start the server.
     pub fn to_server_config(&self) -> macrdp_core::ServerConfig {
         macrdp_core::ServerConfig {
+            bind_address: self.bind_address.clone(),
             port: self.port,
             frame_rate: self.frame_rate,
             width: 0,  // auto-detect
@@ -212,8 +205,10 @@ impl UiConfig {
             } else {
                 Some(self.password.clone())
             },
+            allow_generated_credentials: false,
             cert_path: None,
             key_path: None,
+            log_path: None,
             idle_timeout_secs: self.idle_timeout_secs,
             log_level: Some(self.log_level.clone()),
             quality: None,
@@ -221,6 +216,38 @@ impl UiConfig {
             chroma_mode: Some(self.chroma_mode.clone()),
             hidpi_scale: Some(self.hidpi_scale),
             bitrate_mbps: Some(self.bitrate_mbps),
+            skip_unchanged: None,
+            idle_keyframe_sec: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_removed_max_connections_field() {
+        let config: UiConfig = toml::from_str(
+            r#"
+            port = 3390
+            max_connections = 3
+            username = "macrdp"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.port, 3390);
+        assert_eq!(config.username, "macrdp");
+    }
+
+    #[test]
+    fn rejects_max_connections_updates() {
+        let mut config = UiConfig::default();
+        let err = config
+            .set_field("max_connections", &serde_json::json!(3))
+            .unwrap_err();
+
+        assert_eq!(err, "unknown config key: max_connections");
     }
 }

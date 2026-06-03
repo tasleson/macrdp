@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/macrdp-server",
+    "crates/macrdp-core",
     "crates/macrdp-capture",
     "crates/macrdp-input",
     "crates/macrdp-encode",
+    "crates/ironrdp-acceptor-patched",
 ]
 
 [patch.crates-io]
@@ -19,6 +21,6 @@ license = "MIT"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 bytes = "1"

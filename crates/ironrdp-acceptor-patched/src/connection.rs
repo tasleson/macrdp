@@ -1,8 +1,8 @@
 use core::mem;
 
 use ironrdp_connector::{
-    encode_x224_packet, general_err, reason_err, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
-    Sequence, State, Written,
+    encode_x224_packet, general_err, reason_err, ConnectorError, ConnectorErrorExt as _,
+    ConnectorResult, DesktopSize, Sequence, State, Written,
 };
 use ironrdp_core::{decode, WriteBuf};
 use ironrdp_pdu as pdu;
@@ -23,6 +23,59 @@ use crate::util::{self, wrap_share_data};
 
 const IO_CHANNEL_ID: u16 = 1003;
 const USER_CHANNEL_ID: u16 = 1002;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialCheck {
+    Accepted,
+    NeedsClientPrompt,
+    Rejected,
+}
+
+fn check_credentials(
+    server_creds: Option<&Credentials>,
+    client_creds: &Credentials,
+) -> CredentialCheck {
+    let Some(server_creds) = server_creds else {
+        return CredentialCheck::Rejected;
+    };
+
+    if server_creds.username == client_creds.username
+        && server_creds.password == client_creds.password
+    {
+        return CredentialCheck::Accepted;
+    }
+
+    if client_creds.username.is_empty() && client_creds.password.is_empty() {
+        return CredentialCheck::NeedsClientPrompt;
+    }
+
+    CredentialCheck::Rejected
+}
+
+/// Pick the security protocol to confirm to the client.
+///
+/// NLA/CredSSP (HYBRID_EX preferred, then HYBRID) is the default path for
+/// standard RDP clients; we only fall back to TLS-only (SSL) when the client
+/// did not advertise any HYBRID variant. Empty-on-both-sides yields the
+/// no-security legacy path. Anything else means no common protocol — return
+/// `None` so the caller can fail the connection.
+pub(crate) fn select_security_protocol(
+    requested: SecurityProtocol,
+    supported: SecurityProtocol,
+) -> Option<SecurityProtocol> {
+    let common = requested & supported;
+    if common.intersects(SecurityProtocol::HYBRID_EX) {
+        Some(SecurityProtocol::HYBRID_EX)
+    } else if common.intersects(SecurityProtocol::HYBRID) {
+        Some(SecurityProtocol::HYBRID)
+    } else if common.intersects(SecurityProtocol::SSL) {
+        Some(SecurityProtocol::SSL)
+    } else if supported.is_empty() {
+        Some(SecurityProtocol::empty())
+    } else {
+        None
+    }
+}
 
 pub struct Acceptor {
     pub(crate) state: AcceptorState,
@@ -128,7 +181,8 @@ impl Acceptor {
     /// Panics if state is not [AcceptorState::SecurityUpgrade].
     pub fn mark_security_upgrade_as_done(&mut self) {
         assert!(self.reached_security_upgrade().is_some());
-        self.step(&[], &mut WriteBuf::new()).expect("transition to next state");
+        self.step(&[], &mut WriteBuf::new())
+            .expect("transition to next state");
         debug_assert!(self.reached_security_upgrade().is_none());
     }
 
@@ -141,7 +195,9 @@ impl Acceptor {
     /// Panics if state is not [AcceptorState::Credssp].
     pub fn mark_credssp_as_done(&mut self) {
         assert!(self.should_perform_credssp());
-        let res = self.step(&[], &mut WriteBuf::new()).expect("transition to next state");
+        let res = self
+            .step(&[], &mut WriteBuf::new())
+            .expect("transition to next state");
         debug_assert!(!self.should_perform_credssp());
         assert_eq!(res, Written::Nothing);
     }
@@ -285,7 +341,9 @@ impl Sequence for Acceptor {
             AcceptorState::CapabilitiesSendServer { .. } => None,
             AcceptorState::MonitorLayoutSend { .. } => None,
             AcceptorState::CapabilitiesWaitConfirm { .. } => Some(&pdu::X224_HINT),
-            AcceptorState::ConnectionFinalization { finalization, .. } => finalization.next_pdu_hint(),
+            AcceptorState::ConnectionFinalization { finalization, .. } => {
+                finalization.next_pdu_hint()
+            }
             AcceptorState::Accepted { .. } => None,
         }
     }
@@ -314,18 +372,10 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::InitiationSendConfirm { requested_protocol } => {
-                let protocols = requested_protocol & self.security;
-                let protocol = if protocols.intersects(SecurityProtocol::HYBRID_EX) {
-                    SecurityProtocol::HYBRID_EX
-                } else if protocols.intersects(SecurityProtocol::HYBRID) {
-                    SecurityProtocol::HYBRID
-                } else if protocols.intersects(SecurityProtocol::SSL) {
-                    SecurityProtocol::SSL
-                } else if self.security.is_empty() {
-                    SecurityProtocol::empty()
-                } else {
-                    return Err(ConnectorError::general("failed to negotiate security protocol"));
-                };
+                let protocol = select_security_protocol(requested_protocol, self.security)
+                    .ok_or_else(|| {
+                        ConnectorError::general("failed to negotiate security protocol")
+                    })?;
                 let connection_confirm = nego::ConnectionConfirm::Response {
                     flags: nego::ResponseFlags::empty(),
                     protocol,
@@ -333,8 +383,8 @@ impl Sequence for Acceptor {
 
                 debug!(message = ?connection_confirm, "Send");
 
-                let written =
-                    ironrdp_core::encode_buf(&X224(connection_confirm), output).map_err(ConnectorError::encode)?;
+                let written = ironrdp_core::encode_buf(&X224(connection_confirm), output)
+                    .map_err(ConnectorError::encode)?;
 
                 (
                     Written::from_size(written)?,
@@ -350,7 +400,9 @@ impl Sequence for Acceptor {
                 protocol,
             } => {
                 debug!(?requested_protocol);
-                let next_state = if protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+                let next_state = if protocol
+                    .intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX)
+                {
                     AcceptorState::Credssp {
                         requested_protocol,
                         protocol,
@@ -382,8 +434,8 @@ impl Sequence for Acceptor {
                 let x224_payload = decode::<X224<pdu::x224::X224Data<'_>>>(input)
                     .map_err(ConnectorError::decode)
                     .map(|p| p.0)?;
-                let settings_initial =
-                    decode::<mcs::ConnectInitial>(x224_payload.data.as_ref()).map_err(ConnectorError::decode)?;
+                let settings_initial = decode::<mcs::ConnectInitial>(x224_payload.data.as_ref())
+                    .map_err(ConnectorError::decode)?;
 
                 debug!(message = ?settings_initial, "Received");
 
@@ -405,12 +457,14 @@ impl Sequence for Acceptor {
                     })
                     .unwrap_or_default();
 
-                #[expect(clippy::arithmetic_side_effects)] // IO channel ID is not big enough for overflowing.
+                #[expect(clippy::arithmetic_side_effects)]
+                // IO channel ID is not big enough for overflowing.
                 let channels = joined
                     .into_iter()
                     .enumerate()
                     .map(|(i, channel)| {
-                        let channel_id = u16::try_from(i).expect("always in the range") + self.io_channel_id + 1;
+                        let channel_id =
+                            u16::try_from(i).expect("always in the range") + self.io_channel_id + 1;
                         if let Some((type_id, c)) = channel {
                             self.static_channels.attach_channel_id(type_id, channel_id);
                             (channel_id, Some(c))
@@ -439,8 +493,9 @@ impl Sequence for Acceptor {
             } => {
                 let channel_ids: Vec<u16> = channels.iter().map(|&(i, _)| i).collect();
 
-                let skip_channel_join = early_capability
-                    .is_some_and(|client| client.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN));
+                let skip_channel_join = early_capability.is_some_and(|client| {
+                    client.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN)
+                });
 
                 let server_blocks = create_gcc_blocks(
                     self.io_channel_id,
@@ -450,8 +505,11 @@ impl Sequence for Acceptor {
                 );
 
                 let settings_response = mcs::ConnectResponse {
-                    conference_create_response: gcc::ConferenceCreateResponse::new(self.user_channel_id, server_blocks)
-                        .map_err(ConnectorError::decode)?,
+                    conference_create_response: gcc::ConferenceCreateResponse::new(
+                        self.user_channel_id,
+                        server_blocks,
+                    )
+                    .map_err(ConnectorError::decode)?,
                     called_connect_id: 1,
                     domain_parameters: mcs::DomainParameters::target(),
                 };
@@ -459,7 +517,10 @@ impl Sequence for Acceptor {
                 debug!(message = ?settings_response, "Send");
 
                 let written = encode_x224_packet(&settings_response, output)?;
-                let channels = channels.into_iter().filter_map(|(i, c)| c.map(|c| (i, c))).collect();
+                let channels = channels
+                    .into_iter()
+                    .filter_map(|(i, c)| c.map(|c| (i, c)))
+                    .collect();
 
                 (
                     Written::from_size(written)?,
@@ -470,7 +531,11 @@ impl Sequence for Acceptor {
                         connection: if skip_channel_join {
                             ChannelConnectionSequence::skip_channel_join(self.user_channel_id)
                         } else {
-                            ChannelConnectionSequence::new(self.user_channel_id, self.io_channel_id, channel_ids)
+                            ChannelConnectionSequence::new(
+                                self.user_channel_id,
+                                self.io_channel_id,
+                                channel_ids,
+                            )
                         },
                     },
                 )
@@ -520,7 +585,8 @@ impl Sequence for Acceptor {
                 early_capability,
                 channels,
             } => {
-                let data: X224<mcs::SendDataRequest<'_>> = decode(input).map_err(ConnectorError::decode)?;
+                let data: X224<mcs::SendDataRequest<'_>> =
+                    decode(input).map_err(ConnectorError::decode)?;
                 let data = data.0;
                 let client_info: rdp::ClientInfoPdu =
                     decode(data.user_data.as_ref()).map_err(ConnectorError::decode)?;
@@ -538,25 +604,14 @@ impl Sequence for Acceptor {
                         "Credential check (non-hybrid)"
                     );
 
-                    // Compare username and password only, ignore domain mismatch.
-                    // Accept empty client password — Windows mstsc sends empty creds on
-                    // first connect before prompting the user. Rejecting causes mstsc to
-                    // show an error instead of a login dialog.
-                    let creds_match = self.creds.as_ref().is_some_and(|server_creds| {
-                        creds.password.is_empty()
-                            || (server_creds.username == creds.username
-                                && server_creds.password == creds.password)
-                    });
+                    let credential_check = check_credentials(self.creds.as_ref(), &creds);
 
-                    if !creds_match {
+                    if credential_check != CredentialCheck::Accepted {
                         warn!(
                             client_user = %creds.username,
                             client_domain = ?creds.domain,
                             server_user = ?self.creds.as_ref().map(|c| &c.username),
-                            client_pass_len = creds.password.len(),
-                            server_pass_len = ?self.creds.as_ref().map(|c| c.password.len()),
-                            client_pass_bytes = ?creds.password.as_bytes(),
-                            server_pass_bytes = ?self.creds.as_ref().map(|c| c.password.as_bytes()),
+                            credential_check = ?credential_check,
                             "Credential mismatch — rejecting"
                         );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
@@ -565,7 +620,12 @@ impl Sequence for Acceptor {
 
                         debug!(message = ?info, "Send");
 
-                        util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
+                        util::encode_send_data_indication(
+                            self.user_channel_id,
+                            self.io_channel_id,
+                            &info,
+                            output,
+                        )?;
 
                         return Err(ConnectorError::general("invalid credentials"));
                     }
@@ -591,8 +651,12 @@ impl Sequence for Acceptor {
 
                 debug!(message = ?license, "Send");
 
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &license, output)?;
+                let written = util::encode_send_data_indication(
+                    self.user_channel_id,
+                    self.io_channel_id,
+                    &license,
+                    output,
+                )?;
 
                 self.saved_for_reactivation = AcceptorState::CapabilitiesSendServer {
                     early_capability,
@@ -615,12 +679,14 @@ impl Sequence for Acceptor {
                 let demand_active = rdp::headers::ShareControlHeader {
                     share_id: 0,
                     pdu_source: self.io_channel_id,
-                    share_control_pdu: ShareControlPdu::ServerDemandActive(rdp::capability_sets::ServerDemandActive {
-                        pdu: rdp::capability_sets::DemandActive {
-                            source_descriptor: "".into(),
-                            capability_sets: self.server_capabilities.clone(),
+                    share_control_pdu: ShareControlPdu::ServerDemandActive(
+                        rdp::capability_sets::ServerDemandActive {
+                            pdu: rdp::capability_sets::DemandActive {
+                                source_descriptor: "".into(),
+                                capability_sets: self.server_capabilities.clone(),
+                            },
                         },
-                    }),
+                    ),
                 };
 
                 debug!(message = ?demand_active, "Send");
@@ -643,8 +709,8 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::MonitorLayoutSend { channels } => {
-                let monitor_layout =
-                    rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
+                let monitor_layout = rdp::headers::ShareDataPdu::MonitorLayout(
+                    rdp::finalization_messages::MonitorLayoutPdu {
                         monitors: vec![gcc::Monitor {
                             left: 0,
                             top: 0,
@@ -652,14 +718,19 @@ impl Sequence for Acceptor {
                             bottom: i32::from(self.desktop_size.height),
                             flags: gcc::MonitorFlags::PRIMARY,
                         }],
-                    });
+                    },
+                );
 
                 debug!(message = ?monitor_layout, "Send");
 
                 let share_data = wrap_share_data(monitor_layout, self.io_channel_id);
 
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &share_data, output)?;
+                let written = util::encode_send_data_indication(
+                    self.user_channel_id,
+                    self.io_channel_id,
+                    &share_data,
+                    output,
+                )?;
 
                 (
                     Written::from_size(written)?,
@@ -685,8 +756,9 @@ impl Sequence for Acceptor {
                 };
                 match message {
                     mcs::McsMessage::SendDataRequest(data) => {
-                        let capabilities_confirm = decode::<rdp::headers::ShareControlHeader>(data.user_data.as_ref())
-                            .map_err(ConnectorError::decode);
+                        let capabilities_confirm =
+                            decode::<rdp::headers::ShareControlHeader>(data.user_data.as_ref())
+                                .map_err(ConnectorError::decode);
                         let capabilities_confirm = match capabilities_confirm {
                             Ok(capabilities_confirm) => capabilities_confirm,
                             Err(e) => {
@@ -702,7 +774,8 @@ impl Sequence for Acceptor {
 
                         debug!(message = ?capabilities_confirm, "Received");
 
-                        let ShareControlPdu::ClientConfirmActive(confirm) = capabilities_confirm.share_control_pdu
+                        let ShareControlPdu::ClientConfirmActive(confirm) =
+                            capabilities_confirm.share_control_pdu
                         else {
                             return Err(ConnectorError::general("expected client confirm active"));
                         };
@@ -711,14 +784,21 @@ impl Sequence for Acceptor {
                             Written::Nothing,
                             AcceptorState::ConnectionFinalization {
                                 channels: channels.clone(),
-                                finalization: FinalizationSequence::new(self.user_channel_id, self.io_channel_id),
+                                finalization: FinalizationSequence::new(
+                                    self.user_channel_id,
+                                    self.io_channel_id,
+                                ),
                                 client_capabilities: confirm.pdu.capability_sets,
                             },
                         )
                     }
 
                     mcs::McsMessage::DisconnectProviderUltimatum(ultimatum) => {
-                        return Err(reason_err!("received disconnect ultimatum", "{:?}", ultimatum.reason))
+                        return Err(reason_err!(
+                            "received disconnect ultimatum",
+                            "{:?}",
+                            ultimatum.reason
+                        ))
                     }
 
                     _ => {
@@ -758,6 +838,197 @@ impl Sequence for Acceptor {
 
         self.state = next_state;
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_credentials, select_security_protocol, CredentialCheck};
+    use ironrdp_pdu::nego::SecurityProtocol;
+    use ironrdp_pdu::rdp::client_info::Credentials;
+
+    const SERVER_NLA: SecurityProtocol = SecurityProtocol::from_bits_truncate(
+        SecurityProtocol::HYBRID.bits()
+            | SecurityProtocol::HYBRID_EX.bits()
+            | SecurityProtocol::SSL.bits(),
+    );
+
+    fn credentials(username: &str, password: &str) -> Credentials {
+        Credentials {
+            username: String::from(username),
+            password: String::from(password),
+            domain: None,
+        }
+    }
+
+    #[test]
+    fn accepts_matching_username_and_password() {
+        let server = credentials("macrdp", "secret");
+        let client = credentials("macrdp", "secret");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::Accepted
+        );
+    }
+
+    #[test]
+    fn rejects_empty_password_for_configured_non_empty_password() {
+        let server = credentials("macrdp", "secret");
+        let client = credentials("macrdp", "");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::Rejected
+        );
+    }
+
+    #[test]
+    fn treats_fully_blank_credentials_as_prompt_required_not_accepted() {
+        let server = credentials("macrdp", "secret");
+        let client = credentials("", "");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::NeedsClientPrompt
+        );
+    }
+
+    #[test]
+    fn accepts_empty_password_only_when_it_matches_server_credentials() {
+        let server = credentials("macrdp", "");
+        let client = credentials("macrdp", "");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::Accepted
+        );
+    }
+
+    #[test]
+    fn rejects_when_server_credentials_are_missing() {
+        let client = credentials("macrdp", "secret");
+
+        assert_eq!(check_credentials(None, &client), CredentialCheck::Rejected);
+    }
+
+    #[test]
+    fn rejects_when_only_username_matches() {
+        let server = credentials("macrdp", "secret");
+        let client = credentials("macrdp", "wrong");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::Rejected
+        );
+    }
+
+    #[test]
+    fn rejects_when_only_password_matches() {
+        let server = credentials("macrdp", "secret");
+        let client = credentials("other", "secret");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::Rejected
+        );
+    }
+
+    #[test]
+    fn comparison_is_case_sensitive_on_both_fields() {
+        let server = credentials("macrdp", "Secret");
+
+        // mstsc preserves the case the user typed; we don't fold it.
+        assert_eq!(
+            check_credentials(Some(&server), &credentials("MACRDP", "Secret")),
+            CredentialCheck::Rejected
+        );
+        assert_eq!(
+            check_credentials(Some(&server), &credentials("macrdp", "secret")),
+            CredentialCheck::Rejected
+        );
+    }
+
+    #[test]
+    fn whitespace_only_client_credentials_are_not_treated_as_prompt() {
+        // The NeedsClientPrompt path is strictly "both literally empty"; a single
+        // space is a real (non-matching) credential and must be rejected, not
+        // silently treated as an unattempted login.
+        let server = credentials("macrdp", "secret");
+        let client = credentials(" ", " ");
+
+        assert_eq!(
+            check_credentials(Some(&server), &client),
+            CredentialCheck::Rejected
+        );
+    }
+
+    #[test]
+    fn domain_field_is_ignored_during_credential_match() {
+        let server = Credentials {
+            username: "macrdp".to_string(),
+            password: "secret".to_string(),
+            domain: Some("CORP".to_string()),
+        };
+        let client_no_domain = credentials("macrdp", "secret");
+        let client_other_domain = Credentials {
+            username: "macrdp".to_string(),
+            password: "secret".to_string(),
+            domain: Some("OTHER".to_string()),
+        };
+
+        assert_eq!(
+            check_credentials(Some(&server), &client_no_domain),
+            CredentialCheck::Accepted
+        );
+        assert_eq!(
+            check_credentials(Some(&server), &client_other_domain),
+            CredentialCheck::Accepted
+        );
+    }
+
+    #[test]
+    fn selects_hybrid_ex_when_client_supports_full_nla() {
+        let client = SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX | SecurityProtocol::SSL;
+        assert_eq!(
+            select_security_protocol(client, SERVER_NLA),
+            Some(SecurityProtocol::HYBRID_EX)
+        );
+    }
+
+    #[test]
+    fn selects_hybrid_when_client_lacks_hybrid_ex() {
+        let client = SecurityProtocol::HYBRID | SecurityProtocol::SSL;
+        assert_eq!(
+            select_security_protocol(client, SERVER_NLA),
+            Some(SecurityProtocol::HYBRID)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_ssl_only_when_client_has_no_nla() {
+        let client = SecurityProtocol::SSL;
+        assert_eq!(
+            select_security_protocol(client, SERVER_NLA),
+            Some(SecurityProtocol::SSL)
+        );
+    }
+
+    #[test]
+    fn fails_when_client_and_server_share_no_protocol() {
+        let client = SecurityProtocol::empty();
+        assert_eq!(select_security_protocol(client, SERVER_NLA), None);
+    }
+
+    #[test]
+    fn nla_first_even_when_client_lists_ssl_first() {
+        // Order of bits in the client's requested protocol must not influence
+        // selection; only the strongest mutually supported protocol wins.
+        let client = SecurityProtocol::SSL | SecurityProtocol::HYBRID;
+        assert_eq!(
+            select_security_protocol(client, SERVER_NLA),
+            Some(SecurityProtocol::HYBRID)
+        );
     }
 }
 

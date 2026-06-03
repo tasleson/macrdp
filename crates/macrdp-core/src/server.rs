@@ -1,14 +1,15 @@
 //! RDP server lifecycle: start, stop, metrics, connections
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use ironrdp_server::gfx::GfxState;
+use rand::{rngs::OsRng, RngCore};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -17,12 +18,42 @@ use crate::config::ServerConfig;
 use crate::permissions;
 use crate::tls;
 
+/// Startup behavior options for the RDP server runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStartupOptions {
+    /// Whether startup should request/check macOS Screen Recording and
+    /// Accessibility permissions. Tests can disable this to avoid OS prompts.
+    pub request_permissions: bool,
+}
+
+impl Default for ServerStartupOptions {
+    fn default() -> Self {
+        Self {
+            request_permissions: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCredentials {
+    username: String,
+    password: String,
+    generated: bool,
+}
+
 /// Handle to a running RDP server. Use to query state and stop the server.
 pub struct ServerHandle {
     port: u16,
     started_at: Instant,
     gfx_state: Arc<Mutex<GfxState>>,
     shutdown_notify: Arc<Notify>,
+    generated_credentials: Option<GeneratedCredentials>,
     stopped: AtomicBool,
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -33,6 +64,11 @@ impl ServerHandle {
     /// The TCP port the server is listening on.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Credentials generated for this process, if explicitly enabled.
+    pub fn generated_credentials(&self) -> Option<&GeneratedCredentials> {
+        self.generated_credentials.as_ref()
     }
 
     /// Current server status.
@@ -78,7 +114,7 @@ impl ServerHandle {
         if self.stopped.swap(true, Ordering::Relaxed) {
             return Ok(()); // Already stopped
         }
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_notify.notify_one();
 
         // Extract thread handle from mutex *before* the await point so that
         // the MutexGuard is dropped and the future remains Send.
@@ -101,7 +137,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         if !self.stopped.load(Ordering::Relaxed) {
-            self.shutdown_notify.notify_waiters();
+            self.shutdown_notify.notify_one();
         }
     }
 }
@@ -111,6 +147,7 @@ impl Drop for ServerHandle {
 struct ServerThreadArgs {
     config: ServerConfig,
     bind_addr: SocketAddr,
+    listener: TcpListener,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
     #[allow(dead_code)]
@@ -126,41 +163,61 @@ struct ServerThreadArgs {
     mouse_scale_y: f64,
     gfx_state: Arc<Mutex<GfxState>>,
     shutdown_notify: Arc<Notify>,
+    credentials: ResolvedCredentials,
     handler: Arc<dyn ServerEventHandler>,
 }
 
-/// Try to bind to the given address. If the port is in use, try the next 99 ports.
-/// Returns the successfully bound TcpListener and the actual port.
-fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, u16)> {
-    for offset in 0..100u16 {
-        let port = preferred_port.checked_add(offset)
-            .context("Port number overflow")?;
-        let bind_addr = format!("{addr}:{port}");
-        match TcpListener::bind(&bind_addr) {
-            Ok(listener) => {
-                if offset > 0 {
-                    tracing::warn!(
-                        preferred = preferred_port,
-                        actual = port,
-                        "Preferred port in use, using alternative"
-                    );
-                }
-                return Ok((listener, port));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                tracing::debug!(port, "Port in use, trying next");
-                continue;
-            }
-            Err(e) => {
-                return Err(e).context(format!("Failed to bind to {bind_addr}"));
-            }
+fn validate_bind_address(bind_address: &str, port: u16) -> Result<(TcpListener, SocketAddr)> {
+    let ip: IpAddr = bind_address.parse().with_context(|| {
+        format!("Invalid bind_address `{bind_address}`; expected an IP address")
+    })?;
+    let requested_addr = SocketAddr::new(ip, port);
+    let listener = TcpListener::bind(requested_addr)
+        .with_context(|| format!("Failed to bind to {requested_addr}"))?;
+    let actual_addr = listener.local_addr()?;
+    Ok((listener, actual_addr))
+}
+
+fn resolve_credentials(config: &ServerConfig) -> Result<ResolvedCredentials> {
+    match (&config.username, &config.password) {
+        (Some(username), Some(password))
+            if !username.trim().is_empty() && !password.trim().is_empty() =>
+        {
+            Ok(ResolvedCredentials {
+                username: username.clone(),
+                password: password.clone(),
+                generated: false,
+            })
+        }
+        (None, None) if config.allow_generated_credentials => Ok(ResolvedCredentials {
+            username: "macrdp".to_string(),
+            password: generate_password(24),
+            generated: true,
+        }),
+        _ => {
+            bail!(
+                "RDP credentials are required; configure non-empty username/password or explicitly enable generated credentials"
+            )
         }
     }
-    anyhow::bail!(
-        "No available port found in range {}-{}",
-        preferred_port,
-        preferred_port + 99
-    )
+}
+
+fn generate_password(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut password = String::with_capacity(len);
+    let threshold = u8::MAX - (u8::MAX % ALPHABET.len() as u8);
+    let mut rng = OsRng;
+    let mut byte = [0u8; 1];
+
+    while password.len() < len {
+        rng.fill_bytes(&mut byte);
+        if byte[0] < threshold {
+            let idx = (byte[0] as usize) % ALPHABET.len();
+            password.push(ALPHABET[idx] as char);
+        }
+    }
+
+    password
 }
 
 /// Start the RDP server with the given configuration and event handler.
@@ -168,6 +225,15 @@ fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, 
 pub async fn start_server(
     config: ServerConfig,
     handler: impl ServerEventHandler,
+) -> Result<Arc<ServerHandle>> {
+    start_server_with_options(config, handler, ServerStartupOptions::default()).await
+}
+
+/// Start the RDP server with explicit startup behavior options.
+pub async fn start_server_with_options(
+    config: ServerConfig,
+    handler: impl ServerEventHandler,
+    options: ServerStartupOptions,
 ) -> Result<Arc<ServerHandle>> {
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
 
@@ -178,23 +244,70 @@ pub async fn start_server(
         uptime_secs: 0,
     });
 
-    // Check and request permissions
-    let perms = permissions::request_permissions();
-    tracing::info!(?perms, "Permission status");
+    let credentials = resolve_credentials(&config)?;
+    if credentials.generated {
+        tracing::warn!(
+            user = %credentials.username,
+            "Using generated temporary credentials; password is not logged"
+        );
+    }
 
     // TLS
     let (cert_path, key_path) =
         tls::ensure_tls_files(config.cert_path.as_deref(), config.key_path.as_deref())?;
 
-    // Display detection
-    let (logical_w, logical_h) = match permissions::detect_display_size() {
-        Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "Detected macOS logical display size");
-            (w as u16, h as u16)
+    let (listener, bind_addr) = validate_bind_address(&config.bind_address, config.port)?;
+    let port = bind_addr.port();
+
+    // Check and request permissions only after deterministic startup validation
+    // has completed, so config/bind failures do not trigger OS permission prompts.
+    let perms = if options.request_permissions {
+        permissions::request_permissions()
+    } else {
+        PermissionStatus::default()
+    };
+    tracing::info!(?perms, "Permission status");
+
+    // Stronger preflight than the CoreGraphics permission check: ask
+    // ScreenCaptureKit how many displays it sees right now. The CG check can
+    // (and does) report "granted" for a binary that SCK refuses to enumerate
+    // displays for, in which case the daemon would accept a client and then
+    // fail the first frame — the visible "white screen" symptom. Skip when
+    // permission prompting is disabled (tests, sandboxed contexts) so the
+    // suite stays portable.
+    if options.request_permissions {
+        match permissions::verify_sck_capture_ready() {
+            Ok(n) => {
+                tracing::info!(display_count = n, "ScreenCaptureKit preflight ok");
+            }
+            Err(e) => {
+                handler.on_status_change(ServerStatus {
+                    running: false,
+                    state: format!("error: {e}"),
+                    uptime_secs: 0,
+                });
+                return Err(e.context(
+                    "ScreenCaptureKit cannot enumerate displays — refusing to start; \
+                     a running daemon would accept clients and serve blank screens",
+                ));
+            }
         }
-        Err(e) => {
-            tracing::warn!("Failed to detect display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
+    }
+
+    // Display detection
+    let fixed_config_resolution = config.width > 0 && config.height > 0;
+    let (logical_w, logical_h) = if !options.request_permissions && fixed_config_resolution {
+        (config.width as u16, config.height as u16)
+    } else {
+        match permissions::detect_display_size() {
+            Ok((w, h)) => {
+                tracing::info!(width = w, height = h, "Detected macOS logical display size");
+                (w as u16, h as u16)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to detect display size: {e}, defaulting to 1920x1080");
+                (1920u16, 1080u16)
+            }
         }
     };
 
@@ -225,18 +338,13 @@ pub async fn start_server(
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
 
-    let (listener, port) = find_available_port("0.0.0.0", config.port)?;
-    let bind_addr = listener.local_addr()?;
-    // Drop listener so the RDP server can rebind the same port.
-    // IronRDP's RdpServer::with_addr() binds its own socket; we cannot pass
-    // a pre-bound TcpListener. The TOCTOU window is microsecond-level.
-    drop(listener);
     let shutdown_notify = Arc::new(Notify::new());
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
         config: config.clone(),
         bind_addr,
+        listener,
         cert_path,
         key_path,
         logical_w,
@@ -250,6 +358,7 @@ pub async fn start_server(
         mouse_scale_y,
         gfx_state: Arc::clone(&gfx_state),
         shutdown_notify: Arc::clone(&shutdown_notify),
+        credentials: credentials.clone(),
         handler: Arc::clone(&handler),
     };
 
@@ -311,6 +420,10 @@ pub async fn start_server(
         started_at: Instant::now(),
         gfx_state,
         shutdown_notify,
+        generated_credentials: credentials.generated.then(|| GeneratedCredentials {
+            username: credentials.username,
+            password: credentials.password,
+        }),
         stopped: AtomicBool::new(false),
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
@@ -332,7 +445,7 @@ pub async fn start_server(
 fn run_server_thread(args: ServerThreadArgs) {
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
-    use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
+    use ironrdp_server::{Credentials, RdpServer, ServerEvent, TlsIdentityCtx};
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -373,6 +486,15 @@ fn run_server_thread(args: ServerThreadArgs) {
         // Create display
         let fixed_resolution = args.config.width > 0 && args.config.height > 0;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
+        let skip_unchanged = args
+            .config
+            .skip_unchanged
+            .unwrap_or(args.config.idle_keyframe_sec.is_some());
+        let idle_keyframe_sec = if skip_unchanged {
+            Some(args.config.idle_keyframe_sec.unwrap_or(5))
+        } else {
+            None
+        };
         let display = MacDisplay::new(
             args.width,
             args.height,
@@ -382,12 +504,30 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.encoder_pref,
             args.mode_444,
             bitrate_override,
+            skip_unchanged,
+            idle_keyframe_sec,
             Arc::clone(&args.gfx_state),
         );
 
         // Build RDP server (this is the !Send type)
-        let mut server = RdpServer::builder()
-            .with_addr(args.bind_addr)
+        let builder = match RdpServer::builder().with_listener(args.listener) {
+            Ok(builder) => builder,
+            Err(e) => {
+                tracing::error!("Failed to use pre-bound RDP listener: {e}");
+                args.handler.on_status_change(ServerStatus {
+                    running: false,
+                    state: format!("error: {e}"),
+                    uptime_secs: 0,
+                });
+                return;
+            }
+        };
+
+        // NLA/CredSSP is the default path: with_hybrid advertises HYBRID,
+        // HYBRID_EX, and SSL, and the acceptor selects the strongest mutually
+        // supported protocol (HYBRID_EX > HYBRID > SSL). TLS-only is reachable
+        // only when the client does not advertise either HYBRID variant.
+        let mut server = builder
             .with_hybrid(tls_acceptor, tls_identity.pub_key)
             .with_input_handler(input_handler)
             .with_display_handler(display)
@@ -395,48 +535,23 @@ fn run_server_thread(args: ServerThreadArgs) {
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));
 
-        // Credentials
-        let (username, password) = match (&args.config.username, &args.config.password) {
-            (Some(u), Some(p)) => (u.clone(), p.clone()),
-            _ => {
-                let seed = std::process::id() as u64
-                    ^ std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as u64;
-                let random_pass: String = (0..8)
-                    .map(|i| {
-                        let v = ((seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(i * 1442695040888963407))
-                            >> (i * 5 + 3))
-                            % 36;
-                        if v < 10 {
-                            (b'0' + v as u8) as char
-                        } else {
-                            (b'a' + (v - 10) as u8) as char
-                        }
-                    })
-                    .collect();
-                let user = "macrdp".to_string();
-                tracing::warn!("No credentials in config — using generated credentials:");
-                println!("\n  ┌──────────────────────────────────┐");
-                println!("  │  Username: {:<22}│", &user);
-                println!("  │  Password: {:<22}│", &random_pass);
-                println!("  └──────────────────────────────────┘\n");
-                (user, random_pass)
-            }
-        };
         server.set_credentials(Some(Credentials {
-            username: username.clone(),
-            password: password.clone(),
+            username: args.credentials.username.clone(),
+            password: args.credentials.password.clone(),
             domain: None,
         }));
-        tracing::info!("Authentication configured for user: {}", username);
+        tracing::info!(
+            "Authentication configured for user: {}",
+            args.credentials.username
+        );
 
         tracing::info!(%args.bind_addr, "RDP server listening");
+        let quit_sender = server.event_sender().clone();
+        let run = server.run();
+        tokio::pin!(run);
+
         tokio::select! {
-            result = server.run() => {
+            result = &mut run => {
                 if let Err(e) = result {
                     tracing::error!("RDP server error: {e}");
                     args.handler.on_status_change(ServerStatus {
@@ -448,7 +563,188 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
             _ = args.shutdown_notify.notified() => {
                 tracing::info!("Shutdown signal received, stopping server");
+                let _ = quit_sender.send(ServerEvent::Quit("shutdown requested".to_string()));
+                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut run).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!("RDP server error during shutdown: {e}");
+                        args.handler.on_status_change(ServerStatus {
+                            running: false,
+                            state: format!("error: {e}"),
+                            uptime_secs: 0,
+                        });
+                    }
+                    Err(_) => {
+                        tracing::warn!("Timed out waiting for RDP server to stop gracefully");
+                    }
+                }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_configured_credentials() {
+        let config = ServerConfig {
+            username: Some("admin".to_string()),
+            password: Some("secret".to_string()),
+            ..ServerConfig::default()
+        };
+
+        let credentials = resolve_credentials(&config).unwrap();
+
+        assert_eq!(credentials.username, "admin");
+        assert_eq!(credentials.password, "secret");
+        assert!(!credentials.generated);
+    }
+
+    #[test]
+    fn rejects_missing_credentials_by_default() {
+        let err = resolve_credentials(&ServerConfig::default()).unwrap_err();
+
+        assert!(err.to_string().contains("credentials are required"));
+    }
+
+    #[test]
+    fn rejects_partial_or_blank_credentials() {
+        let partial = ServerConfig {
+            username: Some("admin".to_string()),
+            password: None,
+            ..ServerConfig::default()
+        };
+        assert!(resolve_credentials(&partial).is_err());
+
+        let blank = ServerConfig {
+            username: Some(" ".to_string()),
+            password: Some(" ".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(resolve_credentials(&blank).is_err());
+    }
+
+    #[test]
+    fn generates_credentials_only_when_explicitly_allowed() {
+        let config = ServerConfig {
+            allow_generated_credentials: true,
+            ..ServerConfig::default()
+        };
+
+        let credentials = resolve_credentials(&config).unwrap();
+
+        assert_eq!(credentials.username, "macrdp");
+        assert_eq!(credentials.password.len(), 24);
+        assert!(credentials
+            .password
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric()));
+        assert!(credentials.generated);
+    }
+
+    #[test]
+    fn does_not_generate_when_partial_credentials_are_set() {
+        // Generation kicks in only when *both* fields are None — a half-filled
+        // config is an operator mistake, not an implicit opt-in to generation.
+        let only_username = ServerConfig {
+            username: Some("admin".to_string()),
+            password: None,
+            allow_generated_credentials: true,
+            ..ServerConfig::default()
+        };
+        assert!(resolve_credentials(&only_username).is_err());
+
+        let only_password = ServerConfig {
+            username: None,
+            password: Some("secret".to_string()),
+            allow_generated_credentials: true,
+            ..ServerConfig::default()
+        };
+        assert!(resolve_credentials(&only_password).is_err());
+    }
+
+    #[test]
+    fn does_not_generate_when_credentials_are_blank_not_none() {
+        // `Some("")`/`Some(" ")` is treated as a configured-but-invalid
+        // credential and must fail rather than falling through to generation.
+        let config = ServerConfig {
+            username: Some("".to_string()),
+            password: Some("".to_string()),
+            allow_generated_credentials: true,
+            ..ServerConfig::default()
+        };
+        assert!(resolve_credentials(&config).is_err());
+    }
+
+    #[test]
+    fn generated_passwords_use_unambiguous_alphabet() {
+        // The alphabet deliberately omits visually ambiguous glyphs so the
+        // password printed at first launch is transcribable. Pin that.
+        const FORBIDDEN: &[char] = &['0', 'O', '1', 'I', 'l'];
+        for _ in 0..32 {
+            let password = generate_password(64);
+            for c in password.chars() {
+                assert!(
+                    c.is_ascii_alphanumeric(),
+                    "non-alphanumeric character: {c:?}"
+                );
+                assert!(
+                    !FORBIDDEN.contains(&c),
+                    "ambiguous character {c:?} leaked into generated password"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_passwords_are_distinct_across_calls() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..16 {
+            let password = generate_password(24);
+            assert_eq!(password.len(), 24);
+            assert!(
+                seen.insert(password),
+                "OsRng produced a duplicate 24-char password — CSPRNG sanity check failed"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_passwords_exercise_full_alphabet() {
+        // A bug in the rejection-sampling loop (e.g. wrong modulus) could
+        // collapse the output onto a small slice of the alphabet. Drawing a
+        // long string should cover most of it.
+        let password = generate_password(2048);
+        let unique: std::collections::HashSet<char> = password.chars().collect();
+        assert!(
+            unique.len() >= 40,
+            "expected broad alphabet coverage, got {} distinct chars",
+            unique.len()
+        );
+    }
+
+    #[test]
+    fn bind_validation_keeps_selected_port_reserved() {
+        let (listener, addr) = validate_bind_address("127.0.0.1", 0).unwrap();
+
+        assert_ne!(addr.port(), 0);
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "selected port should stay reserved while startup owns the listener"
+        );
+
+        drop(listener);
+        let rebound = TcpListener::bind(addr).unwrap();
+        drop(rebound);
+    }
+
+    #[test]
+    fn bind_validation_rejects_invalid_bind_address() {
+        let err = validate_bind_address("localhost", 3389).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid bind_address"));
+    }
 }

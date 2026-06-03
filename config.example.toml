@@ -1,6 +1,15 @@
 # macrdp server configuration
 # Copy this file to config.toml and modify as needed.
-# Config search order: ./config.toml → ~/.config/macrdp/ → ~/Library/Application Support/macrdp/
+#
+# All daemon files live under a single base directory:
+#   macOS:     ~/Library/Application Support/macrdp/
+#   Linux/BSD: $XDG_CONFIG_HOME/macrdp/ (or ~/.config/macrdp/)
+#
+# Default layout:
+#   <base>/config.toml      this file
+#   <base>/tls/cert.pem     TLS certificate (auto-generated if missing)
+#   <base>/tls/key.pem      TLS private key  (auto-generated, chmod 600)
+#   <base>/logs/macrdp.log  daemon log
 
 # ─── Network ───────────────────────────────────────────────────────────────────
 
@@ -9,12 +18,25 @@
 # Options: any valid port number (1024-65535 recommended)
 port = 13389
 
+# IP address to listen on
+# Default: 0.0.0.0 (all IPv4 interfaces)
+# Use 127.0.0.1 to accept local connections only.
+bind_address = "0.0.0.0"
+
+# v1 supports one active RDP session at a time.
+# Concurrent client sessions are unsupported.
+
 # ─── Authentication ────────────────────────────────────────────────────────────
 
 # RDP login credentials (NLA/Hybrid/CredSSP)
-# Both fields are optional — if omitted, any credentials are accepted
+# Both fields are required for unattended daemon use.
 username = "admin"
 password = "123456"
+
+# Development-only fallback for temporary credentials.
+# Default: false. When true and username/password are missing, macrdp generates
+# a one-time password using the OS CSPRNG. The password is never logged.
+# allow_generated_credentials = false
 
 # ─── Display ───────────────────────────────────────────────────────────────────
 
@@ -73,11 +95,11 @@ encoder = "hardware"
 # ─── TLS ───────────────────────────────────────────────────────────────────────
 
 # Path to TLS certificate file (PEM format)
-# Default: auto-generated self-signed certificate
+# Default: <base>/tls/cert.pem (auto-generated self-signed if missing)
 # cert_path = "/path/to/cert.pem"
 
 # Path to TLS private key file (PEM format)
-# Default: auto-generated alongside certificate
+# Default: <base>/tls/key.pem (auto-generated alongside certificate, chmod 600)
 # key_path = "/path/to/key.pem"
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
@@ -87,8 +109,25 @@ encoder = "hardware"
 # Options: trace, debug, info, warn, error
 log_level = "info"
 
+# Log format
+# Default: text (human-readable). Set to "json" for one JSON object per line,
+# which is suitable for log aggregation (Vector, Loki, Splunk, etc.).
+# log_format = "json"
+
+# Path to append daemon logs
+# Default: <base>/logs/macrdp.log
+# log_path = "/path/to/macrdp.log"
+
 # ─── Session ───────────────────────────────────────────────────────────────────
 
 # Idle timeout in seconds (disconnect after no input)
 # Default: 1800 (30 minutes)
 idle_timeout_secs = 1800
+
+# Skip encoding frames that ScreenCaptureKit reports as unchanged.
+# Default: false unless idle_keyframe_sec is configured
+# skip_unchanged = true
+
+# When unchanged-frame skipping is enabled, send an idle keyframe/keepalive
+# after this many seconds. Default when skip_unchanged = true: 5
+# idle_keyframe_sec = 5
