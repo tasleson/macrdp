@@ -17,6 +17,10 @@ async fn main() -> Result<ExitCode> {
         return Ok(run_permission_check(&cli.check_permissions_format));
     }
 
+    if cli.keychain_set_password {
+        return run_keychain_set_password(&cli);
+    }
+
     let config = load_config(&cli)?;
 
     // Initialize logging — write to both stderr and file
@@ -133,6 +137,21 @@ fn run_permission_check(format: &str) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn run_keychain_set_password(cli: &Cli) -> Result<ExitCode> {
+    let username = cli
+        .username
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "default".to_string());
+    let password = rpassword::prompt_password(format!("RDP password for '{username}': "))
+        .context("Failed to read password")?;
+    macrdp_server::keychain::set_password(Some(&username), &password)
+        .context("Failed to store password in keychain")?;
+    println!("Password stored in keychain (service=macrdp, account={username})");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Wait for the first SIGINT/SIGTERM, then drive `handle.stop()` to completion.

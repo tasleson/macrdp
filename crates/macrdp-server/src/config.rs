@@ -80,6 +80,14 @@ pub struct Cli {
     /// Output format for `--check-permissions`: text or json.
     #[arg(long, value_parser = ["text", "json"], default_value = "text")]
     pub check_permissions_format: String,
+
+    /// Store the RDP password in the macOS Keychain and exit
+    #[arg(long)]
+    pub keychain_set_password: bool,
+
+    /// Read the RDP password from the macOS Keychain at startup
+    #[arg(long)]
+    pub password_keychain: bool,
 }
 
 /// Load core config from file, then apply CLI overrides.
@@ -143,6 +151,10 @@ pub fn load_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     if let Some(password_env) = &cli.password_env {
         let password = std::env::var(password_env)
             .with_context(|| format!("Failed to read password from ${password_env}"))?;
+        config.password = Some(password);
+    }
+    if cli.password_keychain {
+        let password = crate::keychain::get_password(config.username.as_deref())?;
         config.password = Some(password);
     }
     if cli.allow_generated_credentials {
