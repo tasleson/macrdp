@@ -169,10 +169,21 @@ impl MacDisplay {
             return;
         }
 
-        let w = width.min(MAX_RESOLUTION_DIM);
-        let h = height.min(MAX_RESOLUTION_DIM);
+        let w = width.min(MAX_RESOLUTION_DIM).min(self.native_width);
+        let h = height.min(MAX_RESOLUTION_DIM).min(self.native_height);
         if w == 0 || h == 0 || (w == self.width && h == self.height) {
             return;
+        }
+
+        if width > self.native_width || height > self.native_height {
+            tracing::info!(
+                requested_w = width,
+                requested_h = height,
+                clamped_w = w,
+                clamped_h = h,
+                reason,
+                "Clamped client resolution to native display size"
+            );
         }
 
         tracing::info!(
@@ -1210,7 +1221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flexible_display_adopts_client_requested_larger_size() {
+    async fn flexible_display_clamps_to_native_when_client_requests_larger() {
         let mut display = test_display(1920, 1080, false);
 
         display.request_resize(3840, 2160);
@@ -1218,21 +1229,20 @@ mod tests {
         assert_eq!(
             display.size().await,
             DesktopSize {
-                width: 3840,
-                height: 2160,
-            }
+                width: 1920,
+                height: 1080,
+            },
+            "should clamp to native, not exceed it"
         );
         assert_eq!(
             pending_resize(&display),
-            Some(DesktopSize {
-                width: 3840,
-                height: 2160,
-            })
+            None,
+            "no resize pending — clamped size matches current"
         );
     }
 
     #[tokio::test]
-    async fn flexible_display_clamps_at_protocol_max() {
+    async fn flexible_display_clamps_at_native_before_protocol_max() {
         let mut display = test_display(1920, 1080, false);
 
         display.request_resize(9000, 9000);
@@ -1240,9 +1250,10 @@ mod tests {
         assert_eq!(
             display.size().await,
             DesktopSize {
-                width: MAX_RESOLUTION_DIM,
-                height: MAX_RESOLUTION_DIM,
-            }
+                width: 1920,
+                height: 1080,
+            },
+            "native clamp (1920x1080) takes precedence over protocol max (8192)"
         );
     }
 
@@ -1388,7 +1399,7 @@ mod tests {
     fn rapid_layout_requests_coalesce_to_final_size() {
         let mut display = test_display(1920, 1080, false);
 
-        for (w, h) in [(1922, 1080), (2100, 1200), (2560, 1440)] {
+        for (w, h) in [(1600, 900), (1700, 950), (1800, 1000)] {
             let layout =
                 DisplayControlMonitorLayout::new_single_primary_monitor(w, h, None, None).unwrap();
             display.request_layout(layout);
@@ -1397,8 +1408,8 @@ mod tests {
         assert_eq!(
             pending_resize(&display),
             Some(DesktopSize {
-                width: 2560,
-                height: 1440,
+                width: 1800,
+                height: 1000,
             }),
             "only the final size should be pending after rapid requests"
         );
