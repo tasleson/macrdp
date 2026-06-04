@@ -18,6 +18,20 @@ extern "C" {
 /// ScrollEventUnit::Line
 const SCROLL_UNIT_LINE: u32 = 1;
 
+/// RDP wheel rotation units per detent. MS-RDPBCGR defines one wheel "notch"
+/// (`WHEEL_DELTA`) as 120 rotation units; clients send multiples of this.
+const WHEEL_DELTA: i32 = 120;
+
+/// macOS scroll lines emitted per wheel detent. The raw RDP value would request
+/// ~120 lines per notch, which scrolls violently. One line per detent matches a
+/// physical wheel mouse on a local Mac (one notch == one line of text). Tuned
+/// for feel — adjust here rather than scattering magic numbers.
+const LINES_PER_DETENT: i32 = 1;
+
+/// Upper bound on lines emitted from a single scroll event, so a malformed or
+/// unusually large rotation can't ask macOS to jump an absurd distance.
+const MAX_SCROLL_LINES: i32 = 64;
+
 pub struct MouseInjector;
 
 impl MouseInjector {
@@ -65,14 +79,25 @@ impl MouseInjector {
         Ok(())
     }
 
-    pub fn scroll(&self, vertical: i16) -> Result<()> {
+    /// Inject a scroll event. `dx` and `dy` are in RDP wheel rotation units
+    /// ([`WHEEL_DELTA`] per detent); positive `dy` scrolls up and positive `dx`
+    /// scrolls right, matching the RDP wire convention.
+    pub fn scroll(&self, dx: i32, dy: i32) -> Result<()> {
+        let vertical = Self::units_to_lines(dy);
+        let horizontal = Self::units_to_lines(dx);
+
+        // Nothing to do — avoids emitting empty scroll events for sub-detent jitter.
+        if vertical == 0 && horizontal == 0 {
+            return Ok(());
+        }
+
         unsafe {
             let event_ref = CGEventCreateScrollWheelEvent2(
                 std::ptr::null_mut(),
                 SCROLL_UNIT_LINE,
-                1,
-                vertical as i32,
-                0,
+                2,
+                vertical,
+                horizontal,
                 0,
             );
             if event_ref.is_null() {
@@ -81,8 +106,18 @@ impl MouseInjector {
             let event = CGEvent::from_ptr(event_ref);
             event.post(CGEventTapLocation::HID);
         }
-        tracing::trace!(vertical, "Mouse scroll");
+        tracing::trace!(horizontal, vertical, "Mouse scroll");
         Ok(())
+    }
+
+    /// Convert RDP wheel rotation units into macOS scroll lines, preserving the
+    /// sign and clamping the magnitude. Multiplying before dividing means that if
+    /// `LINES_PER_DETENT` is ever raised above 1, sub-detent rotations still scale
+    /// proportionally rather than all truncating to zero. At one line per detent,
+    /// rotations smaller than a full notch round down to no movement.
+    fn units_to_lines(units: i32) -> i32 {
+        let lines = units.saturating_mul(LINES_PER_DETENT) / WHEEL_DELTA;
+        lines.clamp(-MAX_SCROLL_LINES, MAX_SCROLL_LINES)
     }
 }
 
@@ -91,4 +126,42 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn units_to_lines_maps_detents() {
+        // One detent (WHEEL_DELTA units) yields LINES_PER_DETENT lines, sign preserved.
+        assert_eq!(MouseInjector::units_to_lines(WHEEL_DELTA), LINES_PER_DETENT);
+        assert_eq!(
+            MouseInjector::units_to_lines(-WHEEL_DELTA),
+            -LINES_PER_DETENT
+        );
+        assert_eq!(
+            MouseInjector::units_to_lines(2 * WHEEL_DELTA),
+            2 * LINES_PER_DETENT
+        );
+    }
+
+    #[test]
+    fn units_to_lines_zero_is_zero() {
+        assert_eq!(MouseInjector::units_to_lines(0), 0);
+    }
+
+    #[test]
+    fn units_to_lines_truncates_sub_detent_rotations() {
+        // At one line per detent, a rotation smaller than a full notch produces
+        // no movement (rounds toward zero), preserving sign semantics.
+        assert_eq!(MouseInjector::units_to_lines(WHEEL_DELTA / 2), 0);
+        assert_eq!(MouseInjector::units_to_lines(-WHEEL_DELTA / 2), 0);
+    }
+
+    #[test]
+    fn units_to_lines_clamps_large_bursts() {
+        assert_eq!(MouseInjector::units_to_lines(i32::MAX), MAX_SCROLL_LINES);
+        assert_eq!(MouseInjector::units_to_lines(i32::MIN), -MAX_SCROLL_LINES);
+    }
 }

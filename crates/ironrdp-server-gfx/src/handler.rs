@@ -25,7 +25,10 @@ pub enum KeyboardEvent {
 ///
 #[derive(Debug)]
 pub enum MouseEvent {
-    Move { x: u16, y: u16 },
+    Move {
+        x: u16,
+        y: u16,
+    },
     RightPressed,
     RightReleased,
     LeftPressed,
@@ -36,9 +39,16 @@ pub enum MouseEvent {
     Button4Released,
     Button5Pressed,
     Button5Released,
-    VerticalScroll { value: i16 },
-    Scroll { x: i32, y: i32 },
-    RelMove { x: i32, y: i32 },
+    /// Wheel scroll in RDP rotation units (120 per detent); `x` is horizontal,
+    /// `y` is vertical, both following the RDP sign convention (positive = up/right).
+    Scroll {
+        x: i32,
+        y: i32,
+    },
+    RelMove {
+        x: i32,
+        y: i32,
+    },
 }
 
 /// Input Event Handler for an RDP server
@@ -167,8 +177,17 @@ impl From<MousePdu> for MouseEvent {
                 MouseEvent::RightReleased
             }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
-            MouseEvent::VerticalScroll {
-                value: value.number_of_wheel_rotation_units,
+            MouseEvent::Scroll {
+                x: 0,
+                y: value.number_of_wheel_rotation_units.into(),
+            }
+        } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
+            // A horizontal-wheel PDU carries the rotation in the wheel field, not
+            // a cursor position; without this branch it would fall through to
+            // `Move` and teleport the pointer.
+            MouseEvent::Scroll {
+                x: value.number_of_wheel_rotation_units.into(),
+                y: 0,
             }
         } else {
             MouseEvent::Move {
@@ -243,6 +262,11 @@ impl From<MouseRelPdu> for MouseEvent {
     }
 }
 
+/// Fixed-point scale FreeRDP applies to ainput wheel rotation. Its client
+/// multiplies the legacy WHEEL_DELTA value by `0x10000` before sending it over
+/// the advanced-input channel, so the wire value is WHEEL_DELTA units << 16.
+const AINPUT_WHEEL_SCALE: i32 = 0x10000;
+
 impl From<ainput::MousePdu> for MouseEvent {
     fn from(value: ainput::MousePdu) -> Self {
         use ainput::MouseEventFlags;
@@ -266,9 +290,14 @@ impl From<ainput::MousePdu> for MouseEvent {
                 MouseEvent::MiddleReleased
             }
         } else if value.flags.contains(MouseEventFlags::WHEEL) {
+            // FreeRDP's freerdp_client_send_wheel_event scales the WHEEL_DELTA
+            // rotation by 0x10000 before putting it on the ainput channel
+            // (`value *= 0x10000`), so a single detent arrives as 120 * 65536.
+            // Normalize back to plain WHEEL_DELTA units so Scroll carries the
+            // same units as the legacy MousePdu path.
             MouseEvent::Scroll {
-                x: value.x,
-                y: value.y,
+                x: value.x / AINPUT_WHEEL_SCALE,
+                y: value.y / AINPUT_WHEEL_SCALE,
             }
         } else if value.flags.contains(MouseEventFlags::REL) {
             MouseEvent::RelMove {
@@ -284,5 +313,77 @@ impl From<ainput::MousePdu> for MouseEvent {
         } else {
             MouseEvent::Move { x: 0, y: 0 }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mouse_pdu(flags: PointerFlags, wheel: i16) -> MousePdu {
+        MousePdu {
+            flags,
+            number_of_wheel_rotation_units: wheel,
+            // Non-zero coordinates so a misrouted wheel event would surface as a
+            // bogus Move to these positions rather than a quiet zero.
+            x_position: 100,
+            y_position: 200,
+        }
+    }
+
+    #[test]
+    fn vertical_wheel_maps_to_vertical_scroll() {
+        let event = MouseEvent::from(mouse_pdu(PointerFlags::VERTICAL_WHEEL, 120));
+        assert!(
+            matches!(event, MouseEvent::Scroll { x: 0, y: 120 }),
+            "got {event:?}"
+        );
+    }
+
+    #[test]
+    fn horizontal_wheel_maps_to_horizontal_scroll_not_move() {
+        // Regression: HORIZONTAL_WHEEL used to fall through to Move and teleport
+        // the pointer to the wheel-rotation value held in the position fields.
+        let event = MouseEvent::from(mouse_pdu(PointerFlags::HORIZONTAL_WHEEL, -120));
+        assert!(
+            matches!(event, MouseEvent::Scroll { x: -120, y: 0 }),
+            "got {event:?}"
+        );
+    }
+
+    #[test]
+    fn plain_move_still_carries_position() {
+        let event = MouseEvent::from(mouse_pdu(PointerFlags::MOVE, 0));
+        assert!(
+            matches!(event, MouseEvent::Move { x: 100, y: 200 }),
+            "got {event:?}"
+        );
+    }
+
+    fn ainput_wheel_pdu(x: i32, y: i32) -> ainput::MousePdu {
+        ainput::MousePdu {
+            time: 0,
+            flags: ainput::MouseEventFlags::WHEEL,
+            x,
+            y,
+        }
+    }
+
+    #[test]
+    fn ainput_wheel_normalizes_fixed_point_to_wheel_delta_units() {
+        // FreeRDP sends one detent as 120 << 16 over ainput; it must arrive as
+        // plain WHEEL_DELTA units (120) so it matches the legacy MousePdu path.
+        let one_detent = 120 * AINPUT_WHEEL_SCALE;
+        let event = MouseEvent::from(ainput_wheel_pdu(0, one_detent));
+        assert!(
+            matches!(event, MouseEvent::Scroll { x: 0, y: 120 }),
+            "got {event:?}"
+        );
+
+        let event = MouseEvent::from(ainput_wheel_pdu(-one_detent, 0));
+        assert!(
+            matches!(event, MouseEvent::Scroll { x: -120, y: 0 }),
+            "got {event:?}"
+        );
     }
 }
