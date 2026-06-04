@@ -6,7 +6,8 @@ use ironrdp_server::{
     PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use macrdp_capture::{
-    CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer,
+    CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, Rect,
+    ScreenCapturer,
 };
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -21,6 +22,43 @@ const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
 const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
 const ADAPTIVE_BITRATE_FLOOR_BPS: u32 = 500_000;
 const GFX_CAPS_WAIT_TIMEOUT_SECONDS: u64 = 5;
+
+/// Compute the clamped bounding box `(x, y, width, height)` that covers every
+/// dirty rect, or `None` when there is nothing worth sending: no rects, or a
+/// region that collapses to zero area after clamping to the frame. Coordinates
+/// are clamped to the frame bounds so a capturer reporting a rect that extends
+/// past the frame edge can never produce an out-of-bounds region.
+fn dirty_bounding_box(
+    dirty_rects: &[Rect],
+    frame_width: u32,
+    frame_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if dirty_rects.is_empty() {
+        return None;
+    }
+
+    let mut min_x = frame_width;
+    let mut min_y = frame_height;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    for r in dirty_rects {
+        min_x = min_x.min(r.x);
+        min_y = min_y.min(r.y);
+        max_x = max_x.max(r.x + r.width);
+        max_y = max_y.max(r.y + r.height);
+    }
+
+    // Clamp the far edges to the frame; the near edges are already valid unless
+    // the whole region sits off-screen, which the emptiness check below catches.
+    max_x = max_x.min(frame_width);
+    max_y = max_y.min(frame_height);
+
+    if max_x > min_x && max_y > min_y {
+        Some((min_x, min_y, max_x - min_x, max_y - min_y))
+    } else {
+        None
+    }
+}
 
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
@@ -996,63 +1034,48 @@ impl MacDisplayUpdates {
             return Ok(None);
         }
 
-        if !frame.dirty_rects.is_empty() {
-            // Find bounding box of all dirty rects to send a single update
-            let mut min_x = frame.width;
-            let mut min_y = frame.height;
-            let mut max_x = 0u32;
-            let mut max_y = 0u32;
+        // Send a single update covering the bounding box of all dirty rects.
+        // A `None` here (no rects, or a degenerate region) falls through to the
+        // full-frame path below.
+        if let Some((min_x, min_y, w, h)) =
+            dirty_bounding_box(&frame.dirty_rects, frame.width, frame.height)
+        {
+            let max_y = min_y + h;
+            let Some(width) = NonZeroU16::new(w as u16) else {
+                return Ok(None);
+            };
+            let Some(height) = NonZeroU16::new(h as u16) else {
+                return Ok(None);
+            };
 
-            for r in &frame.dirty_rects {
-                min_x = min_x.min(r.x);
-                min_y = min_y.min(r.y);
-                max_x = max_x.max(r.x + r.width);
-                max_y = max_y.max(r.y + r.height);
-            }
-
-            // Clamp to frame bounds
-            max_x = max_x.min(frame.width);
-            max_y = max_y.min(frame.height);
-
-            if max_x > min_x && max_y > min_y {
-                let w = max_x - min_x;
-                let h = max_y - min_y;
-                let Some(width) = NonZeroU16::new(w as u16) else {
-                    return Ok(None);
-                };
-                let Some(height) = NonZeroU16::new(h as u16) else {
-                    return Ok(None);
-                };
-
-                // Extract only the dirty region from the full frame buffer
-                let bpp = 4usize;
-                let dirty_stride = w as usize * bpp;
-                let mut dirty_data = Vec::with_capacity(dirty_stride * h as usize);
-                for row in min_y..max_y {
-                    let src_offset = row as usize * frame.stride + min_x as usize * bpp;
-                    let src_end = src_offset + dirty_stride;
-                    if src_end <= bgra_bitmap.len() {
-                        dirty_data.extend_from_slice(&bgra_bitmap[src_offset..src_end]);
-                    }
+            // Extract only the dirty region from the full frame buffer
+            let bpp = 4usize;
+            let dirty_stride = w as usize * bpp;
+            let mut dirty_data = Vec::with_capacity(dirty_stride * h as usize);
+            for row in min_y..max_y {
+                let src_offset = row as usize * frame.stride + min_x as usize * bpp;
+                let src_end = src_offset + dirty_stride;
+                if src_end <= bgra_bitmap.len() {
+                    dirty_data.extend_from_slice(&bgra_bitmap[src_offset..src_end]);
                 }
-
-                let Some(stride) = NonZeroUsize::new(dirty_stride) else {
-                    return Ok(None);
-                };
-
-                let update = BitmapUpdate {
-                    x: min_x as u16,
-                    y: min_y as u16,
-                    width,
-                    height,
-                    format: RdpPixelFormat::BgrA32,
-                    data: Bytes::from(dirty_data),
-                    stride,
-                };
-
-                self.idle_frames.record_sent(Instant::now());
-                return Ok(Some(DisplayUpdate::Bitmap(update)));
             }
+
+            let Some(stride) = NonZeroUsize::new(dirty_stride) else {
+                return Ok(None);
+            };
+
+            let update = BitmapUpdate {
+                x: min_x as u16,
+                y: min_y as u16,
+                width,
+                height,
+                format: RdpPixelFormat::BgrA32,
+                data: Bytes::from(dirty_data),
+                stride,
+            };
+
+            self.idle_frames.record_sent(Instant::now());
+            return Ok(Some(DisplayUpdate::Bitmap(update)));
         }
 
         // No dirty rects available — send full frame (first frame or fallback)
@@ -1305,6 +1328,79 @@ mod tests {
         assert_eq!(updates[0].width.get(), 64);
         assert_eq!(updates[1].x, 64);
         assert_eq!(updates[1].width.get(), 36);
+    }
+
+    #[test]
+    fn dirty_bounding_box_cases() {
+        fn r(x: u32, y: u32, width: u32, height: u32) -> Rect {
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            }
+        }
+
+        struct Case {
+            name: &'static str,
+            rects: Vec<Rect>,
+            frame: (u32, u32),
+            expected: Option<(u32, u32, u32, u32)>,
+        }
+
+        let cases = [
+            Case {
+                name: "no rects -> nothing to send",
+                rects: vec![],
+                frame: (1920, 1080),
+                expected: None,
+            },
+            Case {
+                name: "single rect passes through",
+                rects: vec![r(10, 20, 30, 40)],
+                frame: (1920, 1080),
+                expected: Some((10, 20, 30, 40)),
+            },
+            Case {
+                name: "union spans all rects",
+                rects: vec![r(10, 10, 10, 10), r(100, 50, 20, 30)],
+                frame: (1920, 1080),
+                expected: Some((10, 10, 110, 70)),
+            },
+            Case {
+                name: "far edges clamp to frame",
+                rects: vec![r(1900, 1060, 100, 100)],
+                frame: (1920, 1080),
+                expected: Some((1900, 1060, 20, 20)),
+            },
+            Case {
+                name: "fully off-screen collapses to none",
+                rects: vec![r(1920, 1080, 10, 10)],
+                frame: (1920, 1080),
+                expected: None,
+            },
+            Case {
+                name: "zero-area rect collapses to none",
+                rects: vec![r(50, 50, 0, 0)],
+                frame: (1920, 1080),
+                expected: None,
+            },
+            Case {
+                name: "full-frame rect",
+                rects: vec![r(0, 0, 1920, 1080)],
+                frame: (1920, 1080),
+                expected: Some((0, 0, 1920, 1080)),
+            },
+        ];
+
+        for c in &cases {
+            assert_eq!(
+                dirty_bounding_box(&c.rects, c.frame.0, c.frame.1),
+                c.expected,
+                "{}",
+                c.name
+            );
+        }
     }
 
     #[test]
