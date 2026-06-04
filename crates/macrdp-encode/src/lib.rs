@@ -71,6 +71,11 @@ pub trait VideoEncoder: Send {
         anyhow::bail!("encode_pixel_buffer not supported by this encoder")
     }
 
+    /// Whether this encoder can consume NV12 CVPixelBuffer frames directly.
+    fn supports_pixel_buffer_input(&self) -> bool {
+        false
+    }
+
     fn set_bitrate(&mut self, bitrate_bps: u32);
     fn force_keyframe(&mut self);
 
@@ -102,7 +107,7 @@ pub enum EncoderPreference {
     Software,
     /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames
     Hardware,
-    /// Same as Software (recommended default)
+    /// Prefer platform hardware when available, with software fallback.
     Auto,
 }
 
@@ -114,15 +119,42 @@ impl EncoderPreference {
             _ => Self::Auto,
         }
     }
+
+    /// Whether this preference should prepare for platform hardware encode.
+    pub fn prefers_hardware_on_this_platform(self) -> bool {
+        cfg!(target_os = "macos") && matches!(self, Self::Hardware | Self::Auto)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderBackend {
+    VideoToolbox,
+    OpenH264,
+}
+
+#[cfg(target_os = "macos")]
+fn encoder_backend_order(preference: EncoderPreference) -> &'static [EncoderBackend] {
+    match preference {
+        EncoderPreference::Software => &[EncoderBackend::OpenH264],
+        EncoderPreference::Hardware | EncoderPreference::Auto => {
+            &[EncoderBackend::VideoToolbox, EncoderBackend::OpenH264]
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn encoder_backend_order(_preference: EncoderPreference) -> &'static [EncoderBackend] {
+    &[EncoderBackend::OpenH264]
 }
 
 /// Create an H.264 encoder based on preference.
-/// When `mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
+/// When `mode_444` is true, the encoder tries to initialize AVC444 support.
+/// AVC444 is optional: if setup fails, creation retries AVC420 before giving up.
 pub fn create_encoder(
     width: u32,
     height: u32,
     fps: f32,
-    quality: Quality,
+    _quality: Quality,
     preference: EncoderPreference,
     mode_444: bool,
     bitrate: u32,
@@ -132,7 +164,7 @@ pub fn create_encoder(
 
     // Hardware: VideoToolbox GPU encoder
     #[cfg(target_os = "macos")]
-    if preference == EncoderPreference::Hardware {
+    if encoder_backend_order(preference).contains(&EncoderBackend::VideoToolbox) {
         match VtEncoder::new(enc_w, enc_h, fps, bitrate, mode_444) {
             Ok(encoder) => {
                 tracing::info!(
@@ -144,18 +176,119 @@ pub fn create_encoder(
                 return Ok(Box::new(encoder));
             }
             Err(e) => {
-                tracing::warn!("VideoToolbox unavailable: {e}, falling back to OpenH264");
+                if mode_444 {
+                    tracing::warn!(
+                        "VideoToolbox AVC444 unavailable: {e}; retrying VideoToolbox AVC420"
+                    );
+                    match VtEncoder::new(enc_w, enc_h, fps, bitrate, false) {
+                        Ok(encoder) => {
+                            tracing::info!(
+                                enc_w,
+                                enc_h,
+                                mode_444 = false,
+                                "Using VideoToolbox hardware encoder (GPU)"
+                            );
+                            return Ok(Box::new(encoder));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "VideoToolbox AVC420 unavailable after AVC444 retry: {e}; falling back to OpenH264"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!("VideoToolbox unavailable: {e}, falling back to OpenH264");
+                }
             }
         }
     }
 
     // Software / Auto: OpenH264 CPU encoder (full P-frame support)
-    tracing::info!(
-        enc_w,
-        enc_h,
-        mode_444,
-        "Using OpenH264 software encoder (CPU)"
-    );
-    let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
-    Ok(Box::new(encoder))
+    match OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444) {
+        Ok(encoder) => {
+            tracing::info!(
+                enc_w,
+                enc_h,
+                mode_444,
+                "Using OpenH264 software encoder (CPU)"
+            );
+            Ok(Box::new(encoder))
+        }
+        Err(e) if mode_444 => {
+            tracing::warn!("OpenH264 AVC444 unavailable: {e}; retrying OpenH264 AVC420");
+            let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, false)?;
+            tracing::info!(
+                enc_w,
+                enc_h,
+                mode_444 = false,
+                "Using OpenH264 software encoder (CPU)"
+            );
+            Ok(Box::new(encoder))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoder_preference_aliases_parse_as_expected() {
+        assert_eq!(
+            EncoderPreference::from_str_opt(Some("videotoolbox")),
+            EncoderPreference::Hardware
+        );
+        assert_eq!(
+            EncoderPreference::from_str_opt(Some("OPENH264")),
+            EncoderPreference::Software
+        );
+        assert_eq!(
+            EncoderPreference::from_str_opt(Some("auto")),
+            EncoderPreference::Auto
+        );
+        assert_eq!(
+            EncoderPreference::from_str_opt(None),
+            EncoderPreference::Auto
+        );
+    }
+
+    #[test]
+    fn auto_prefers_videotoolbox_on_macos_with_openh264_fallback() {
+        let order = encoder_backend_order(EncoderPreference::Auto);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            order,
+            &[EncoderBackend::VideoToolbox, EncoderBackend::OpenH264]
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(order, &[EncoderBackend::OpenH264]);
+    }
+
+    #[test]
+    fn software_preference_skips_videotoolbox() {
+        assert_eq!(
+            encoder_backend_order(EncoderPreference::Software),
+            &[EncoderBackend::OpenH264]
+        );
+    }
+
+    #[test]
+    fn hardware_preparation_matches_platform_support() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(EncoderPreference::Auto.prefers_hardware_on_this_platform());
+            assert!(EncoderPreference::Hardware.prefers_hardware_on_this_platform());
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!EncoderPreference::Auto.prefers_hardware_on_this_platform());
+            assert!(!EncoderPreference::Hardware.prefers_hardware_on_this_platform());
+        }
+
+        assert!(!EncoderPreference::Software.prefers_hardware_on_this_platform());
+    }
 }

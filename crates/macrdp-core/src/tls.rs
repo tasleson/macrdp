@@ -122,11 +122,7 @@ pub fn ensure_tls_files(
                     key.display(),
                 );
             }
-            tracing::info!(
-                ?cert,
-                ?key,
-                "Using operator-supplied TLS certificate"
-            );
+            tracing::info!(?cert, ?key, "Using operator-supplied TLS certificate");
             Ok((cert.to_path_buf(), key.to_path_buf()))
         }
         (None, None) => {

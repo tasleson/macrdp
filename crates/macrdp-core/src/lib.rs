@@ -1,8 +1,10 @@
 //! macrdp-core: unified RDP server library
 
 pub mod callbacks;
+pub mod clipboard;
 pub mod config;
 pub mod display;
+pub mod features;
 pub mod handler;
 pub mod permissions;
 pub mod server;

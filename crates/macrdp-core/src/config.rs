@@ -29,7 +29,7 @@ pub struct ServerConfig {
     pub log_format: Option<String>,
     /// Video quality: low_latency, balanced, high_quality (default: high_quality)
     pub quality: Option<String>,
-    /// H.264 encoder: software, hardware, auto (default: software)
+    /// H.264 encoder: software, hardware, auto (default: auto)
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,
@@ -52,10 +52,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("username", &self.username)
-            .field(
-                "password",
-                &self.password.as_ref().map(|_| "<redacted>"),
-            )
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field(
                 "allow_generated_credentials",
                 &self.allow_generated_credentials,

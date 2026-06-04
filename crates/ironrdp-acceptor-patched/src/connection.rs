@@ -83,6 +83,7 @@ pub struct Acceptor {
     io_channel_id: u16,
     user_channel_id: u16,
     desktop_size: DesktopSize,
+    requested_desktop_size: Option<DesktopSize>,
     server_capabilities: Vec<CapabilitySet>,
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
@@ -113,6 +114,7 @@ impl Acceptor {
             user_channel_id: USER_CHANNEL_ID,
             io_channel_id: IO_CHANNEL_ID,
             desktop_size,
+            requested_desktop_size: None,
             server_capabilities: capabilities,
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
@@ -154,6 +156,7 @@ impl Acceptor {
             user_channel_id: consumed.user_channel_id,
             io_channel_id: consumed.io_channel_id,
             desktop_size,
+            requested_desktop_size: None,
             server_capabilities: consumed.server_capabilities,
             static_channels,
             saved_for_reactivation,
@@ -167,6 +170,20 @@ impl Acceptor {
         T: SvcServerProcessor + 'static,
     {
         self.static_channels.insert(channel);
+    }
+
+    pub fn take_requested_desktop_size(&mut self) -> Option<DesktopSize> {
+        self.requested_desktop_size.take()
+    }
+
+    pub fn set_desktop_size(&mut self, desktop_size: DesktopSize) {
+        self.desktop_size = desktop_size;
+        for cap in self.server_capabilities.iter_mut() {
+            if let CapabilitySet::Bitmap(cap) = cap {
+                cap.desktop_width = desktop_size.width;
+                cap.desktop_height = desktop_size.height;
+            }
+        }
     }
 
     pub fn reached_security_upgrade(&self) -> Option<SecurityProtocol> {
@@ -441,6 +458,10 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                self.requested_desktop_size = Some(DesktopSize {
+                    width: gcc_blocks.core.desktop_width,
+                    height: gcc_blocks.core.desktop_height,
+                });
 
                 let joined: Vec<_> = gcc_blocks
                     .network

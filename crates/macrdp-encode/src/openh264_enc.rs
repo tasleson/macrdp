@@ -6,7 +6,7 @@ use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::YUVBuffer;
 
 use crate::color_convert::VImageConverter;
-use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
+use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 pub struct OpenH264Encoder {
     encoder: Encoder,
@@ -53,29 +53,15 @@ impl Yuv444SplitBufs {
     }
 }
 
-/// Calculate optimal bitrate for screen content
-fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
-    let pixels = width as f64 * height as f64;
-    // Screen content needs high bitrate for sharp text and UI edges
-    // Base bits-per-pixel at 30fps, scaled by actual fps
-    let base_bpp = match quality {
-        Quality::LowLatency => 8.0,   // ~16 Mbps for 1080p@30
-        Quality::Balanced => 16.0,    // ~33 Mbps for 1080p@30
-        Quality::HighQuality => 24.0, // ~50 Mbps for 1080p@30
-    };
-    let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
-}
-
 fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Result<Encoder> {
     let config = EncoderConfig::new()
         .bitrate(openh264::encoder::BitRate::from_bps(bitrate))
         .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
         .background_detection(false)
-        .adaptive_quantization(true)
+        .adaptive_quantization(false)
         .qp(openh264::encoder::QpRange::new(20, 40))
-        .skip_frames(false)
+        .skip_frames(true)
         .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
         .complexity(openh264::encoder::Complexity::Medium)
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
@@ -412,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_screen_bitrate() {
-        let br = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
+        let br = crate::screen_bitrate(1920, 1080, 60.0, crate::Quality::HighQuality);
         assert!(
             br > 30_000_000,
             "1080p60 HighQuality should be > 30Mbps, got {}",

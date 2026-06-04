@@ -2,17 +2,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use ironrdp_core::{encode_vec, impl_as_any, Encode, WriteCursor, EncodeResult};
+use ironrdp_core::{encode_vec, impl_as_any, Encode, EncodeResult, WriteCursor};
 use ironrdp_dvc::{DvcEncode, DvcProcessor, DvcServerProcessor};
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
     Avc420BitmapStream, Avc444BitmapStream, CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu,
     CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags,
     CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, ClientPdu, Codec1Type,
-    CreateSurfacePdu, EndFramePdu, Encoding, MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat,
+    CreateSurfacePdu, Encoding, EndFramePdu, MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat,
     QuantQuality, ResetGraphicsPdu, ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
-use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::{decode, PduResult};
 
 type DvcMessage = ironrdp_dvc::DvcMessage;
@@ -109,7 +109,10 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
                     break;
                 }
                 let seg_size = u32::from_le_bytes([
-                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
                 ]) as usize;
                 offset += 4;
                 if offset < data.len() && data[offset] == 0x04 {
@@ -129,9 +132,23 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
-    let data = encode_vec(pdu).map_err(|e| ironrdp_pdu::custom_err!("GfxEncode", e))?;
+    let data = encode_vec(pdu).map_err(|e| ironrdp_pdu::encode_err!(e))?;
     let wrapped = wrap_zgfx(&data);
     Ok(Box::new(RawGfxPdu(wrapped)))
+}
+
+fn encode_pdu_into<T: Encode>(buf: &mut Vec<u8>, pdu: &T) -> bool {
+    let size = pdu.size();
+    let start = buf.len();
+    buf.resize(start + size, 0);
+    let mut cursor = WriteCursor::new(&mut buf[start..]);
+    match pdu.encode(&mut cursor) {
+        Ok(()) => true,
+        Err(_) => {
+            buf.truncate(start);
+            false
+        }
+    }
 }
 
 /// Lenient parser for an RDPGFX `CapabilitiesAdvertisePDU` that tolerates
@@ -164,7 +181,8 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 /// the upstream error handling.
 fn parse_caps_advertise_lenient(data: &[u8]) -> Option<Vec<CapabilitySet>> {
     fn read_u16_le(b: &[u8], off: usize) -> Option<u16> {
-        b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+        b.get(off..off + 2)
+            .map(|s| u16::from_le_bytes([s[0], s[1]]))
     }
     fn read_u32_le(b: &[u8], off: usize) -> Option<u32> {
         b.get(off..off + 4)
@@ -268,6 +286,13 @@ pub struct GfxState {
     pub frame_send_times: std::collections::HashMap<u32, std::time::Instant>,
     /// Exponentially weighted moving average RTT in ms
     pub rtt_ewma_ms: f64,
+    /// EWMA of pending_acks (smoothed to filter per-frame jitter)
+    pub pending_acks_ewma: f64,
+    /// EWMA of pending_acks delta between consecutive ack events.
+    /// Positive = queue growing (congestion), zero/negative = stable/recovering.
+    pub ack_queue_trend: f64,
+    /// pending_acks snapshot at the previous ack event, for trend computation
+    prev_pending_at_ack: u32,
     /// Last frame encode time in ms
     pub last_encode_ms: f64,
     /// Last frame size in bytes
@@ -301,6 +326,9 @@ impl GfxState {
             network_quality: 1.0,
             frame_send_times: std::collections::HashMap::new(),
             rtt_ewma_ms: 0.0,
+            pending_acks_ewma: 0.0,
+            ack_queue_trend: 0.0,
+            prev_pending_at_ack: 0,
             last_encode_ms: 0.0,
             last_frame_bytes: 0,
             total_bytes_sent: 0,
@@ -324,11 +352,16 @@ impl GfxState {
             let dt = prev.elapsed().as_secs_f64().max(0.0001);
             let mbps = self.last_frame_bytes as f64 * 8.0 / dt / 1_000_000.0;
             self.bitrate_samples.push(mbps);
-            if mbps > self.bitrate_max { self.bitrate_max = mbps; }
-            if mbps < self.bitrate_min { self.bitrate_min = mbps; }
+            if mbps > self.bitrate_max {
+                self.bitrate_max = mbps;
+            }
+            if mbps < self.bitrate_min {
+                self.bitrate_min = mbps;
+            }
         }
         self.last_frame_time = Some(std::time::Instant::now());
-        self.frame_send_times.insert(self.frame_id, std::time::Instant::now());
+        self.frame_send_times
+            .insert(self.frame_id, std::time::Instant::now());
         // Limit map size to prevent unbounded growth
         if self.frame_send_times.len() > 120 {
             let cutoff = self.frame_id.saturating_sub(120);
@@ -337,7 +370,7 @@ impl GfxState {
         self.frame_id
     }
 
-    /// Update network quality and RTT based on frame acknowledgment
+    /// Update network quality and RTT based on frame acknowledgment.
     pub fn ack_frame(&mut self, ack_frame_id: u32) {
         self.last_ack_frame = ack_frame_id;
         if self.pending_acks > 0 {
@@ -347,7 +380,6 @@ impl GfxState {
         // Calculate RTT from send timestamp
         if let Some(send_time) = self.frame_send_times.remove(&ack_frame_id) {
             let rtt_ms = send_time.elapsed().as_secs_f64() * 1000.0;
-            // EWMA with alpha=0.2 for smooth averaging
             if self.rtt_ewma_ms == 0.0 {
                 self.rtt_ewma_ms = rtt_ms;
             } else {
@@ -355,17 +387,38 @@ impl GfxState {
             }
         }
 
-        // Network quality based on RTT and ack backlog
-        self.network_quality = if self.rtt_ewma_ms < 15.0 && self.pending_acks <= 2 {
-            1.0 // Excellent: max bitrate
-        } else if self.rtt_ewma_ms < 30.0 && self.pending_acks <= 5 {
-            0.8 // Good
-        } else if self.rtt_ewma_ms < 60.0 && self.pending_acks <= 10 {
-            0.5 // Fair
-        } else if self.rtt_ewma_ms < 100.0 {
-            0.3 // Poor
+        // Ack queue trend: delta in pending_acks between consecutive ack events.
+        // Positive = more frames sent than acked since last time (queue growing).
+        let delta = self.pending_acks as i32 - self.prev_pending_at_ack as i32;
+        self.prev_pending_at_ack = self.pending_acks;
+        self.ack_queue_trend = self.ack_queue_trend * 0.8 + delta as f64 * 0.2;
+        self.pending_acks_ewma = self.pending_acks_ewma * 0.9 + self.pending_acks as f64 * 0.1;
+
+        // Network-only RTT estimate (subtract server-side encode time)
+        let net_rtt_ms = (self.rtt_ewma_ms - self.last_encode_ms).max(0.0);
+
+        // Adaptive bitrate: ack queue TREND driven, not absolute RTT driven.
+        //
+        // Absolute RTT conflates client decode/render latency with network delay.
+        // A pipelined RDP client sustaining 60fps with 200ms pipeline latency
+        // produces RTT=200ms on a sub-1ms LAN — the old absolute thresholds
+        // would cut bitrate to 0.15× while the link sits idle.
+        //
+        // Ack queue trend directly measures whether the transport pipeline is
+        // falling behind: growing queue = congestion, stable queue = healthy
+        // (regardless of absolute latency from slow client decode).
+        self.network_quality = if self.pending_acks <= 2 {
+            1.0
+        } else if self.ack_queue_trend <= 0.5 {
+            // Queue stable or shrinking — client keeping up, even with pipeline latency.
+            if self.pending_acks_ewma < 15.0 { 1.0 } else { 0.85 }
+        } else if self.ack_queue_trend <= 2.0 {
+            // Queue growing slowly — early congestion or transient burst.
+            if net_rtt_ms < 30.0 { 0.85 } else { 0.6 }
+        } else if self.ack_queue_trend <= 5.0 {
+            0.4
         } else {
-            0.15 // Congested
+            0.15
         };
     }
 
@@ -396,15 +449,15 @@ impl GfxHandler {
     /// into a single RDP_SEGMENTED_DATA structure."
     /// First call also includes surface setup PDUs (ResetGraphics + CreateSurface + MapSurfaceToOutput).
     pub fn create_frame_pdu(state: &mut GfxState, frame: &GfxFrameUpdate) -> Vec<u8> {
-        // Concatenate all raw GFX PDUs, then ZGFX-wrap once
-        let mut raw_pdus = Vec::new();
+        let aux_len = frame.h264_aux.as_ref().map_or(0, |a| a.len());
+        let mut raw_pdus = Vec::with_capacity(frame.h264_data.len() + aux_len + 512);
 
         let enc_w = frame.enc_width;
         let enc_h = frame.enc_height;
 
         // First frame: surface setup (CapConfirm already sent by DVC handler)
         if !state.surface_created {
-            if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
+            encode_pdu_into(&mut raw_pdus, &ServerPdu::ResetGraphics(ResetGraphicsPdu {
                 width: state.width as u32,
                 height: state.height as u32,
                 monitors: vec![Monitor {
@@ -414,35 +467,31 @@ impl GfxHandler {
                     bottom: state.height as i32 - 1,
                     flags: MonitorFlags::PRIMARY,
                 }],
-            })) {
-                raw_pdus.extend_from_slice(&data);
-            }
+            }));
 
-            if let Ok(data) = encode_vec(&ServerPdu::CreateSurface(CreateSurfacePdu {
+            encode_pdu_into(&mut raw_pdus, &ServerPdu::CreateSurface(CreateSurfacePdu {
                 surface_id: 0,
                 width: enc_w,
                 height: enc_h,
                 pixel_format: GfxPixelFormat::XRgb,
-            })) {
-                raw_pdus.extend_from_slice(&data);
-            }
+            }));
 
-            if let Ok(data) = encode_vec(&ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+            encode_pdu_into(&mut raw_pdus, &ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
                 surface_id: 0,
                 output_origin_x: 0,
                 output_origin_y: 0,
-            })) {
-                raw_pdus.extend_from_slice(&data);
-            }
+            }));
 
             state.surface_created = true;
-            info!("GFX surface created: {}x{} (enc: {}x{})", state.width, state.height, enc_w, enc_h);
+            info!(
+                "GFX surface created: {}x{} (enc: {}x{})",
+                state.width, state.height, enc_w, enc_h
+            );
         }
 
         let frame_id = state.next_frame_id();
 
-        // StartFrame
-        if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
+        encode_pdu_into(&mut raw_pdus, &ServerPdu::StartFrame(StartFramePdu {
             timestamp: Timestamp {
                 milliseconds: 0,
                 seconds: 0,
@@ -450,9 +499,7 @@ impl GfxHandler {
                 hours: 0,
             },
             frame_id,
-        })) {
-            raw_pdus.extend_from_slice(&data);
-        }
+        }));
 
         let make_rect = || InclusiveRectangle {
             left: 0,
@@ -464,8 +511,8 @@ impl GfxHandler {
         let make_dest_rect = || InclusiveRectangle {
             left: 0,
             top: 0,
-            right: enc_w,   // RDPGFX_RECT16 exclusive bound = encoder-aligned
-            bottom: enc_h,  // RDPGFX_RECT16 exclusive bound = encoder-aligned
+            right: enc_w,  // RDPGFX_RECT16 exclusive bound = encoder-aligned
+            bottom: enc_h, // RDPGFX_RECT16 exclusive bound = encoder-aligned
         };
 
         let make_qq = || QuantQuality {
@@ -475,9 +522,7 @@ impl GfxHandler {
         };
 
         // Choose AVC444 or AVC420 path based on available data and negotiated caps
-        let use_avc444 = frame.h264_aux.is_some()
-            && state.avc444_supported
-            && state.avc444_enabled;
+        let use_avc444 = frame.h264_aux.is_some() && state.avc444_supported && state.avc444_enabled;
 
         if use_avc444 {
             // AVC444 path: WireToSurface1 + Avc444BitmapStream
@@ -497,15 +542,13 @@ impl GfxHandler {
             };
 
             if let Ok(avc444_data) = encode_vec(&avc444_stream) {
-                if let Ok(data) = encode_vec(&ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                encode_pdu_into(&mut raw_pdus, &ServerPdu::WireToSurface1(WireToSurface1Pdu {
                     surface_id: 0,
                     codec_id: Codec1Type::Avc444,
                     pixel_format: GfxPixelFormat::XRgb,
                     destination_rectangle: make_dest_rect(),
                     bitmap_data: avc444_data,
-                })) {
-                    raw_pdus.extend_from_slice(&data);
-                }
+                }));
             }
         } else {
             // AVC420 path: WireToSurface1 + Avc420BitmapStream
@@ -516,22 +559,17 @@ impl GfxHandler {
             };
 
             if let Ok(avc_data) = encode_vec(&avc_stream) {
-                if let Ok(data) = encode_vec(&ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                encode_pdu_into(&mut raw_pdus, &ServerPdu::WireToSurface1(WireToSurface1Pdu {
                     surface_id: 0,
                     codec_id: Codec1Type::Avc420,
                     pixel_format: GfxPixelFormat::XRgb,
                     destination_rectangle: make_dest_rect(),
                     bitmap_data: avc_data,
-                })) {
-                    raw_pdus.extend_from_slice(&data);
-                }
+                }));
             }
         }
 
-        // EndFrame
-        if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
-            raw_pdus.extend_from_slice(&data);
-        }
+        encode_pdu_into(&mut raw_pdus, &ServerPdu::EndFrame(EndFramePdu { frame_id }));
 
         debug!(
             frame_id,
@@ -622,7 +660,9 @@ impl DvcProcessor for GfxHandler {
 
                 for cap in cap_sets {
                     match cap {
-                        CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
+                        CapabilitySet::V10_7 { flags }
+                            if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) =>
+                        {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
                             best_cap = Some(cap.clone());
@@ -640,43 +680,55 @@ impl DvcProcessor for GfxHandler {
                         {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V10_3 { flags }
                             if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
                         {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
                             if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
                         {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V10_1 => {
                             // V10_1 has no AVC_DISABLED flag — always supports AVC
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V8_1 { flags }
                             if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) =>
                         {
                             state.avc420_supported = true;
                             // V8.1 only supports AVC420, not AVC444
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         _ => {
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                     }
                 }
 
                 let confirmed = best_cap.unwrap_or(CapabilitySet::V8 {
-                    flags: ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags::empty(),
+                    flags: CapabilitiesV8Flags::empty(),
                 });
 
                 info!(
@@ -711,16 +763,29 @@ impl DvcProcessor for GfxHandler {
                     let (inst_avg, inst_std) = if n > 0.0 {
                         let sum: f64 = state.bitrate_samples.iter().sum();
                         let avg = sum / n;
-                        let var: f64 = state.bitrate_samples.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / n;
+                        let var: f64 = state
+                            .bitrate_samples
+                            .iter()
+                            .map(|x| (x - avg).powi(2))
+                            .sum::<f64>()
+                            / n;
                         (avg, var.sqrt())
                     } else {
                         (0.0, 0.0)
                     };
-                    let inst_max = if state.bitrate_max > 0.0 { state.bitrate_max } else { 0.0 };
-                    let inst_min = if state.bitrate_min < f64::MAX { state.bitrate_min } else { 0.0 };
+                    let inst_max = if state.bitrate_max > 0.0 {
+                        state.bitrate_max
+                    } else {
+                        0.0
+                    };
+                    let inst_min = if state.bitrate_min < f64::MAX {
+                        state.bitrate_min
+                    } else {
+                        0.0
+                    };
 
                     info!(
-                        "RTT {:.1}ms | encode {:.1}ms | net {:.1}ms | instant {:.1}/{:.1}/{:.1} Mbps (avg/max/min) | std {:.1} | {}KB/f | {} pending",
+                        "RTT {:.1}ms | encode {:.1}ms | net {:.1}ms | instant {:.1}/{:.1}/{:.1} Mbps (avg/max/min) | std {:.1} | {}KB/f | {} pending | trend {:.2} | quality {:.2}",
                         state.rtt_ewma_ms,
                         state.last_encode_ms,
                         net_ms,
@@ -730,6 +795,8 @@ impl DvcProcessor for GfxHandler {
                         inst_std,
                         state.last_frame_bytes / 1024,
                         state.pending_acks,
+                        state.ack_queue_trend,
+                        state.network_quality,
                     );
 
                     // Reset for next window
@@ -755,3 +822,207 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap_set(version: u32, flags: u32) -> (u32, Vec<u8>) {
+        (version, flags.to_le_bytes().to_vec())
+    }
+
+    fn raw_caps_advertise(cap_sets: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let caps_len: usize = cap_sets.iter().map(|(_, data)| 8 + data.len()).sum();
+        let pdu_len = 10 + caps_len;
+
+        let mut pdu = Vec::with_capacity(pdu_len);
+        pdu.extend_from_slice(&0x0012_u16.to_le_bytes());
+        pdu.extend_from_slice(&0_u16.to_le_bytes());
+        pdu.extend_from_slice(&(pdu_len as u32).to_le_bytes());
+        pdu.extend_from_slice(&(cap_sets.len() as u16).to_le_bytes());
+
+        for (version, data) in cap_sets {
+            pdu.extend_from_slice(&version.to_le_bytes());
+            pdu.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            pdu.extend_from_slice(data);
+        }
+
+        pdu
+    }
+
+    fn process_caps(cap_sets: Vec<(u32, Vec<u8>)>) -> (GfxState, usize) {
+        let state = Arc::new(Mutex::new(GfxState::new(1920, 1080, false)));
+        let mut handler = GfxHandler::new(Arc::clone(&state));
+
+        handler.start(7).expect("GFX channel should open");
+        let messages = handler
+            .process(7, &raw_caps_advertise(&cap_sets))
+            .expect("CapabilitiesAdvertise should process");
+        drop(handler);
+
+        let state = Arc::try_unwrap(state)
+            .expect("test should hold the only state reference")
+            .into_inner()
+            .expect("state mutex should not be poisoned");
+
+        (state, messages.len())
+    }
+
+    #[test]
+    fn avc420_negotiates_for_representative_client_capabilities() {
+        let avc420_v81 = cap_set(0x0008_0105, CapabilitiesV81Flags::AVC420_ENABLED.bits());
+        let v10_2 = cap_set(0x000a_0200, 0);
+        let v10_4 = cap_set(0x000a_0400, 0);
+        let v10_6 = cap_set(0x000a_0600, 0);
+        let v10_7 = cap_set(0x000a_0701, 0);
+        let unknown_future = cap_set(0x000a_0800, 0);
+
+        let profiles = [
+            ("mstsc", vec![unknown_future.clone(), v10_7]),
+            ("Microsoft Remote Desktop for macOS", vec![v10_6.clone()]),
+            ("Microsoft Remote Desktop for iOS/iPadOS", vec![v10_4]),
+            ("FreeRDP", vec![unknown_future, v10_6]),
+            ("Remmina", vec![v10_2]),
+            ("legacy AVC420-only client", vec![avc420_v81]),
+        ];
+
+        for (client_name, cap_sets) in profiles {
+            let (state, message_count) = process_caps(cap_sets);
+            assert!(
+                state.caps_confirmed,
+                "{client_name} should complete GFX capability negotiation",
+            );
+            assert!(
+                state.avc420_supported,
+                "{client_name} should negotiate AVC420",
+            );
+            assert!(
+                state.confirmed_cap.is_some(),
+                "{client_name} should have a confirmed capability",
+            );
+            assert_eq!(
+                message_count, 1,
+                "{client_name} should receive exactly one CapabilitiesConfirm",
+            );
+        }
+    }
+
+    #[test]
+    fn avc420_stays_disabled_when_client_disables_avc() {
+        let (state, message_count) = process_caps(vec![cap_set(
+            0x000a_0200,
+            CapabilitiesV10Flags::AVC_DISABLED.bits(),
+        )]);
+
+        assert!(state.caps_confirmed);
+        assert!(!state.avc420_supported);
+        assert_eq!(message_count, 1);
+    }
+
+    #[test]
+    fn stable_ack_queue_preserves_full_quality() {
+        let mut gfx = GfxState::new(1920, 1080, false);
+
+        // Simulate pipelined client: send one frame, ack one frame, repeat.
+        // pending_acks stays at 0-1, queue trend stays at zero.
+        for _ in 0..60 {
+            gfx.next_frame_id();
+            gfx.ack_frame(gfx.frame_id);
+        }
+
+        assert!(
+            gfx.network_quality >= 1.0,
+            "stable queue should get full quality, got {}",
+            gfx.network_quality,
+        );
+        assert!(
+            gfx.ack_queue_trend <= 0.5,
+            "balanced send/ack should have non-growing trend, got {}",
+            gfx.ack_queue_trend,
+        );
+    }
+
+    #[test]
+    fn slow_client_with_stable_pipeline_keeps_quality() {
+        let mut gfx = GfxState::new(1920, 1080, false);
+
+        // Build up a pipeline: send 10 frames without acking (simulates
+        // 10-frame pipeline latency from a slow decoder).
+        for _ in 0..10 {
+            gfx.next_frame_id();
+        }
+        // Now acks arrive at the same rate as sends — 1:1 steady state.
+        // pending_acks stays around 10 but the queue is not growing.
+        for _ in 0..120 {
+            gfx.next_frame_id();
+            let ack_id = gfx.frame_id - 10; // ack a frame from 10 frames ago
+            gfx.ack_frame(ack_id);
+        }
+
+        assert!(
+            gfx.ack_queue_trend <= 0.5,
+            "1:1 send/ack rate should have non-growing trend, got {}",
+            gfx.ack_queue_trend,
+        );
+        assert!(
+            gfx.network_quality >= 0.85,
+            "stable pipeline (even with backlog) should not heavily penalize quality, got {}",
+            gfx.network_quality,
+        );
+    }
+
+    #[test]
+    fn growing_ack_queue_reduces_quality() {
+        let mut gfx = GfxState::new(1920, 1080, false);
+
+        // Simulate severe congestion: send 5 frames per ack — queue grows fast.
+        for round in 0..40 {
+            for _ in 0..5 {
+                gfx.next_frame_id();
+            }
+            gfx.ack_frame(round + 1);
+        }
+
+        assert!(
+            gfx.ack_queue_trend > 2.0,
+            "5:1 send/ack imbalance should produce strongly growing trend, got {}",
+            gfx.ack_queue_trend,
+        );
+        assert!(
+            gfx.network_quality <= 0.4,
+            "rapidly growing queue should significantly reduce quality, got {}",
+            gfx.network_quality,
+        );
+    }
+
+    #[test]
+    fn recovery_from_congestion_restores_quality() {
+        let mut gfx = GfxState::new(1920, 1080, false);
+
+        // Phase 1: congestion — send faster than ack
+        for round in 0..30 {
+            gfx.next_frame_id();
+            gfx.next_frame_id();
+            gfx.ack_frame(round + 1);
+        }
+        let congested_quality = gfx.network_quality;
+
+        // Phase 2: recovery — ack faster than send (drain backlog)
+        let drain_start = gfx.frame_id - gfx.pending_acks + 1;
+        for i in 0..gfx.pending_acks.min(30) {
+            gfx.ack_frame(drain_start + i);
+        }
+        // Then stabilize at 1:1
+        for _ in 0..60 {
+            gfx.next_frame_id();
+            gfx.ack_frame(gfx.frame_id);
+        }
+
+        assert!(
+            gfx.network_quality > congested_quality,
+            "quality should improve after recovery: {} > {}",
+            gfx.network_quality,
+            congested_quality,
+        );
+    }
+}

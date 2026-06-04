@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use macrdp_core::{
-    default_log_path, format_report, permission_report, Metrics, ReportFormat,
-    ServerEventHandler, ServerStatus,
+    default_log_path, format_report, permission_report, Metrics, ReportFormat, ServerEventHandler,
+    ServerStatus,
 };
 use macrdp_server::config::{load_config, Cli};
 use std::fs::OpenOptions;
@@ -219,4 +219,3 @@ impl ServerEventHandler for CliEventHandler {
         );
     }
 }
-

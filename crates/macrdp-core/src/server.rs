@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::callbacks::*;
 use crate::config::ServerConfig;
+use crate::features;
 use crate::permissions;
 use crate::tls;
 
@@ -150,9 +151,7 @@ struct ServerThreadArgs {
     listener: TcpListener,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
-    #[allow(dead_code)]
     logical_w: u16,
-    #[allow(dead_code)]
     logical_h: u16,
     width: u16,
     height: u16,
@@ -218,6 +217,16 @@ fn generate_password(len: usize) -> String {
     }
 
     password
+}
+
+fn resolve_chroma_mode(chroma_mode: Option<&str>) -> Result<bool> {
+    match chroma_mode {
+        None | Some("avc420") => Ok(false),
+        Some("avc444") => Ok(true),
+        Some(other) => {
+            bail!("Invalid chroma_mode `{other}`; expected `avc420` or `avc444`")
+        }
+    }
 }
 
 /// Start the RDP server with the given configuration and event handler.
@@ -325,11 +334,35 @@ pub async fn start_server_with_options(
         _ => macrdp_encode::Quality::HighQuality,
     };
     let encoder_pref = macrdp_encode::EncoderPreference::from_str_opt(config.encoder.as_deref());
-    let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
+    let mode_444 = resolve_chroma_mode(config.chroma_mode.as_deref())?;
+    tracing::info!(
+        chroma_mode = if mode_444 { "avc444" } else { "avc420" },
+        "Resolved H.264 chroma mode"
+    );
 
     // HiDPI
     let hidpi_scale = config.hidpi_scale.unwrap_or(1).max(1).min(4);
     let (width, height) = (width * hidpi_scale as u16, height * hidpi_scale as u16);
+
+    // VideoToolbox silently drops every frame when encode size != native display size.
+    // Override to native and warn the user.
+    let (width, height) = if encoder_pref.prefers_hardware_on_this_platform()
+        && (width != logical_w || height != logical_h)
+    {
+        tracing::warn!(
+            configured_w = width,
+            configured_h = height,
+            native_w = logical_w,
+            native_h = logical_h,
+            "VideoToolbox requires native display resolution; \
+             overriding to {}x{} (use `--encoder software` for custom resolutions)",
+            logical_w,
+            logical_h,
+        );
+        (logical_w, logical_h)
+    } else {
+        (width, height)
+    };
 
     // Mouse coordinate mapping
     let mouse_scale_x = width as f64 / logical_w as f64;
@@ -443,6 +476,7 @@ pub async fn start_server_with_options(
 /// server thread. Constructs the !Send RdpServer here so it never crosses thread
 /// boundaries.
 fn run_server_thread(args: ServerThreadArgs) {
+    use crate::clipboard::MacClipboardFactory;
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
     use ironrdp_server::{Credentials, RdpServer, ServerEvent, TlsIdentityCtx};
@@ -454,6 +488,14 @@ fn run_server_thread(args: ServerThreadArgs) {
 
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
+        let supported_features = features::SUPPORTED_DAEMON_FEATURES.join(", ");
+        let deferred_features = features::DEFERRED_DAEMON_FEATURES.join(", ");
+        tracing::info!(
+            supported = %supported_features,
+            deferred = %deferred_features,
+            "macrdp v1 daemon feature policy"
+        );
+
         // Load TLS identity (on this thread)
         let tls_identity = match TlsIdentityCtx::init_from_paths(&args.cert_path, &args.key_path) {
             Ok(id) => id,
@@ -498,6 +540,8 @@ fn run_server_thread(args: ServerThreadArgs) {
         let display = MacDisplay::new(
             args.width,
             args.height,
+            args.logical_w,
+            args.logical_h,
             fixed_resolution,
             args.config.frame_rate,
             args.quality,
@@ -531,6 +575,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             .with_hybrid(tls_acceptor, tls_identity.pub_key)
             .with_input_handler(input_handler)
             .with_display_handler(display)
+            .with_cliprdr_factory(Some(Box::new(MacClipboardFactory::new())))
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));
@@ -746,5 +791,23 @@ mod tests {
         let err = validate_bind_address("localhost", 3389).unwrap_err();
 
         assert!(err.to_string().contains("Invalid bind_address"));
+    }
+
+    #[test]
+    fn chroma_mode_defaults_to_avc420() {
+        assert!(!resolve_chroma_mode(None).unwrap());
+        assert!(!resolve_chroma_mode(Some("avc420")).unwrap());
+    }
+
+    #[test]
+    fn chroma_mode_allows_explicit_avc444() {
+        assert!(resolve_chroma_mode(Some("avc444")).unwrap());
+    }
+
+    #[test]
+    fn chroma_mode_rejects_unknown_values() {
+        let err = resolve_chroma_mode(Some("h264")).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid chroma_mode"));
     }
 }

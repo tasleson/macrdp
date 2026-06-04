@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     gfx::GfxState, BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate,
     PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
@@ -13,11 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Maximum tile size for bitmap updates
+#[cfg(test)]
 const TILE_SIZE: u16 = 64;
 const ADAPTIVE_BITRATE_MIN_INTERVAL_FRAMES: u64 = 30;
 const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
 const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
 const ADAPTIVE_BITRATE_FLOOR_BPS: u32 = 500_000;
+const GFX_CAPS_WAIT_TIMEOUT_SECONDS: u64 = 5;
 
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
@@ -84,6 +87,9 @@ pub struct MacDisplay {
     /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
     max_width: u16,
     max_height: u16,
+    /// Native macOS display resolution. VideoToolbox silently drops frames at other sizes.
+    native_width: u16,
+    native_height: u16,
     /// Whether resolution is fixed by config (true) or follows client (false)
     fixed_resolution: bool,
     frame_rate: u32,
@@ -95,12 +101,15 @@ pub struct MacDisplay {
     skip_unchanged: bool,
     idle_keyframe_interval: Option<Duration>,
     gfx_state: Arc<Mutex<GfxState>>,
+    pending_resize: Arc<Mutex<Option<DesktopSize>>>,
 }
 
 impl MacDisplay {
     pub fn new(
         width: u16,
         height: u16,
+        native_width: u16,
+        native_height: u16,
         fixed_resolution: bool,
         frame_rate: u32,
         quality: Quality,
@@ -123,6 +132,8 @@ impl MacDisplay {
             height,
             max_width: width,
             max_height: height,
+            native_width,
+            native_height,
             fixed_resolution,
             frame_rate,
             quality,
@@ -134,7 +145,60 @@ impl MacDisplay {
                 .filter(|seconds| *seconds > 0)
                 .map(|seconds| Duration::from_secs(seconds as u64)),
             gfx_state,
+            pending_resize: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Effective encoder preference, accounting for VideoToolbox native-resolution constraint.
+    #[cfg(test)]
+    fn effective_encoder_pref(&self) -> macrdp_encode::EncoderPreference {
+        if self.encoder_pref.prefers_hardware_on_this_platform()
+            && (self.width != self.native_width || self.height != self.native_height)
+        {
+            macrdp_encode::EncoderPreference::Software
+        } else {
+            self.encoder_pref
+        }
+    }
+
+    fn apply_resize_request(&mut self, width: u16, height: u16, reason: &'static str) {
+        if self.fixed_resolution {
+            tracing::debug!(
+                reason,
+                "Ignoring resize request — resolution is fixed by config"
+            );
+            return;
+        }
+
+        let w = width.min(self.max_width);
+        let h = height.min(self.max_height);
+        if w == 0 || h == 0 || (w == self.width && h == self.height) {
+            return;
+        }
+
+        tracing::info!(
+            old_w = self.width,
+            old_h = self.height,
+            new_w = w,
+            new_h = h,
+            reason,
+            "Adopting client-requested resolution"
+        );
+        self.width = w;
+        self.height = h;
+        self.base_bitrate =
+            macrdp_encode::screen_bitrate(w as u32, h as u32, self.frame_rate as f32, self.quality);
+
+        {
+            let mut gfx = self.gfx_state.lock().unwrap();
+            gfx.width = w;
+            gfx.height = h;
+        }
+
+        *self.pending_resize.lock().unwrap() = Some(DesktopSize {
+            width: w,
+            height: h,
+        });
     }
 }
 
@@ -148,61 +212,80 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     fn request_resize(&mut self, width: u16, height: u16) {
-        if self.fixed_resolution {
-            tracing::debug!("Ignoring resize request — resolution is fixed by config");
+        self.apply_resize_request(width, height, "client-confirm-active");
+    }
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        let monitors = layout.monitors();
+        if monitors.len() != 1 {
+            tracing::debug!(
+                monitor_count = monitors.len(),
+                "Ignoring multi-monitor layout request; v1 supports one client desktop"
+            );
             return;
         }
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
-        if w > 0 && h > 0 && (w != self.width || h != self.height) {
-            tracing::info!(
-                old_w = self.width,
-                old_h = self.height,
-                new_w = w,
-                new_h = h,
-                "Adopting client-requested resolution"
+
+        let (width, height) = monitors[0].dimensions();
+        let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
+            tracing::debug!(
+                width,
+                height,
+                "Ignoring layout request with dimensions outside u16 range"
             );
-            self.width = w;
-            self.height = h;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
-                w as u32,
-                h as u32,
-                self.frame_rate as f32,
-                self.quality,
-            );
-        }
+            return;
+        };
+
+        self.apply_resize_request(width, height, "display-control-monitor-layout");
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        let capture_config = CaptureConfig {
-            width: self.width as u32,
-            height: self.height as u32,
-            frame_rate: self.frame_rate,
-            pixel_format: if self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
-                && !self.mode_444
-            {
-                CapturePixelFormat::Nv12
-            } else {
-                CapturePixelFormat::Bgra
-            },
-        };
-        let capturer = ScreenCapturer::new(capture_config.clone()).await?;
+        {
+            let mut pending_resize = self.pending_resize.lock().unwrap();
+            if pending_resize.take().is_some() {
+                tracing::debug!("Cleared pre-stream resize request");
+            }
+        }
 
-        // Create H.264 encoder with configured quality and encoder preference
+        // VideoToolbox hardware encoder silently drops frames at non-native resolutions.
+        // When a resize moved us away from native, fall back to software encoding.
+        let effective_encoder_pref = if self.encoder_pref.prefers_hardware_on_this_platform()
+            && (self.width != self.native_width || self.height != self.native_height)
+        {
+            tracing::warn!(
+                current_w = self.width,
+                current_h = self.height,
+                native_w = self.native_width,
+                native_h = self.native_height,
+                "VideoToolbox requires native display resolution; using software encoder after resize"
+            );
+            macrdp_encode::EncoderPreference::Software
+        } else {
+            self.encoder_pref
+        };
+
         let encoder = macrdp_encode::create_encoder(
             self.width as u32,
             self.height as u32,
             self.frame_rate as f32,
             self.quality,
-            self.encoder_pref,
+            effective_encoder_pref,
             self.mode_444,
             self.base_bitrate,
         )
+        .map_err(|e| tracing::warn!("H.264 encoder unavailable: {e}; using bitmap fallback"))
         .ok();
 
         if encoder.is_some() {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
+
+        let capture_config = CaptureConfig {
+            width: self.width as u32,
+            height: self.height as u32,
+            frame_rate: self.frame_rate,
+            pixel_format: capture_pixel_format(self.mode_444, encoder.as_deref()),
+        };
+        let capturer = ScreenCapturer::new(capture_config.clone()).await?;
 
         Ok(Box::new(MacDisplayUpdates {
             capturer,
@@ -211,13 +294,28 @@ impl RdpServerDisplay for MacDisplay {
             gfx_state: Arc::clone(&self.gfx_state),
             adaptive_bitrate: AdaptiveBitrateController::new(self.base_bitrate),
             idle_frames: IdleFrameController::new(self.skip_unchanged, self.idle_keyframe_interval),
+            pending_resize: Arc::clone(&self.pending_resize),
             mode_444: self.mode_444,
             display_frame_count: 0,
-            skip_next_frame: false,
-            last_overload_warn: None,
+            frame_pacer: FramePacer::new(self.frame_rate),
+            backpressure_skip_remaining: 0,
+            last_backpressure_warn: None,
             gfx_wait_frames: 0,
+            gfx_no_caps_frames: 0,
         }))
     }
+}
+
+fn capture_pixel_format(mode_444: bool, encoder: Option<&dyn VideoEncoder>) -> CapturePixelFormat {
+    if !mode_444 {
+        if let Some(encoder) = encoder {
+            if encoder.supports_pixel_buffer_input() {
+                return CapturePixelFormat::Nv12;
+            }
+        }
+    }
+
+    CapturePixelFormat::Bgra
 }
 
 struct MacDisplayUpdates {
@@ -227,12 +325,18 @@ struct MacDisplayUpdates {
     gfx_state: Arc<Mutex<GfxState>>,
     adaptive_bitrate: AdaptiveBitrateController,
     idle_frames: IdleFrameController,
+    pending_resize: Arc<Mutex<Option<DesktopSize>>>,
     mode_444: bool,
     display_frame_count: u64,
-    skip_next_frame: bool,
-    last_overload_warn: Option<std::time::Instant>,
+    frame_pacer: FramePacer,
+    /// Backpressure: frames remaining to skip before encoding the next one.
+    /// Set after each encode based on the client's pending ack queue depth.
+    backpressure_skip_remaining: u32,
+    last_backpressure_warn: Option<std::time::Instant>,
     /// Frame counter for rate-limiting "GFX not ready" diagnostic logs
     gfx_wait_frames: u64,
+    /// Consecutive frames spent with the GFX channel open but no capabilities advertised
+    gfx_no_caps_frames: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +452,48 @@ impl IdleFrameController {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FramePacer {
+    base_interval: Duration,
+    encode_time_ewma_ms: f64,
+    last_sent: Option<Instant>,
+}
+
+impl FramePacer {
+    fn new(fps: u32) -> Self {
+        Self {
+            base_interval: Duration::from_secs_f64(1.0 / fps.max(1) as f64),
+            encode_time_ewma_ms: 0.0,
+            last_sent: None,
+        }
+    }
+
+    fn record_encode(&mut self, encode_ms: f64) {
+        if self.encode_time_ewma_ms == 0.0 {
+            self.encode_time_ewma_ms = encode_ms;
+        } else {
+            self.encode_time_ewma_ms = self.encode_time_ewma_ms * 0.8 + encode_ms * 0.2;
+        }
+    }
+
+    fn effective_interval(&self) -> Duration {
+        let encode_interval_ms = self.encode_time_ewma_ms * 1.2;
+        let base_ms = self.base_interval.as_secs_f64() * 1000.0;
+        Duration::from_secs_f64(base_ms.max(encode_interval_ms) / 1000.0)
+    }
+
+    fn should_send(&self, now: Instant) -> bool {
+        match self.last_sent {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.effective_interval(),
+        }
+    }
+
+    fn record_sent(&mut self, now: Instant) {
+        self.last_sent = Some(now);
+    }
+}
+
 fn is_known_unchanged_frame(frame: &CapturedFrame) -> bool {
     frame.dirty_rects_available && frame.dirty_rects.is_empty()
 }
@@ -357,6 +503,7 @@ struct GfxPipelineDecision {
     ready: bool,
     use_444: bool,
     hopeless: bool,
+    no_caps_timed_out: bool,
     channel_open: bool,
     caps_confirmed: bool,
 }
@@ -365,19 +512,93 @@ fn gfx_pipeline_decision(
     state: &GfxState,
     encoder_available: bool,
     mode_444: bool,
+    no_caps_wait_frames: u64,
+    no_caps_timeout_frames: u64,
 ) -> GfxPipelineDecision {
+    let no_caps_timed_out = state.channel_id.is_some()
+        && !state.caps_confirmed
+        && no_caps_wait_frames >= no_caps_timeout_frames;
+
     GfxPipelineDecision {
         ready: state.is_ready() && encoder_available,
         use_444: mode_444 && state.avc444_supported && state.avc444_enabled,
-        hopeless: state.channel_id.is_some() && state.caps_confirmed && !state.avc420_supported,
+        hopeless: no_caps_timed_out
+            || (state.channel_id.is_some() && state.caps_confirmed && !state.avc420_supported),
+        no_caps_timed_out,
         channel_open: state.channel_id.is_some(),
         caps_confirmed: state.caps_confirmed,
+    }
+}
+
+fn gfx_caps_timeout_frames(frame_rate: u32) -> u64 {
+    u64::from(frame_rate.max(1)) * GFX_CAPS_WAIT_TIMEOUT_SECONDS
+}
+
+/// How many frames to skip after encoding one, based on ack queue depth.
+/// Returns 0 (no skip) through 3 (keep 1 in 4) to let the client drain its buffer.
+fn backpressure_skip_count(pending_acks: u32) -> u32 {
+    match pending_acks {
+        0..=4 => 0,
+        5..=9 => 1,
+        10..=19 => 2,
+        _ => 3,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitmapSourceKind {
+    Bgra,
+    PixelBuffer,
+}
+
+impl From<&FrameData> for BitmapSourceKind {
+    fn from(data: &FrameData) -> Self {
+        match data {
+            FrameData::Raw(_) => Self::Bgra,
+            FrameData::PixelBuffer(_) => Self::PixelBuffer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitmapFallbackBlock {
+    Nv12AfterNoCapsTimeout,
+    Nv12AfterAvcDisabled,
+    UnexpectedPixelBuffer,
+}
+
+fn bitmap_fallback_decision(
+    gfx: &GfxPipelineDecision,
+    source: BitmapSourceKind,
+) -> Result<(), BitmapFallbackBlock> {
+    match source {
+        BitmapSourceKind::Bgra => Ok(()),
+        BitmapSourceKind::PixelBuffer if gfx.hopeless && gfx.no_caps_timed_out => {
+            Err(BitmapFallbackBlock::Nv12AfterNoCapsTimeout)
+        }
+        BitmapSourceKind::PixelBuffer if gfx.hopeless => {
+            Err(BitmapFallbackBlock::Nv12AfterAvcDisabled)
+        }
+        BitmapSourceKind::PixelBuffer => Err(BitmapFallbackBlock::UnexpectedPixelBuffer),
     }
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        if let Some(desktop_size) = self.pending_resize.lock().unwrap().take() {
+            if desktop_size.width as u32 != self.capture_config.width
+                || desktop_size.height as u32 != self.capture_config.height
+            {
+                tracing::info!(
+                    width = desktop_size.width,
+                    height = desktop_size.height,
+                    "Display resize requested; triggering deactivation/reactivation"
+                );
+                return Ok(Some(DisplayUpdate::Resize(desktop_size)));
+            }
+        }
+
         // Drain stale frames — always use the latest available frame.
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).
@@ -426,23 +647,23 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
-    fn check_overload(&mut self, encode_ms: f64) {
-        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-        if encode_ms > frame_interval_ms {
-            self.skip_next_frame = true;
+    fn update_backpressure(&mut self, pending_acks: u32) {
+        let skip = backpressure_skip_count(pending_acks);
+        if skip > 0 {
             let should_warn = self
-                .last_overload_warn
-                .map(|t| t.elapsed().as_secs_f64() >= 1.0)
+                .last_backpressure_warn
+                .map(|t| t.elapsed().as_secs_f64() >= 2.0)
                 .unwrap_or(true);
             if should_warn {
-                self.last_overload_warn = Some(std::time::Instant::now());
+                self.last_backpressure_warn = Some(std::time::Instant::now());
                 tracing::warn!(
-                    encode_ms = format!("{:.1}", encode_ms),
-                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                    "encode overload — skipping next frame"
+                    pending_acks,
+                    skip_frames = skip,
+                    "Backpressure: client ack queue deep, throttling frame rate"
                 );
             }
         }
+        self.backpressure_skip_remaining = skip;
     }
 
     fn apply_adaptive_bitrate(&mut self) {
@@ -464,19 +685,39 @@ impl MacDisplayUpdates {
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
-        // Encode overload protection: skip this frame if previous encode took too long
-        if self.skip_next_frame {
-            self.skip_next_frame = false;
-            return Ok(Some(DisplayUpdate::DefaultPointer));
-        }
 
-        let gfx = {
+        let (gfx, pending_acks) = {
             let state = self.gfx_state.lock().unwrap();
-            gfx_pipeline_decision(&state, self.encoder.is_some(), self.mode_444)
+            if state.channel_id.is_some() && !state.caps_confirmed {
+                self.gfx_no_caps_frames += 1;
+            } else {
+                self.gfx_no_caps_frames = 0;
+            }
+
+            (
+                gfx_pipeline_decision(
+                    &state,
+                    self.encoder.is_some(),
+                    self.mode_444,
+                    self.gfx_no_caps_frames,
+                    gfx_caps_timeout_frames(self.capture_config.frame_rate),
+                ),
+                state.pending_acks,
+            )
         };
 
         if gfx.ready {
+            // Backpressure: skip frames when the client's ack queue is deep.
+            if self.backpressure_skip_remaining > 0 {
+                self.backpressure_skip_remaining -= 1;
+                return Ok(None);
+            }
+
+            // Frame pacing: skip if we're sending faster than the encoder can sustain.
             let now = Instant::now();
+            if !self.frame_pacer.should_send(now) {
+                return Ok(None);
+            }
             let idle_decision = self.idle_frames.next_decision(&frame, now);
             if idle_decision == IdleFrameDecision::Skip {
                 let skipped = self.idle_frames.record_skipped();
@@ -533,7 +774,9 @@ impl MacDisplayUpdates {
                                     st.last_encode_ms = encode_ms;
                                     st.last_frame_bytes = encoded.data.len() as u32;
                                 }
-                                self.check_overload(encode_ms);
+                                self.frame_pacer.record_encode(encode_ms);
+                                self.frame_pacer.record_sent(Instant::now());
+                                self.update_backpressure(pending_acks);
                                 self.idle_frames.record_sent(Instant::now());
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
@@ -583,7 +826,9 @@ impl MacDisplayUpdates {
                                 st.last_encode_ms = encode_ms;
                                 st.last_frame_bytes = total_bytes as u32;
                             }
-                            self.check_overload(encode_ms);
+                            self.frame_pacer.record_encode(encode_ms);
+                            self.frame_pacer.record_sent(Instant::now());
+                            self.update_backpressure(pending_acks);
                             self.idle_frames.record_sent(Instant::now());
                             return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
@@ -628,7 +873,9 @@ impl MacDisplayUpdates {
                             st.last_encode_ms = encode_ms;
                             st.last_frame_bytes = encoded.data.len() as u32;
                         }
-                        self.check_overload(encode_ms);
+                        self.frame_pacer.record_encode(encode_ms);
+                        self.frame_pacer.record_sent(Instant::now());
+                        self.update_backpressure(pending_acks);
                         self.idle_frames.record_sent(Instant::now());
                         return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
@@ -669,32 +916,51 @@ impl MacDisplayUpdates {
             }
             return Ok(Some(DisplayUpdate::DefaultPointer));
         } else if gfx.hopeless {
-            // GFX channel opened and caps confirmed, but client does not support AVC.
-            // Fall through to bitmap path — only works if capture is BGRA, not NV12/PixelBuffer.
+            // GFX cannot become usable. Fall through to bitmap path, which only
+            // works if capture is BGRA, not NV12/PixelBuffer.
             self.gfx_wait_frames += 1;
             if self.gfx_wait_frames == 1 || self.gfx_wait_frames % 300 == 0 {
-                tracing::warn!(
-                    frame = self.gfx_wait_frames,
-                    "GFX hopeless (client AVC disabled) — falling back to bitmap path"
-                );
+                if gfx.no_caps_timed_out {
+                    tracing::warn!(
+                        frame = self.gfx_wait_frames,
+                        no_caps_frames = self.gfx_no_caps_frames,
+                        "GFX channel opened but client capabilities were not received — falling back to bitmap path"
+                    );
+                } else {
+                    tracing::warn!(
+                        frame = self.gfx_wait_frames,
+                        "GFX hopeless (client AVC disabled) — falling back to bitmap path"
+                    );
+                }
             }
         }
 
         // Bitmap path (only when GFX is not available at all, or gfx_hopeless with BGRA capture)
         // Requires BGRA raw bytes — PixelBuffer (NV12) frames cannot be bitmap-encoded.
-        let bgra_bitmap = match &frame.data {
-            FrameData::Raw(bytes) => bytes,
-            FrameData::PixelBuffer(_) => {
-                if gfx.hopeless {
+        if let Err(block) = bitmap_fallback_decision(&gfx, BitmapSourceKind::from(&frame.data)) {
+            match block {
+                BitmapFallbackBlock::Nv12AfterNoCapsTimeout => {
+                    tracing::warn!(
+                        "GFX capabilities timed out + NV12 capture: cannot bitmap-encode PixelBuffer frames. \
+                         Use software encoder or BGRA capture to get screen output."
+                    );
+                }
+                BitmapFallbackBlock::Nv12AfterAvcDisabled => {
                     tracing::warn!(
                         "GFX hopeless + NV12 capture: cannot bitmap-encode PixelBuffer frames. \
                          Use software encoder or BGRA capture to get screen output."
                     );
-                } else {
+                }
+                BitmapFallbackBlock::UnexpectedPixelBuffer => {
                     tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
                 }
-                return Ok(Some(DisplayUpdate::DefaultPointer));
             }
+            return Ok(Some(DisplayUpdate::DefaultPointer));
+        }
+
+        let FrameData::Raw(bgra_bitmap) = &frame.data else {
+            tracing::warn!("Bitmap fallback reached without BGRA frame data");
+            return Ok(Some(DisplayUpdate::DefaultPointer));
         };
 
         let now = Instant::now();
@@ -799,6 +1065,208 @@ impl MacDisplayUpdates {
 mod tests {
     use super::*;
 
+    fn test_display(width: u16, height: u16, fixed_resolution: bool) -> MacDisplay {
+        MacDisplay::new(
+            width,
+            height,
+            width,
+            height,
+            fixed_resolution,
+            60,
+            Quality::Balanced,
+            macrdp_encode::EncoderPreference::Software,
+            false,
+            None,
+            false,
+            None,
+            Arc::new(Mutex::new(GfxState::new(width, height, false))),
+        )
+    }
+
+    fn pending_resize(display: &MacDisplay) -> Option<DesktopSize> {
+        display.pending_resize.lock().unwrap().clone()
+    }
+
+    struct StubEncoder {
+        supports_pixel_buffer_input: bool,
+        supports_444: bool,
+    }
+
+    impl VideoEncoder for StubEncoder {
+        fn encode_bgra(
+            &mut self,
+            _data: &[u8],
+            _width: u32,
+            _height: u32,
+            _stride: usize,
+        ) -> Result<macrdp_encode::EncodedFrame> {
+            anyhow::bail!("not used in capture-format tests")
+        }
+
+        fn encode_bgra_444(
+            &mut self,
+            _data: &[u8],
+            _width: u32,
+            _height: u32,
+            _stride: usize,
+        ) -> Result<macrdp_encode::Avc444EncodedFrame> {
+            anyhow::bail!("not used in capture-format tests")
+        }
+
+        fn supports_pixel_buffer_input(&self) -> bool {
+            self.supports_pixel_buffer_input
+        }
+
+        fn set_bitrate(&mut self, _bitrate_bps: u32) {}
+
+        fn force_keyframe(&mut self) {}
+
+        fn supports_444(&self) -> bool {
+            self.supports_444
+        }
+    }
+
+    #[tokio::test]
+    async fn flexible_display_adopts_client_requested_smaller_size() {
+        let mut display = test_display(1920, 1080, false);
+
+        display.request_resize(1280, 720);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            }
+        );
+        assert_eq!(
+            pending_resize(&display),
+            Some(DesktopSize {
+                width: 1280,
+                height: 720,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn flexible_display_clamps_client_requested_larger_size() {
+        let mut display = test_display(1920, 1080, false);
+
+        display.request_resize(3840, 2160);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            }
+        );
+        assert_eq!(pending_resize(&display), None);
+    }
+
+    #[tokio::test]
+    async fn fixed_display_ignores_client_requested_size() {
+        let mut display = test_display(1920, 1080, true);
+
+        display.request_resize(1280, 720);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            }
+        );
+        assert_eq!(pending_resize(&display), None);
+    }
+
+    #[tokio::test]
+    async fn display_control_layout_requests_resize() {
+        let mut display = test_display(1920, 1080, false);
+        let layout =
+            DisplayControlMonitorLayout::new_single_primary_monitor(1440, 900, None, None).unwrap();
+
+        display.request_layout(layout);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: 1440,
+                height: 900,
+            }
+        );
+        assert_eq!(
+            pending_resize(&display),
+            Some(DesktopSize {
+                width: 1440,
+                height: 900,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn display_control_multi_monitor_layout_is_deferred() {
+        let mut display = test_display(1920, 1080, false);
+        let primary =
+            ironrdp_displaycontrol::pdu::MonitorLayoutEntry::new_primary(1440, 900).unwrap();
+        let secondary = ironrdp_displaycontrol::pdu::MonitorLayoutEntry::new_secondary(1024, 768)
+            .unwrap()
+            .with_position(1440, 0)
+            .unwrap();
+        let layout = DisplayControlMonitorLayout::new(&[primary, secondary]).unwrap();
+
+        display.request_layout(layout);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            }
+        );
+        assert_eq!(pending_resize(&display), None);
+    }
+
+    #[test]
+    fn avc420_uses_nv12_only_when_encoder_supports_zero_copy_pixel_buffers() {
+        let encoder = StubEncoder {
+            supports_pixel_buffer_input: true,
+            supports_444: false,
+        };
+
+        assert_eq!(
+            capture_pixel_format(false, Some(&encoder)),
+            CapturePixelFormat::Nv12
+        );
+    }
+
+    #[test]
+    fn software_and_no_encoder_capture_use_bgra_for_bgra_encoding_or_bitmap_fallback() {
+        let software_encoder = StubEncoder {
+            supports_pixel_buffer_input: false,
+            supports_444: false,
+        };
+
+        assert_eq!(
+            capture_pixel_format(false, Some(&software_encoder)),
+            CapturePixelFormat::Bgra
+        );
+        assert_eq!(capture_pixel_format(false, None), CapturePixelFormat::Bgra);
+    }
+
+    #[test]
+    fn avc444_capture_uses_bgra_even_with_zero_copy_encoder() {
+        let encoder = StubEncoder {
+            supports_pixel_buffer_input: true,
+            supports_444: true,
+        };
+
+        assert_eq!(
+            capture_pixel_format(true, Some(&encoder)),
+            CapturePixelFormat::Bgra
+        );
+    }
+
     #[test]
     fn test_frame_to_bitmap_updates() {
         let frame = CapturedFrame {
@@ -811,7 +1279,7 @@ mod tests {
             dirty_rects_available: false,
         };
 
-        let updates = frame_to_bitmap_updates(&frame, 64);
+        let updates = frame_to_bitmap_updates(&frame, TILE_SIZE);
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].x, 0);
         assert_eq!(updates[0].width.get(), 64);
@@ -831,7 +1299,7 @@ mod tests {
             dirty_rects_available: false,
         };
 
-        let updates = frame_to_bitmap_updates(&frame, 64);
+        let updates = frame_to_bitmap_updates(&frame, TILE_SIZE);
         assert_eq!(updates.len(), 2);
     }
 
@@ -948,11 +1416,12 @@ mod tests {
         let mut state = GfxState::new(1920, 1080, false);
 
         assert_eq!(
-            gfx_pipeline_decision(&state, true, false),
+            gfx_pipeline_decision(&state, true, false, 0, 300),
             GfxPipelineDecision {
                 ready: false,
                 use_444: false,
                 hopeless: false,
+                no_caps_timed_out: false,
                 channel_open: false,
                 caps_confirmed: false,
             }
@@ -960,11 +1429,30 @@ mod tests {
 
         state.channel_id = Some(1);
         assert_eq!(
-            gfx_pipeline_decision(&state, true, false),
+            gfx_pipeline_decision(&state, true, false, 299, 300),
             GfxPipelineDecision {
                 ready: false,
                 use_444: false,
                 hopeless: false,
+                no_caps_timed_out: false,
+                channel_open: true,
+                caps_confirmed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn gfx_decision_falls_back_when_open_channel_never_sends_capabilities() {
+        let mut state = GfxState::new(1920, 1080, false);
+        state.channel_id = Some(1);
+
+        assert_eq!(
+            gfx_pipeline_decision(&state, true, false, 300, 300),
+            GfxPipelineDecision {
+                ready: false,
+                use_444: false,
+                hopeless: true,
+                no_caps_timed_out: true,
                 channel_open: true,
                 caps_confirmed: false,
             }
@@ -978,14 +1466,50 @@ mod tests {
         state.caps_confirmed = true;
 
         assert_eq!(
-            gfx_pipeline_decision(&state, true, false),
+            gfx_pipeline_decision(&state, true, false, 0, 300),
             GfxPipelineDecision {
                 ready: false,
                 use_444: false,
                 hopeless: true,
+                no_caps_timed_out: false,
                 channel_open: true,
                 caps_confirmed: true,
             }
+        );
+    }
+
+    #[test]
+    fn bitmap_fallback_for_no_avc_client_requires_bgra_frame_data() {
+        let mut state = GfxState::new(1920, 1080, false);
+        state.channel_id = Some(1);
+        state.caps_confirmed = true;
+
+        let gfx = gfx_pipeline_decision(&state, true, false, 0, 300);
+
+        assert_eq!(
+            bitmap_fallback_decision(&gfx, BitmapSourceKind::Bgra),
+            Ok(())
+        );
+        assert_eq!(
+            bitmap_fallback_decision(&gfx, BitmapSourceKind::PixelBuffer),
+            Err(BitmapFallbackBlock::Nv12AfterAvcDisabled)
+        );
+    }
+
+    #[test]
+    fn bitmap_fallback_for_missing_caps_timeout_requires_bgra_frame_data() {
+        let mut state = GfxState::new(1920, 1080, false);
+        state.channel_id = Some(1);
+
+        let gfx = gfx_pipeline_decision(&state, true, false, 300, 300);
+
+        assert_eq!(
+            bitmap_fallback_decision(&gfx, BitmapSourceKind::Bgra),
+            Ok(())
+        );
+        assert_eq!(
+            bitmap_fallback_decision(&gfx, BitmapSourceKind::PixelBuffer),
+            Err(BitmapFallbackBlock::Nv12AfterNoCapsTimeout)
         );
     }
 
@@ -997,11 +1521,12 @@ mod tests {
         state.avc420_supported = true;
 
         assert_eq!(
-            gfx_pipeline_decision(&state, true, false),
+            gfx_pipeline_decision(&state, true, false, 0, 300),
             GfxPipelineDecision {
                 ready: true,
                 use_444: false,
                 hopeless: false,
+                no_caps_timed_out: false,
                 channel_open: true,
                 caps_confirmed: true,
             }
@@ -1015,10 +1540,147 @@ mod tests {
         state.caps_confirmed = true;
         state.avc420_supported = true;
 
-        assert!(!gfx_pipeline_decision(&state, true, true).use_444);
+        assert!(!gfx_pipeline_decision(&state, true, true, 0, 300).use_444);
 
         state.avc444_supported = true;
-        assert!(gfx_pipeline_decision(&state, true, true).use_444);
-        assert!(!gfx_pipeline_decision(&state, true, false).use_444);
+        assert!(gfx_pipeline_decision(&state, true, true, 0, 300).use_444);
+        assert!(!gfx_pipeline_decision(&state, true, false, 0, 300).use_444);
+    }
+
+    #[test]
+    fn vt_encoder_falls_back_to_software_at_non_native_resolution() {
+        // At native resolution, hardware preference is preserved
+        let display = MacDisplay::new(
+            1920,
+            1080,
+            1920,
+            1080,
+            false,
+            60,
+            Quality::Balanced,
+            macrdp_encode::EncoderPreference::Auto,
+            false,
+            None,
+            false,
+            None,
+            Arc::new(Mutex::new(GfxState::new(1920, 1080, false))),
+        );
+        assert_eq!(
+            display.effective_encoder_pref(),
+            macrdp_encode::EncoderPreference::Auto
+        );
+
+        // After resize away from native, hardware preference should become software
+        let display = MacDisplay::new(
+            1280,
+            720,
+            1920,
+            1080,
+            false,
+            60,
+            Quality::Balanced,
+            macrdp_encode::EncoderPreference::Auto,
+            false,
+            None,
+            false,
+            None,
+            Arc::new(Mutex::new(GfxState::new(1280, 720, false))),
+        );
+        assert_eq!(
+            display.effective_encoder_pref(),
+            macrdp_encode::EncoderPreference::Software
+        );
+
+        // Software preference is unchanged regardless of native match
+        let display = MacDisplay::new(
+            1280,
+            720,
+            1920,
+            1080,
+            false,
+            60,
+            Quality::Balanced,
+            macrdp_encode::EncoderPreference::Software,
+            false,
+            None,
+            false,
+            None,
+            Arc::new(Mutex::new(GfxState::new(1280, 720, false))),
+        );
+        assert_eq!(
+            display.effective_encoder_pref(),
+            macrdp_encode::EncoderPreference::Software
+        );
+    }
+
+    #[test]
+    fn backpressure_skip_count_scales_with_pending_acks() {
+        assert_eq!(backpressure_skip_count(0), 0);
+        assert_eq!(backpressure_skip_count(4), 0);
+        assert_eq!(backpressure_skip_count(5), 1);
+        assert_eq!(backpressure_skip_count(9), 1);
+        assert_eq!(backpressure_skip_count(10), 2);
+        assert_eq!(backpressure_skip_count(19), 2);
+        assert_eq!(backpressure_skip_count(20), 3);
+        assert_eq!(backpressure_skip_count(100), 3);
+    }
+
+    #[test]
+    fn frame_pacer_allows_first_frame_immediately() {
+        let pacer = FramePacer::new(60);
+        assert!(pacer.should_send(Instant::now()));
+    }
+
+    #[test]
+    fn frame_pacer_uses_base_interval_when_encode_is_fast() {
+        let mut pacer = FramePacer::new(60);
+        pacer.record_encode(5.0); // 5ms encode at 60fps (16.7ms interval)
+
+        let effective = pacer.effective_interval();
+        let base = Duration::from_secs_f64(1.0 / 60.0);
+        assert_eq!(
+            effective, base,
+            "fast encode should use base interval"
+        );
+    }
+
+    #[test]
+    fn frame_pacer_stretches_interval_when_encode_is_slow() {
+        let mut pacer = FramePacer::new(60);
+        // Seed EWMA with slow encode times
+        for _ in 0..20 {
+            pacer.record_encode(25.0); // 25ms encode, exceeds 16.7ms frame interval
+        }
+
+        let effective = pacer.effective_interval();
+        let base = Duration::from_secs_f64(1.0 / 60.0);
+        assert!(
+            effective > base,
+            "slow encode should stretch interval: {:?} > {:?}",
+            effective,
+            base,
+        );
+        // 25ms * 1.2 = 30ms effective interval → ~33fps
+        let expected_ms = 30.0;
+        let actual_ms = effective.as_secs_f64() * 1000.0;
+        assert!(
+            (actual_ms - expected_ms).abs() < 1.0,
+            "effective interval should be ~30ms, got {:.1}ms",
+            actual_ms,
+        );
+    }
+
+    #[test]
+    fn frame_pacer_blocks_send_within_interval() {
+        let mut pacer = FramePacer::new(60);
+        let now = Instant::now();
+        pacer.record_sent(now);
+
+        // Immediately after sending, should_send returns false
+        assert!(!pacer.should_send(now));
+        assert!(!pacer.should_send(now + Duration::from_millis(5)));
+
+        // After the base interval, should_send returns true
+        assert!(pacer.should_send(now + Duration::from_millis(17)));
     }
 }

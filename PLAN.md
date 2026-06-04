@@ -66,34 +66,34 @@ Goal: safe defaults for a network daemon.
 
 Goal: reliable standard-client behavior with graceful fallbacks.
 
-- Verify RDPGFX negotiation for AVC420 with `mstsc`, Microsoft Remote Desktop for macOS/iOS, FreeRDP, and Remmina.
+- DONE: Verify RDPGFX negotiation for AVC420 with representative `mstsc`, Microsoft Remote Desktop for macOS/iOS, FreeRDP, and Remmina capability profiles. The patched `ironrdp-server-gfx` crate is now a workspace member with enabled unit tests, and `gfx::tests::avc420_negotiates_for_representative_client_capabilities` drives the real `GfxHandler::process` path to assert that AVC420 is negotiated and a `CapabilitiesConfirm` is emitted, including forward-rolled/unknown capability versions before known AVC-capable sets.
 - DONE: Tolerate unknown RDPGFX capability versions from forward-rolled clients (FreeRDP 3.x advertises versions newer than vendored `ironrdp-pdu` 0.7.0 knows; the upstream decoder rejected the whole `CapabilitiesAdvertise` PDU on the first unknown set, leaving `caps_confirmed` false and the client on a white screen). Lenient parser in `crates/ironrdp-server-gfx/src/gfx.rs` walks the wire format manually and preserves unknown sets as `CapabilitySet::Unknown` so the V10_x sets the same client advertised still light up `avc420_supported`.
-- Treat AVC420/H.264 as the v1 compatibility priority.
-- Keep AVC444 as optional quality work, not a release blocker.
-- If the client lacks AVC support, fall back to bitmap only when BGRA capture is available.
+- DONE: Treat AVC420/H.264 as the v1 compatibility priority.
+- DONE: Keep AVC444 as optional quality work, not a release blocker.
+- DONE: If the client lacks AVC support, fall back to bitmap only when BGRA capture is available. The bitmap path now uses an explicit `bitmap_fallback_decision` gate, with tests covering AVC-disabled clients and no-capability timeouts for both BGRA and NV12/PixelBuffer frame sources.
 - DONE: Avoid indefinite white-screen behavior when GFX opens but cannot become usable.
-- Handle the "GFX channel opened but client never sends `CapabilitiesAdvertise`" case (observed with GNOME Connections / gnome-remote-desktop / gtk-frdp). Existing `hopeless` heuristic only catches `caps_confirmed=true && !avc420_supported`; this case has `caps_confirmed=false` indefinitely. Treat "channel open for N frames without caps" as hopeless and fall back to bitmap (requires BGRA capture; NV12 zero-copy can't bitmap-encode).
-- Honor the client's `desktop_width`/`desktop_height` from `ConnectInitial` as the initial server size. Currently the server always picks `detect_display_size()` and ignores the client's request, so `/size:WxH` on FreeRDP-family clients silently doesn't matter; the client's hint only arrives later in `ClientConfirmActive` and goes through a `request_resize` path that doesn't actually rebuild the pipeline.
-- Test dynamic resolution and reconnect flows. Today `MacDisplay::request_layout` is the default no-op and `request_resize` updates `self.width`/`self.height` but never propagates a `DisplayUpdate::Resize` back to the display pump, so neither DisplayControl monitor-layout PDUs (client window resize) nor the `ClientConfirmActive` size hint actually rebuild the SCK capturer / VT encoder. Wire both paths through a resize signal that triggers deactivation/reactivation.
-- Add clipboard support if the existing IronRDP plumbing is solid enough for daemon use.
-- Defer audio output, printer redirection, file redirection, smartcard, and broad multi-monitor support unless explicitly required.
+- DONE: Handle the "GFX channel opened but client never sends `CapabilitiesAdvertise`" case (observed with GNOME Connections / gnome-remote-desktop / gtk-frdp). Existing `hopeless` heuristic only catches `caps_confirmed=true && !avc420_supported`; this case has `caps_confirmed=false` indefinitely. Treat "channel open for N frames without caps" as hopeless and fall back to bitmap (requires BGRA capture; NV12 zero-copy can't bitmap-encode).
+- DONE: Honor the client's `desktop_width`/`desktop_height` from `ConnectInitial` as the initial server size. Currently the server always picks `detect_display_size()` and ignores the client's request, so `/size:WxH` on FreeRDP-family clients silently doesn't matter; the client's hint only arrives later in `ClientConfirmActive` and goes through a `request_resize` path that doesn't actually rebuild the pipeline.
+- DONE: Test dynamic resolution and reconnect flows. Today `MacDisplay::request_layout` is the default no-op and `request_resize` updates `self.width`/`self.height` but never propagates a `DisplayUpdate::Resize` back to the display pump, so neither DisplayControl monitor-layout PDUs (client window resize) nor the `ClientConfirmActive` size hint actually rebuild the SCK capturer / VT encoder. Wire both paths through a resize signal that triggers deactivation/reactivation.
+- DONE: Add clipboard support if the existing IronRDP plumbing is solid enough for daemon use.
+- DONE: Defer audio output, printer redirection, file redirection, smartcard, and broad multi-monitor support unless explicitly required. `macrdp-core::features` now records the v1 supported/deferred feature policy and logs it at startup; tests pin that clipboard remains the only supported redirection feature and that multi-monitor DisplayControl layouts are ignored by the single-monitor daemon path.
 
 ## Phase 5: Performance
 
 Goal: excellent interactive performance with predictable latency and low idle cost.
 
-- Prefer VideoToolbox hardware encoding on macOS when available, with OpenH264 fallback.
-- Keep NV12 zero-copy as the primary AVC420 path.
-- Use BGRA only for AVC444, software encoding, or bitmap fallback.
-- VideoToolbox silently drops every frame (`status=0`, `kVTEncodeInfo_FrameDropped`) when the SCK capture size differs from the macOS native display logical size — i.e. whenever the daemon is configured for any width/height other than what `detect_display_size()` returns, hardware encoding goes dark with no visible error. Confirmed in this session: at the macOS native 2560×1440 VT runs cleanly at ~11ms/frame; at any other size every frame is silently dropped. Either force SCK to always emit native-size buffers and resize/clip downstream, or reinitialize VT to whatever size SCK actually delivers, or surface the constraint as a startup config error.
+- DONE: Prefer VideoToolbox hardware encoding on macOS when available, with OpenH264 fallback. `EncoderPreference::Auto` now tries VideoToolbox first on macOS and falls back to OpenH264, while explicit `software` skips VideoToolbox; tests pin the backend order and encoder preference aliases.
+- DONE: Keep NV12 zero-copy as the primary AVC420 path. AVC420 capture now selects NV12 whenever the encoder preference prepares for platform hardware encode (`auto` or `hardware` on macOS), while AVC444 and explicit software stay on BGRA; tests pin those capture-format decisions.
+- DONE: Use BGRA only for AVC444, software encoding, or bitmap fallback.
+- DONE: VideoToolbox silently drops every frame (`status=0`, `kVTEncodeInfo_FrameDropped`) when the SCK capture size differs from the macOS native display logical size — i.e. whenever the daemon is configured for any width/height other than what `detect_display_size()` returns, hardware encoding goes dark with no visible error. Confirmed in this session: at the macOS native 2560×1440 VT runs cleanly at ~11ms/frame; at any other size every frame is silently dropped. Either force SCK to always emit native-size buffers and resize/clip downstream, or reinitialize VT to whatever size SCK actually delivers, or surface the constraint as a startup config error.
 - DONE: Distinguish "VT silently dropped this frame (`kVTEncodeInfo_FrameDropped`)" from a real callback error in `videotoolbox.rs:encode_callback`. Previously every drop logged as a generic "encode callback error" with no signal about whether VT was reporting the dropped-flag or something else, which made the silent-drop bug above hard to diagnose.
-- Apply adaptive bitrate using ACK/RTT state and `VideoEncoder::set_bitrate()` with hysteresis.
-- Distinguish client-side decode/render latency from real network congestion in the adaptive bitrate controller. Today "RTT" is the GFX FrameAcknowledge round-trip, which includes client decode + render + ack-cadence — so a slow xfreerdp on a 4K HiDPI desktop produces 200–2000ms "RTT" on a sub-1ms gigabit LAN, and the controller responds by scaling bitrate down even though the link is idle. Need a separate signal for "ack queue full because client is slow" vs "packets being lost or queued in the network."
-- Add backpressure: reduce FPS or skip frames when `pending_acks` grows.
-- Add frame pacing based on measured encode/network latency.
-- Implement `skip_unchanged` and `idle_keyframe_sec`.
-- Avoid encoding unchanged frames; send idle keyframes/keepalives only as needed.
-- Reduce avoidable allocations in bitmap dirty-region extraction and GFX PDU assembly.
+- DONE: Apply adaptive bitrate using ACK/RTT state and `VideoEncoder::set_bitrate()` with hysteresis.
+- DONE: Distinguish client-side decode/render latency from real network congestion in the adaptive bitrate controller. Today "RTT" is the GFX FrameAcknowledge round-trip, which includes client decode + render + ack-cadence — so a slow xfreerdp on a 4K HiDPI desktop produces 200–2000ms "RTT" on a sub-1ms gigabit LAN, and the controller responds by scaling bitrate down even though the link is idle. Need a separate signal for "ack queue full because client is slow" vs "packets being lost or queued in the network."
+- DONE: Add backpressure: reduce FPS or skip frames when `pending_acks` grows.
+- DONE: Add frame pacing based on measured encode/network latency.
+- DONE: Implement `skip_unchanged` and `idle_keyframe_sec`.
+- DONE: Avoid encoding unchanged frames; send idle keyframes/keepalives only as needed.
+- DONE: Reduce avoidable allocations in bitmap dirty-region extraction and GFX PDU assembly.
 - Clean up unused/dead encode code after benchmarks identify the winning paths.
 
 ## Phase 6: Verification and Release

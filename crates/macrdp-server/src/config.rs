@@ -56,7 +56,7 @@ pub struct Cli {
     pub bitrate_mbps: Option<u32>,
 
     /// Chroma subsampling mode: avc420 or avc444
-    #[arg(long)]
+    #[arg(long, value_parser = ["avc420", "avc444"])]
     pub chroma_mode: Option<String>,
 
     /// HiDPI scale factor (1-4)

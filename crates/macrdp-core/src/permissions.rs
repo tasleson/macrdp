@@ -216,7 +216,10 @@ mod tests {
         assert_eq!(parsed["all_granted"], false);
         assert_eq!(parsed["screen_recording"]["granted"], false);
         assert_eq!(parsed["accessibility"]["granted"], true);
-        assert_eq!(parsed["screen_recording"]["grant_path"], SCREEN_RECORDING_PATH);
+        assert_eq!(
+            parsed["screen_recording"]["grant_path"],
+            SCREEN_RECORDING_PATH
+        );
     }
 
     #[test]

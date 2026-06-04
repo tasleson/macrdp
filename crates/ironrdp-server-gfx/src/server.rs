@@ -5,22 +5,26 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
-use ironrdp_async::Framed;
+use ironrdp_async::{single_sequence_step, Framed};
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::CliprdrServer;
-use ironrdp_core::{decode, encode_vec, impl_as_any};
+use ironrdp_core::{decode, encode_vec, impl_as_any, WriteBuf};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
-use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags,
+};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
 use ironrdp_svc::{server_encode_svc_messages, StaticChannelId, StaticChannelSet, SvcProcessor};
-use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed};
+use ironrdp_tokio::{
+    split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed,
+};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -359,7 +363,12 @@ impl RdpServer {
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
-        let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+        let mut acceptor = Acceptor::new(
+            self.opts.security.flag(),
+            size,
+            capabilities,
+            self.creds.clone(),
+        );
 
         self.attach_channels(&mut acceptor);
 
@@ -537,19 +546,23 @@ impl RdpServer {
                     drop(state); // release lock before async
 
                     // Send as a single DVC message (auto-fragmented by encode_dvc_messages)
-                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
                         ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
-                    ).context("Failed to encode DVC messages")?;
+                    )
+                    .context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
                         svc_messages.into(),
                         drdynvc_id,
                         user_channel_id,
                     )?;
-                    writer.write_all(&data).await
+                    writer
+                        .write_all(&data)
+                        .await
                         .context("failed to write GFX frame")?;
 
                     return Ok((RunState::Continue, encoder));
@@ -620,7 +633,9 @@ impl RdpServer {
                             wave_limit -= 1;
                             rdpsnd.wave(data, ts)
                         }
-                        RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
+                        RdpsndServerMessage::SetVolume { left, right } => {
+                            rdpsnd.set_volume(left, right)
+                        }
                         RdpsndServerMessage::Close => rdpsnd.close(),
                         RdpsndServerMessage::Error(error) => {
                             error!(?error, "Handling rdpsnd event");
@@ -631,7 +646,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::Clipboard(c) => {
@@ -640,9 +656,13 @@ impl RdpServer {
                         continue;
                     };
                     let msgs = match c {
-                        ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
+                        ClipboardMessage::SendInitiateCopy(formats) => {
+                            cliprdr.initiate_copy(&formats)
+                        }
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
-                        ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
+                        ClipboardMessage::SendInitiatePaste(format) => {
+                            cliprdr.initiate_paste(format)
+                        }
                         ClipboardMessage::Error(error) => {
                             error!(?error, "Handling clipboard event");
                             continue;
@@ -652,7 +672,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
             }
@@ -687,12 +708,8 @@ impl RdpServer {
                     error = format!("{e:#}"),
                     "display updates unavailable; notifying client and disconnecting"
                 );
-                if let Err(send_err) = send_server_denied(
-                    io_channel_id,
-                    user_channel_id,
-                    writer,
-                )
-                .await
+                if let Err(send_err) =
+                    send_server_denied(io_channel_id, user_channel_id, writer).await
                 {
                     warn!(
                         error = format!("{send_err:#}"),
@@ -838,7 +855,8 @@ impl RdpServer {
                     continue;
                 };
                 let svc_responses = channel.start()?;
-                let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
+                let response =
+                    server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
             }
         }
@@ -848,7 +866,9 @@ impl RdpServer {
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
-                    let fastpath = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
+                    let fastpath = c
+                        .extra_flags
+                        .contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
                     if !fastpath {
                         bail!("Fastpath output not supported!");
                     }
@@ -860,16 +880,21 @@ impl RdpServer {
                     };
                     let display_size = self.display.lock().await.size().await;
 
-                    if client_size.width != display_size.width || client_size.height != display_size.height {
+                    if client_size.width != display_size.width
+                        || client_size.height != display_size.height
+                    {
                         info!(
-                            client_w = client_size.width, client_h = client_size.height,
-                            server_w = display_size.width, server_h = display_size.height,
+                            client_w = client_size.width,
+                            client_h = client_size.height,
+                            server_w = display_size.width,
+                            server_h = display_size.height,
                             "Client requested different resolution"
                         );
                         // Adopt client resolution via request_resize
-                        self.display.lock().await.request_resize(
-                            client_size.width, client_size.height,
-                        );
+                        self.display
+                            .lock()
+                            .await
+                            .request_resize(client_size.width, client_size.height);
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {
@@ -887,16 +912,16 @@ impl RdpServer {
                             // We should distinguish parameters for both modes,
                             // and somehow choose the "best", instead of picking
                             // the last parsed here.
-                            CodecProperty::RemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(c))
-                                if self.opts.has_remote_fx() =>
-                            {
+                            CodecProperty::RemoteFx(
+                                rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
+                            ) if self.opts.has_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
                             }
-                            CodecProperty::ImageRemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(
-                                c,
-                            )) if self.opts.has_image_remote_fx() => {
+                            CodecProperty::ImageRemoteFx(
+                                rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
+                            ) if self.opts.has_image_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
@@ -923,7 +948,13 @@ impl RdpServer {
             .context("failed to initialize update encoder")?;
 
         let state = self
-            .client_loop(reader, writer, result.io_channel_id, result.user_channel_id, encoder)
+            .client_loop(
+                reader,
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                encoder,
+            )
             .await
             .context("client loop failure")?;
 
@@ -945,7 +976,9 @@ impl RdpServer {
                 }
 
                 Ok(Action::X224) => {
-                    let _ = self.handle_x224(writer, io_channel_id, user_channel_id, &frame).await;
+                    let _ = self
+                        .handle_x224(writer, io_channel_id, user_channel_id, &frame)
+                        .await;
                 }
 
                 // the frame here is always valid, because otherwise it would
@@ -1035,10 +1068,17 @@ impl RdpServer {
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
                     let response_pdus = svc.process(&data.user_data)?;
-                    let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)?;
+                    let response = server_encode_svc_messages(
+                        response_pdus,
+                        data.channel_id,
+                        user_channel_id,
+                    )?;
                     writer.write_all(&response).await?;
                 } else {
-                    warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
+                    warn!(
+                        channel_id = data.channel_id,
+                        "Unexpected channel received: ID",
+                    );
                 }
             }
 
@@ -1049,7 +1089,10 @@ impl RdpServer {
             }
 
             _ => {
-                warn!(name = ironrdp_core::name(&message), "Unexpected mcs message");
+                warn!(
+                    name = ironrdp_core::name(&message),
+                    "Unexpected mcs message"
+                );
             }
         }
 
@@ -1089,18 +1132,79 @@ impl RdpServer {
         }
     }
 
-    async fn accept_finalize<S>(&mut self, mut framed: TokioFramed<S>, mut acceptor: Acceptor) -> Result<TokioFramed<S>>
+    async fn apply_client_requested_desktop_size(
+        &mut self,
+        acceptor: &mut Acceptor,
+        requested_size: DesktopSize,
+    ) {
+        if requested_size.width == 0 || requested_size.height == 0 {
+            debug!(
+                ?requested_size,
+                "Ignoring invalid client-requested desktop size"
+            );
+            return;
+        }
+
+        let mut display = self.display.lock().await;
+        let before = display.size().await;
+        display.request_resize(requested_size.width, requested_size.height);
+        let after = display.size().await;
+        drop(display);
+
+        if after != before {
+            info!(
+                client_w = requested_size.width,
+                client_h = requested_size.height,
+                server_w = after.width,
+                server_h = after.height,
+                "Adopted client-requested initial desktop size"
+            );
+            acceptor.set_desktop_size(after);
+            let mut gfx = self.gfx_state.lock().unwrap();
+            gfx.width = after.width;
+            gfx.height = after.height;
+        } else if requested_size != before {
+            info!(
+                client_w = requested_size.width,
+                client_h = requested_size.height,
+                server_w = before.width,
+                server_h = before.height,
+                "Ignoring client-requested initial desktop size"
+            );
+        }
+    }
+
+    async fn accept_finalize<S>(
+        &mut self,
+        mut framed: TokioFramed<S>,
+        mut acceptor: Acceptor,
+    ) -> Result<TokioFramed<S>>
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
+        let mut buf = WriteBuf::new();
         loop {
-            let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
-                .await
-                .context("failed to accept client during finalize")?;
+            let (new_framed, result) = loop {
+                if let Some(result) = acceptor.get_result() {
+                    break (framed, result);
+                }
+
+                if let Some(requested_size) = acceptor.take_requested_desktop_size() {
+                    self.apply_client_requested_desktop_size(&mut acceptor, requested_size)
+                        .await;
+                }
+
+                single_sequence_step(&mut framed, &mut acceptor, &mut buf)
+                    .await
+                    .context("failed to accept client during finalize")?;
+            };
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
-            match self.client_accepted(&mut reader, &mut writer, result).await? {
+            match self
+                .client_accepted(&mut reader, &mut writer, result)
+                .await?
+            {
                 RunState::Continue => {
                     unreachable!();
                 }

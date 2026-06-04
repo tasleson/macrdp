@@ -243,9 +243,6 @@ extern "C" {
 const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
 const K_CF_NUMBER_FLOAT64_TYPE: i64 = 13;
 
-// Pixel format: BGRA
-const K_CV_PIXEL_FORMAT_32BGRA: u32 = 0x42475241; // 'BGRA'
-
 // Pixel format: NV12 (420f — YUV 4:2:0 biplanar, full range)
 // Full range (Y: 0-255) avoids the washed-out look of video range (Y: 16-235)
 const K_CV_PIXEL_FORMAT_420F: u32 = 0x34323066; // '420f'
@@ -483,40 +480,13 @@ impl Yuv444Buffers {
     }
 }
 
-/// Send-safe pointer wrappers for multi-threaded NV12 conversion.
-/// Safety: callers ensure the pointed-to memory is valid and disjoint per thread.
-#[derive(Clone, Copy)]
-struct SendPtr(usize);
-#[derive(Clone, Copy)]
-struct SendPtrMut(usize);
-unsafe impl Send for SendPtr {}
-unsafe impl Send for SendPtrMut {}
-unsafe impl Sync for SendPtr {}
-unsafe impl Sync for SendPtrMut {}
-impl SendPtr {
-    fn from(p: *const u8) -> Self {
-        Self(p as usize)
-    }
-    unsafe fn add(self, off: usize) -> *const u8 {
-        (self.0 + off) as *const u8
-    }
-}
-impl SendPtrMut {
-    fn from(p: *mut u8) -> Self {
-        Self(p as usize)
-    }
-    unsafe fn add(self, off: usize) -> *mut u8 {
-        (self.0 + off) as *mut u8
-    }
-}
-
 // --- Encoder ---
 
 pub struct VtEncoder {
     session: VTCompressionSessionRef,
     session_aux: Option<VTCompressionSessionRef>,
     callback_ctx: Arc<CallbackCtx>,
-    callback_ctx_aux: Option<Arc<CallbackCtx>>,
+    _callback_ctx_aux: Option<Arc<CallbackCtx>>,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -581,7 +551,7 @@ impl VtEncoder {
             session,
             session_aux,
             callback_ctx,
-            callback_ctx_aux,
+            _callback_ctx_aux: callback_ctx_aux,
             width,
             height,
             frame_count: 0,
@@ -770,8 +740,6 @@ impl VtEncoder {
         stride: usize,
     ) -> Result<CVPixelBufferRef> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = enc_w as usize;
-        let h = enc_h as usize;
         let sw = src_w.min(enc_w) as usize;
         let sh = src_h.min(enc_h) as usize;
 
@@ -841,83 +809,6 @@ impl VtEncoder {
             CVPixelBufferUnlockBaseAddress(pb, 0);
         }
         Ok(pb)
-    }
-
-    /// Create a BGRA CVPixelBuffer with VT-managed memory and copy frame data into it.
-    fn create_bgra_pixelbuffer(
-        enc_w: u32,
-        enc_h: u32,
-        data: &[u8],
-        src_w: u32,
-        src_h: u32,
-        stride: usize,
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        unsafe {
-            let status = CVPixelBufferCreate(
-                std::ptr::null(),
-                enc_w as usize,
-                enc_h as usize,
-                K_CV_PIXEL_FORMAT_32BGRA,
-                std::ptr::null(),
-                &mut pb,
-            );
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferCreate BGRA failed: {status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-            let base = CVPixelBufferGetBaseAddress(pb) as *mut u8;
-            let bpr = CVPixelBufferGetBytesPerRow(pb);
-            let copy_rows = (src_h as usize).min(enc_h as usize);
-            let copy_cols_bytes = (src_w as usize * 4).min(bpr);
-            for row in 0..copy_rows {
-                let src_start = row * stride;
-                let dst_start = row * bpr;
-                if src_start + copy_cols_bytes <= data.len() {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(src_start),
-                        base.add(dst_start),
-                        copy_cols_bytes,
-                    );
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-        Ok(pb)
-    }
-
-    /// Convert I420 (YUV420) frame to BGRA using BT.601 reverse transform.
-    fn yuv420_to_bgra(frame: &crate::yuv444_split::Yuv420Frame) -> Vec<u8> {
-        let w = frame.width as usize;
-        let h = frame.height as usize;
-        let uv_w = w / 2;
-        let mut bgra = vec![0u8; w * h * 4];
-
-        for row in 0..h {
-            for col in 0..w {
-                let y_idx = row * w + col;
-                let uv_idx = (row / 2) * uv_w + (col / 2);
-
-                let y = frame.y.get(y_idx).copied().unwrap_or(16) as i32;
-                let u = frame.u.get(uv_idx).copied().unwrap_or(128) as i32;
-                let v = frame.v.get(uv_idx).copied().unwrap_or(128) as i32;
-
-                let c = y - 16;
-                let d = u - 128;
-                let e = v - 128;
-                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-
-                let px = (row * w + col) * 4;
-                bgra[px] = b;
-                bgra[px + 1] = g;
-                bgra[px + 2] = r;
-                bgra[px + 3] = 255;
-            }
-        }
-        bgra
     }
 
     /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
@@ -1473,6 +1364,10 @@ impl VideoEncoder for VtEncoder {
             width: self.width,
             height: self.height,
         })
+    }
+
+    fn supports_pixel_buffer_input(&self) -> bool {
+        true
     }
 
     fn encode_bgra_444(
