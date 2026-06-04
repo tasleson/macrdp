@@ -11,14 +11,14 @@ use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().preflight()
+    ScreenCaptureAccess.preflight()
 }
 
 /// Request Screen Recording permission (triggers system dialog if not granted)
 /// Returns true if already granted. Note: even after granting, the app
 /// may need to be restarted for the permission to take effect.
 pub fn request_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().request()
+    ScreenCaptureAccess.request()
 }
 
 /// Result of an SCK-based capture preflight.
@@ -281,14 +281,14 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
         .into_iter()
         .next()
         .context("No display found")?;
-    Ok((display.width() as u32, display.height() as u32))
+    Ok((display.width(), display.height()))
 }
 
 impl ScreenCapturer {
     /// Create a new screen capturer for the main display
     pub async fn new(config: CaptureConfig) -> Result<Self> {
         // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
+        let content = tokio::task::spawn_blocking(SCShareableContent::get)
             .await?
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 

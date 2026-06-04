@@ -289,7 +289,7 @@ fn encode_unicode_text(text: &str) -> Vec<u8> {
 
 fn decode_unicode_text(data: &[u8]) -> anyhow::Result<String> {
     anyhow::ensure!(
-        data.len() % 2 == 0,
+        data.len().is_multiple_of(2),
         "CF_UNICODETEXT payload has odd byte length"
     );
 

@@ -633,7 +633,7 @@ impl Sequence for Acceptor {
                             client_domain = ?creds.domain,
                             server_user = ?self.creds.as_ref().map(|c| &c.username),
                             credential_check = ?credential_check,
-                            "Credential mismatch — rejecting"
+                            "Credential mismatch \u{2014} rejecting"
                         );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
                             ProtocolIndependentCode::ServerDeniedConnection,
@@ -862,6 +862,31 @@ impl Sequence for Acceptor {
     }
 }
 
+fn create_gcc_blocks(
+    io_channel: u16,
+    channel_ids: Vec<u16>,
+    requested: SecurityProtocol,
+    skip_channel_join: bool,
+) -> gcc::ServerGccBlocks {
+    gcc::ServerGccBlocks {
+        core: gcc::ServerCoreData {
+            version: gcc::RdpVersion::V5_PLUS,
+            optional_data: gcc::ServerCoreOptionalData {
+                client_requested_protocols: Some(requested),
+                early_capability_flags: skip_channel_join
+                    .then_some(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED),
+            },
+        },
+        security: gcc::ServerSecurityData::no_security(),
+        network: gcc::ServerNetworkData {
+            channel_ids,
+            io_channel,
+        },
+        message_channel: None,
+        multi_transport_channel: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_credentials, select_security_protocol, CredentialCheck};
@@ -987,15 +1012,15 @@ mod tests {
     #[test]
     fn domain_field_is_ignored_during_credential_match() {
         let server = Credentials {
-            username: "macrdp".to_string(),
-            password: "secret".to_string(),
-            domain: Some("CORP".to_string()),
+            username: "macrdp".to_owned(),
+            password: "secret".to_owned(),
+            domain: Some("CORP".to_owned()),
         };
         let client_no_domain = credentials("macrdp", "secret");
         let client_other_domain = Credentials {
-            username: "macrdp".to_string(),
-            password: "secret".to_string(),
-            domain: Some("OTHER".to_string()),
+            username: "macrdp".to_owned(),
+            password: "secret".to_owned(),
+            domain: Some("OTHER".to_owned()),
         };
 
         assert_eq!(
@@ -1050,30 +1075,5 @@ mod tests {
             select_security_protocol(client, SERVER_NLA),
             Some(SecurityProtocol::HYBRID)
         );
-    }
-}
-
-fn create_gcc_blocks(
-    io_channel: u16,
-    channel_ids: Vec<u16>,
-    requested: SecurityProtocol,
-    skip_channel_join: bool,
-) -> gcc::ServerGccBlocks {
-    gcc::ServerGccBlocks {
-        core: gcc::ServerCoreData {
-            version: gcc::RdpVersion::V5_PLUS,
-            optional_data: gcc::ServerCoreOptionalData {
-                client_requested_protocols: Some(requested),
-                early_capability_flags: skip_channel_join
-                    .then_some(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED),
-            },
-        },
-        security: gcc::ServerSecurityData::no_security(),
-        network: gcc::ServerNetworkData {
-            channel_ids,
-            io_channel,
-        },
-        message_channel: None,
-        multi_transport_channel: None,
     }
 }

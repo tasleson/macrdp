@@ -343,14 +343,14 @@ impl GfxState {
     pub fn next_frame_id(&mut self) -> u32 {
         self.frame_id += 1;
         self.pending_acks += 1;
-        self.total_bytes_sent += self.last_frame_bytes as u64;
+        self.total_bytes_sent += u64::from(self.last_frame_bytes);
         if self.start_time.is_none() {
             self.start_time = Some(std::time::Instant::now());
         }
         // Track instantaneous bitrate per frame
         if let Some(prev) = self.last_frame_time {
             let dt = prev.elapsed().as_secs_f64().max(0.0001);
-            let mbps = self.last_frame_bytes as f64 * 8.0 / dt / 1_000_000.0;
+            let mbps = f64::from(self.last_frame_bytes) * 8.0 / dt / 1_000_000.0;
             self.bitrate_samples.push(mbps);
             if mbps > self.bitrate_max {
                 self.bitrate_max = mbps;
@@ -391,8 +391,8 @@ impl GfxState {
         // Positive = more frames sent than acked since last time (queue growing).
         let delta = self.pending_acks as i32 - self.prev_pending_at_ack as i32;
         self.prev_pending_at_ack = self.pending_acks;
-        self.ack_queue_trend = self.ack_queue_trend * 0.8 + delta as f64 * 0.2;
-        self.pending_acks_ewma = self.pending_acks_ewma * 0.9 + self.pending_acks as f64 * 0.1;
+        self.ack_queue_trend = self.ack_queue_trend * 0.8 + f64::from(delta) * 0.2;
+        self.pending_acks_ewma = self.pending_acks_ewma * 0.9 + f64::from(self.pending_acks) * 0.1;
 
         // Network-only RTT estimate (subtract server-side encode time)
         let net_rtt_ms = (self.rtt_ewma_ms - self.last_encode_ms).max(0.0);
@@ -468,13 +468,13 @@ impl GfxHandler {
             encode_pdu_into(
                 &mut raw_pdus,
                 &ServerPdu::ResetGraphics(ResetGraphicsPdu {
-                    width: state.width as u32,
-                    height: state.height as u32,
+                    width: u32::from(state.width),
+                    height: u32::from(state.height),
                     monitors: vec![Monitor {
                         left: 0,
                         top: 0,
-                        right: state.width as i32 - 1,
-                        bottom: state.height as i32 - 1,
+                        right: i32::from(state.width) - 1,
+                        bottom: i32::from(state.height) - 1,
                         flags: MonitorFlags::PRIMARY,
                     }],
                 }),
@@ -865,8 +865,8 @@ mod tests {
         let pdu_len = 10 + caps_len;
 
         let mut pdu = Vec::with_capacity(pdu_len);
-        pdu.extend_from_slice(&0x0012_u16.to_le_bytes());
-        pdu.extend_from_slice(&0_u16.to_le_bytes());
+        pdu.extend_from_slice(&0x0012u16.to_le_bytes());
+        pdu.extend_from_slice(&0u16.to_le_bytes());
         pdu.extend_from_slice(&(pdu_len as u32).to_le_bytes());
         pdu.extend_from_slice(&(cap_sets.len() as u16).to_le_bytes());
 

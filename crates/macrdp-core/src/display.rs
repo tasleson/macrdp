@@ -31,8 +31,8 @@ pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<Bit
     let mut updates = Vec::new();
     let bpp: usize = 4;
 
-    let cols = (frame.width as u16 + tile_size - 1) / tile_size;
-    let rows = (frame.height as u16 + tile_size - 1) / tile_size;
+    let cols = (frame.width as u16).div_ceil(tile_size);
+    let rows = (frame.height as u16).div_ceil(tile_size);
 
     for row in 0..rows {
         for col in 0..cols {
@@ -105,6 +105,7 @@ pub struct MacDisplay {
 }
 
 impl MacDisplay {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         width: u16,
         height: u16,
@@ -720,7 +721,7 @@ impl MacDisplayUpdates {
             let idle_decision = self.idle_frames.next_decision(&frame, now);
             if idle_decision == IdleFrameDecision::Skip {
                 let skipped = self.idle_frames.record_skipped();
-                if skipped == 1 || skipped % self.capture_config.frame_rate as u64 == 0 {
+                if skipped == 1 || skipped.is_multiple_of(self.capture_config.frame_rate as u64) {
                     tracing::debug!(
                         skipped_unchanged_frames = skipped,
                         "Display: skipping unchanged frame"
@@ -905,7 +906,7 @@ impl MacDisplayUpdates {
             // H.264 encoder exists and GFX channel may still become ready — wait for it.
             // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
             self.gfx_wait_frames += 1;
-            if self.gfx_wait_frames == 1 || self.gfx_wait_frames % 300 == 0 {
+            if self.gfx_wait_frames == 1 || self.gfx_wait_frames.is_multiple_of(300) {
                 tracing::warn!(
                     frame = self.gfx_wait_frames,
                     gfx_channel_open = gfx.channel_open,
@@ -918,7 +919,7 @@ impl MacDisplayUpdates {
             // GFX cannot become usable. Fall through to bitmap path, which only
             // works if capture is BGRA, not NV12/PixelBuffer.
             self.gfx_wait_frames += 1;
-            if self.gfx_wait_frames == 1 || self.gfx_wait_frames % 300 == 0 {
+            if self.gfx_wait_frames == 1 || self.gfx_wait_frames.is_multiple_of(300) {
                 if gfx.no_caps_timed_out {
                     tracing::warn!(
                         frame = self.gfx_wait_frames,
@@ -966,7 +967,7 @@ impl MacDisplayUpdates {
         let idle_decision = self.idle_frames.next_decision(&frame, now);
         if idle_decision == IdleFrameDecision::Skip {
             let skipped = self.idle_frames.record_skipped();
-            if skipped == 1 || skipped % self.capture_config.frame_rate as u64 == 0 {
+            if skipped == 1 || skipped.is_multiple_of(self.capture_config.frame_rate as u64) {
                 tracing::debug!(
                     skipped_unchanged_frames = skipped,
                     "Display: skipping unchanged bitmap frame"
@@ -1083,7 +1084,7 @@ mod tests {
     }
 
     fn pending_resize(display: &MacDisplay) -> Option<DesktopSize> {
-        display.pending_resize.lock().unwrap().clone()
+        *display.pending_resize.lock().unwrap()
     }
 
     struct StubEncoder {

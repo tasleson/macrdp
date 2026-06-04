@@ -55,10 +55,10 @@ type VTCompressionOutputCallback = extern "C" fn(
     sample_buffer: CMSampleBufferRef,
 );
 
+#[allow(clippy::duplicated_attributes, dead_code)]
 #[link(name = "VideoToolbox", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
-#[allow(dead_code)]
 extern "C" {
     fn VTCompressionSessionCreate(
         allocator: CFAllocatorRef,
@@ -1002,7 +1002,7 @@ impl VideoEncoder for VtEncoder {
             );
         }
 
-        if self.frame_count % 300 == 0 {
+        if self.frame_count.is_multiple_of(300) {
             tracing::debug!(
                 frame = self.frame_count,
                 output_bytes = nal_data.len(),

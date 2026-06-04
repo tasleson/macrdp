@@ -32,7 +32,7 @@ impl BitmapEncoder {
         //
         // It’s not clear how to achieve that yet, but generally, server uses multiple of 4-widths,
         // and client has surface capabilities, so this path is unlikely.
-        if bitmap.width.get() % 4 != 0 {
+        if !bitmap.width.get().is_multiple_of(4) {
             return Err(BitmapEncodeError::Encode(invalid_field_err!(
                 "bitmap",
                 "Width must be a multiple of 4"

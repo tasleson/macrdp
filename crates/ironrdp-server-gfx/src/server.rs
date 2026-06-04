@@ -358,8 +358,8 @@ impl RdpServer {
             let w = gs.width;
             let h = gs.height;
             let avc444_enabled = gs.avc444_enabled;
-            *gs = GfxState::new(w, h, avc444_enabled);
-        }
+            *gs = GfxState::new(w, h, avc444_enabled)
+        };
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
@@ -556,7 +556,7 @@ impl RdpServer {
                     .context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
-                        svc_messages.into(),
+                        svc_messages,
                         drdynvc_id,
                         user_channel_id,
                     )?;
@@ -730,8 +730,8 @@ impl RdpServer {
             let size = self.display.lock().await.size().await;
             let mut gs = self.gfx_state.lock().unwrap();
             gs.width = size.width;
-            gs.height = size.height;
-        }
+            gs.height = size.height
+        };
 
         // Get DRDYNVC channel ID for sending GFX frames
         let drdynvc_channel_id = self.get_channel_id_by_type::<dvc::DrdynvcServer>();

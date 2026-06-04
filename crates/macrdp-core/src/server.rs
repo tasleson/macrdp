@@ -341,7 +341,7 @@ pub async fn start_server_with_options(
     );
 
     // HiDPI
-    let hidpi_scale = config.hidpi_scale.unwrap_or(1).max(1).min(4);
+    let hidpi_scale = config.hidpi_scale.unwrap_or(1).clamp(1, 4);
     let (width, height) = (width * hidpi_scale as u16, height * hidpi_scale as u16);
 
     // VideoToolbox silently drops every frame when encode size != native display size.
@@ -453,7 +453,7 @@ pub async fn start_server_with_options(
         started_at: Instant::now(),
         gfx_state,
         shutdown_notify,
-        generated_credentials: credentials.generated.then(|| GeneratedCredentials {
+        generated_credentials: credentials.generated.then_some(GeneratedCredentials {
             username: credentials.username,
             password: credentials.password,
         }),
