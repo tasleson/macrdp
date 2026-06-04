@@ -19,6 +19,13 @@ use std::time::{Duration, Instant};
 /// from a misbehaving client.
 const MAX_RESOLUTION_DIM: u16 = 8192;
 
+/// How long to wait after the last resize request before triggering
+/// deactivation/reactivation.  When a user drags a window corner, the RDP
+/// client sends a new display-control PDU on every mouse-move frame.
+/// Without debouncing each PDU triggers a full session reset (~200ms),
+/// creating a cascade that can crash the session.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+
 const ADAPTIVE_BITRATE_MIN_INTERVAL_FRAMES: u64 = 30;
 const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
 const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
@@ -80,7 +87,7 @@ pub struct MacDisplay {
     skip_unchanged: bool,
     idle_keyframe_interval: Option<Duration>,
     gfx_state: Arc<Mutex<GfxState>>,
-    pending_resize: Arc<Mutex<Option<DesktopSize>>>,
+    pending_resize: Arc<Mutex<Option<(DesktopSize, Instant)>>>,
     /// Shared with the input handler. `macos_point = rdp_coord / scale`
     /// where `scale = rdp_dim / native_dim`. Updated on every resize.
     mouse_scale: Arc<Mutex<(f64, f64)>>,
@@ -190,10 +197,8 @@ impl MacDisplay {
             gfx.height = h;
         }
 
-        *self.pending_resize.lock().unwrap() = Some(DesktopSize {
-            width: w,
-            height: h,
-        });
+        *self.pending_resize.lock().unwrap() =
+            Some((DesktopSize { width: w, height: h }, Instant::now()));
     }
 }
 
@@ -359,7 +364,7 @@ struct MacDisplayUpdates {
     gfx_state: Arc<Mutex<GfxState>>,
     adaptive_bitrate: AdaptiveBitrateController,
     idle_frames: IdleFrameController,
-    pending_resize: Arc<Mutex<Option<DesktopSize>>>,
+    pending_resize: Arc<Mutex<Option<(DesktopSize, Instant)>>>,
     mode_444: bool,
     display_frame_count: u64,
     frame_pacer: FramePacer,
@@ -631,7 +636,20 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // ever surface an actual `DisplayUpdate`; genuine capture loss is
         // handled inline by the CoreGraphics fallback below.
         'outer: loop {
-            if let Some(desktop_size) = self.pending_resize.lock().unwrap().take() {
+            // Debounce resize: only fire after no new request for RESIZE_DEBOUNCE.
+            // During a window drag, the client sends a new display-control PDU
+            // every mouse-move frame; we coalesce them into a single reactivation
+            // at the final size.
+            let settled_resize = {
+                let mut pending = self.pending_resize.lock().unwrap();
+                match pending.as_ref() {
+                    Some((_, ts)) if ts.elapsed() >= RESIZE_DEBOUNCE => {
+                        pending.take().map(|(ds, _)| ds)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(desktop_size) = settled_resize {
                 if desktop_size.width as u32 != self.capture_config.width
                     || desktop_size.height as u32 != self.capture_config.height
                 {
@@ -1122,7 +1140,12 @@ mod tests {
     }
 
     fn pending_resize(display: &MacDisplay) -> Option<DesktopSize> {
-        *display.pending_resize.lock().unwrap()
+        display
+            .pending_resize
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(ds, _)| *ds)
     }
 
     struct StubEncoder {
@@ -1358,6 +1381,26 @@ mod tests {
         assert!(
             (sy - expected_y).abs() < 1e-9,
             "scale_y should update to {expected_y} after resize, got {sy}"
+        );
+    }
+
+    #[test]
+    fn rapid_layout_requests_coalesce_to_final_size() {
+        let mut display = test_display(1920, 1080, false);
+
+        for (w, h) in [(1922, 1080), (2100, 1200), (2560, 1440)] {
+            let layout =
+                DisplayControlMonitorLayout::new_single_primary_monitor(w, h, None, None).unwrap();
+            display.request_layout(layout);
+        }
+
+        assert_eq!(
+            pending_resize(&display),
+            Some(DesktopSize {
+                width: 2560,
+                height: 1440,
+            }),
+            "only the final size should be pending after rapid requests"
         );
     }
 
