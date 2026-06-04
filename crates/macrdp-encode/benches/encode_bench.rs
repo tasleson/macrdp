@@ -6,6 +6,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use macrdp_encode::color_convert::VImageConverter;
 use macrdp_encode::{align16, OpenH264Encoder, VideoEncoder};
+#[cfg(target_os = "macos")]
+use macrdp_encode::VtEncoder;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -175,5 +177,55 @@ fn bench_openh264_encode(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// VideoToolbox encode benchmarks (macOS hardware encoder)
+// ---------------------------------------------------------------------------
+
+/// Hardware H.264 encode through VideoToolbox — the primary path on Apple
+/// Silicon. Feeds BGRA, which `encode_bgra` wraps into an NV12 CVPixelBuffer
+/// before handing it to the VT compression session, so this measures the same
+/// per-frame work the daemon does (color conversion + hardware encode).
+#[cfg(target_os = "macos")]
+fn bench_videotoolbox_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("videotoolbox_encode");
+    group.sample_size(20); // hardware encode dominated by latency, not throughput
+
+    for &(label, width, height, bitrate) in &[
+        ("vt_4k_120fps", 3840u32, 2160u32, 50_000_000u32),
+        ("vt_1080p_120fps", 1920, 1080, 30_000_000),
+    ] {
+        let stride = width as usize * 4;
+        let bgra = generate_test_pattern(width, height, stride);
+        // The daemon creates the session at 16-aligned dimensions and feeds the
+        // raw frame size; mirror that here.
+        let mut encoder = match VtEncoder::new(align16(width), align16(height), 120.0, bitrate, false)
+        {
+            Ok(e) => e,
+            // VideoToolbox needs a real GPU/codec; skip rather than fail when
+            // unavailable (e.g. headless CI without hardware encode).
+            Err(e) => {
+                eprintln!("skipping {label}: VtEncoder unavailable: {e}");
+                continue;
+            }
+        };
+
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                encoder.encode_bgra(&bgra, width, height, stride).unwrap();
+            })
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(target_os = "macos")]
+criterion_group!(
+    benches,
+    bench_color_conversion,
+    bench_openh264_encode,
+    bench_videotoolbox_encode
+);
+#[cfg(not(target_os = "macos"))]
 criterion_group!(benches, bench_color_conversion, bench_openh264_encode);
 criterion_main!(benches);
