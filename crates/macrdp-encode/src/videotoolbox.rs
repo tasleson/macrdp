@@ -59,6 +59,11 @@ type VTCompressionOutputCallback = extern "C" fn(
 #[link(name = "VideoToolbox", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
+// CoreFoundation provides CFRelease/CFDictionaryCreate/kCFBoolean* used below.
+// The daemon links it transitively (via core-graphics), but a leaf binary that
+// depends only on this crate — e.g. the encode benchmark — needs it declared
+// here so the framework lands on the link line.
+#[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn VTCompressionSessionCreate(
         allocator: CFAllocatorRef,
