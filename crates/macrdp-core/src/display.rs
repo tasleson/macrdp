@@ -79,6 +79,9 @@ pub struct MacDisplay {
     idle_keyframe_interval: Option<Duration>,
     gfx_state: Arc<Mutex<GfxState>>,
     pending_resize: Arc<Mutex<Option<DesktopSize>>>,
+    /// Shared with the input handler. `macos_point = rdp_coord / scale`
+    /// where `scale = rdp_dim / native_dim`. Updated on every resize.
+    mouse_scale: Arc<Mutex<(f64, f64)>>,
 }
 
 impl MacDisplay {
@@ -105,6 +108,8 @@ impl MacDisplay {
             base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0,
             "Base bitrate"
         );
+        let scale_x = (width as f64 / native_width as f64).max(f64::EPSILON);
+        let scale_y = (height as f64 / native_height as f64).max(f64::EPSILON);
         Self {
             width,
             height,
@@ -124,7 +129,16 @@ impl MacDisplay {
                 .map(|seconds| Duration::from_secs(seconds as u64)),
             gfx_state,
             pending_resize: Arc::new(Mutex::new(None)),
+            mouse_scale: Arc::new(Mutex::new((scale_x, scale_y))),
         }
+    }
+
+    /// Returns a shared handle to the mouse coordinate scale.
+    ///
+    /// Pass the returned Arc to [`MacInputHandler`] so it reads the current
+    /// scale after each client-driven resize.
+    pub fn mouse_scale(&self) -> Arc<Mutex<(f64, f64)>> {
+        Arc::clone(&self.mouse_scale)
     }
 
     /// Effective encoder preference, accounting for VideoToolbox native-resolution constraint.
@@ -164,6 +178,9 @@ impl MacDisplay {
         );
         self.width = w;
         self.height = h;
+        let scale_x = (w as f64 / self.native_width as f64).max(f64::EPSILON);
+        let scale_y = (h as f64 / self.native_height as f64).max(f64::EPSILON);
+        *self.mouse_scale.lock().unwrap() = (scale_x, scale_y);
         self.base_bitrate =
             macrdp_encode::screen_bitrate(w as u32, h as u32, self.frame_rate as f32, self.quality);
 
@@ -1207,6 +1224,81 @@ mod tests {
             }
         );
         assert_eq!(pending_resize(&display), None);
+    }
+
+    #[test]
+    fn mouse_scale_is_1_when_native_equals_configured() {
+        let display = test_display(1920, 1080, false);
+        let (sx, sy) = *display.mouse_scale().lock().unwrap();
+        assert!((sx - 1.0).abs() < 1e-9, "scale_x should be 1.0, got {sx}");
+        assert!((sy - 1.0).abs() < 1e-9, "scale_y should be 1.0, got {sy}");
+    }
+
+    #[test]
+    fn mouse_scale_reflects_non_native_initial_resolution() {
+        // Software encoder with a smaller configured resolution: scale < 1.
+        let display = MacDisplay::new(
+            1280,
+            720,
+            1920,
+            1080,
+            true, // fixed
+            60,
+            Quality::Balanced,
+            macrdp_encode::EncoderPreference::Software,
+            false,
+            None,
+            false,
+            None,
+            Arc::new(Mutex::new(GfxState::new(1280, 720, false))),
+        );
+        let (sx, sy) = *display.mouse_scale().lock().unwrap();
+        let expected_x = 1280.0 / 1920.0;
+        let expected_y = 720.0 / 1080.0;
+        assert!(
+            (sx - expected_x).abs() < 1e-9,
+            "scale_x should be {expected_x}, got {sx}"
+        );
+        assert!(
+            (sy - expected_y).abs() < 1e-9,
+            "scale_y should be {expected_y}, got {sy}"
+        );
+    }
+
+    #[test]
+    fn mouse_scale_updates_on_client_resize() {
+        // Regression: mouse coords were injected using the original startup scale
+        // even after a client requested a smaller resolution, causing cursor mismatch.
+        let mut display = MacDisplay::new(
+            1920,
+            1080,
+            1920,
+            1080,
+            false,
+            60,
+            Quality::Balanced,
+            macrdp_encode::EncoderPreference::Software,
+            false,
+            None,
+            false,
+            None,
+            Arc::new(Mutex::new(GfxState::new(1920, 1080, false))),
+        );
+        let scale = display.mouse_scale();
+
+        display.request_resize(1280, 720);
+
+        let (sx, sy) = *scale.lock().unwrap();
+        let expected_x = 1280.0 / 1920.0;
+        let expected_y = 720.0 / 1080.0;
+        assert!(
+            (sx - expected_x).abs() < 1e-9,
+            "scale_x should update to {expected_x} after resize, got {sx}"
+        );
+        assert!(
+            (sy - expected_y).abs() < 1e-9,
+            "scale_y should update to {expected_y} after resize, got {sy}"
+        );
     }
 
     #[test]

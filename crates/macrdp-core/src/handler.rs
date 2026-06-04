@@ -1,5 +1,6 @@
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use std::sync::{Arc, Mutex};
 
 /// Bridges RDP input events to macOS CGEvent injection
 pub struct MacInputHandler {
@@ -7,13 +8,14 @@ pub struct MacInputHandler {
     mouse: Option<MouseInjector>,
     last_mouse_x: u16,
     last_mouse_y: u16,
-    /// RDP-to-macOS coordinate scale (RDP coords / scale = macOS logical points)
-    mouse_scale_x: f64,
-    mouse_scale_y: f64,
+    /// Shared RDP-to-macOS coordinate scale. Written by MacDisplay on every
+    /// client-driven resize. `macos_point = rdp_coord / scale` where
+    /// `scale = rdp_dim / native_logical_dim`.
+    mouse_scale: Arc<Mutex<(f64, f64)>>,
 }
 
 impl MacInputHandler {
-    pub fn new(mouse_scale_x: f64, mouse_scale_y: f64) -> Self {
+    pub fn new(mouse_scale: Arc<Mutex<(f64, f64)>>) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -30,8 +32,7 @@ impl MacInputHandler {
             mouse,
             last_mouse_x: 0,
             last_mouse_y: 0,
-            mouse_scale_x: mouse_scale_x.max(1.0),
-            mouse_scale_y: mouse_scale_y.max(1.0),
+            mouse_scale,
         }
     }
 }
@@ -61,9 +62,9 @@ impl RdpServerInputHandler for MacInputHandler {
 
         let result = match event {
             MouseEvent::Move { x, y } => {
-                // Scale RDP desktop coordinates to macOS logical points
-                let mx = (x as f64 / self.mouse_scale_x) as u16;
-                let my = (y as f64 / self.mouse_scale_y) as u16;
+                let (scale_x, scale_y) = *self.mouse_scale.lock().unwrap();
+                let mx = (x as f64 / scale_x) as u16;
+                let my = (y as f64 / scale_y) as u16;
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
                 m.move_to(mx, my)

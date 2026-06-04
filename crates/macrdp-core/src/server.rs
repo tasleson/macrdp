@@ -158,8 +158,6 @@ struct ServerThreadArgs {
     quality: macrdp_encode::Quality,
     encoder_pref: macrdp_encode::EncoderPreference,
     mode_444: bool,
-    mouse_scale_x: f64,
-    mouse_scale_y: f64,
     gfx_state: Arc<Mutex<GfxState>>,
     shutdown_notify: Arc<Notify>,
     credentials: ResolvedCredentials,
@@ -370,10 +368,6 @@ pub async fn start_server_with_options(
         (width, height)
     };
 
-    // Mouse coordinate mapping
-    let mouse_scale_x = width as f64 / logical_w as f64;
-    let mouse_scale_y = height as f64 / logical_h as f64;
-
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
 
@@ -393,8 +387,6 @@ pub async fn start_server_with_options(
         quality,
         encoder_pref,
         mode_444,
-        mouse_scale_x,
-        mouse_scale_y,
         gfx_state: Arc::clone(&gfx_state),
         shutdown_notify: Arc::clone(&shutdown_notify),
         credentials: credentials.clone(),
@@ -528,10 +520,8 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         };
 
-        // Create input handler
-        let input_handler = MacInputHandler::new(args.mouse_scale_x, args.mouse_scale_y);
-
-        // Create display
+        // Create display first — the mouse scale Arc lives here and is shared
+        // with the input handler so coordinate mapping stays correct after resizes.
         let fixed_resolution = args.config.width > 0 && args.config.height > 0;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
         let skip_unchanged = args
@@ -558,6 +548,10 @@ fn run_server_thread(args: ServerThreadArgs) {
             idle_keyframe_sec,
             Arc::clone(&args.gfx_state),
         );
+
+        // Input handler reads the scale Arc from the display so it stays correct
+        // after any client-driven resize.
+        let input_handler = MacInputHandler::new(display.mouse_scale());
 
         // Build RDP server (this is the !Send type)
         let builder = match RdpServer::builder().with_listener(args.listener) {
