@@ -587,63 +587,83 @@ fn bitmap_fallback_decision(
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        if let Some(desktop_size) = self.pending_resize.lock().unwrap().take() {
-            if desktop_size.width as u32 != self.capture_config.width
-                || desktop_size.height as u32 != self.capture_config.height
-            {
-                tracing::info!(
-                    width = desktop_size.width,
-                    height = desktop_size.height,
-                    "Display resize requested; triggering deactivation/reactivation"
-                );
-                return Ok(Some(DisplayUpdate::Resize(desktop_size)));
-            }
-        }
-
-        // Drain stale frames — always use the latest available frame.
-        // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
-        // which works at the display level (including lock screen).
-        let frame = loop {
-            let frame = match self.capturer.next_frame().await {
-                Some(f) => f,
-                None => {
-                    // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
-                    tracing::warn!(
-                        "SCStream stopped — switching to CoreGraphics fallback (lock screen?)"
+        // `encode_and_send` returns `Ok(None)` for ordinary, transient frame
+        // skips: frame pacing, ack backpressure, unchanged/idle frames, and
+        // degenerate (zero-size) dimensions. The RDP server loop, however,
+        // treats a `next_update()` result of `Ok(None)` as end-of-stream and
+        // tears the whole session down. A skipped frame is emphatically not
+        // end-of-stream, so we loop and pull the next frame instead. This does
+        // not busy-spin: `next_frame().await` blocks until the capturer
+        // produces the next frame, which paces us at the capture rate. We only
+        // ever surface an actual `DisplayUpdate`; genuine capture loss is
+        // handled inline by the CoreGraphics fallback below.
+        'outer: loop {
+            if let Some(desktop_size) = self.pending_resize.lock().unwrap().take() {
+                if desktop_size.width as u32 != self.capture_config.width
+                    || desktop_size.height as u32 != self.capture_config.height
+                {
+                    tracing::info!(
+                        width = desktop_size.width,
+                        height = desktop_size.height,
+                        "Display resize requested; triggering deactivation/reactivation"
                     );
-                    let fallback = CgFallbackCapturer::new(&self.capture_config);
-                    loop {
-                        // Try to restore SCK (faster, has dirty rects)
-                        match ScreenCapturer::new(self.capture_config.clone()).await {
-                            Ok(new_capturer) => {
-                                tracing::info!(
-                                    "SCStream recovered — switching back from CoreGraphics"
-                                );
-                                self.capturer = new_capturer;
-                                break;
-                            }
-                            Err(_) => {
-                                // SCK still unavailable — use CGDisplayCreateImage
-                                if let Some(cg_frame) = fallback.capture_frame() {
-                                    // Send this fallback frame through the normal encoding path
-                                    return self.encode_and_send(cg_frame);
+                    return Ok(Some(DisplayUpdate::Resize(desktop_size)));
+                }
+            }
+
+            // Drain stale frames — always use the latest available frame.
+            // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
+            // which works at the display level (including lock screen).
+            let frame = loop {
+                let frame = match self.capturer.next_frame().await {
+                    Some(f) => f,
+                    None => {
+                        // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
+                        tracing::warn!(
+                            "SCStream stopped — switching to CoreGraphics fallback (lock screen?)"
+                        );
+                        let fallback = CgFallbackCapturer::new(&self.capture_config);
+                        loop {
+                            // Try to restore SCK (faster, has dirty rects)
+                            match ScreenCapturer::new(self.capture_config.clone()).await {
+                                Ok(new_capturer) => {
+                                    tracing::info!(
+                                        "SCStream recovered — switching back from CoreGraphics"
+                                    );
+                                    self.capturer = new_capturer;
+                                    break;
                                 }
-                                tokio::time::sleep(fallback.frame_interval()).await;
+                                Err(_) => {
+                                    // SCK still unavailable — use CGDisplayCreateImage
+                                    if let Some(cg_frame) = fallback.capture_frame() {
+                                        // Send this fallback frame through the normal encoding
+                                        // path; a skip here loops for the next frame rather than
+                                        // ending the session.
+                                        match self.encode_and_send(cg_frame)? {
+                                            Some(update) => return Ok(Some(update)),
+                                            None => continue 'outer,
+                                        }
+                                    }
+                                    tokio::time::sleep(fallback.frame_interval()).await;
+                                }
                             }
                         }
+                        continue; // retry next_frame with restored SCK capturer
                     }
-                    continue; // retry next_frame with restored SCK capturer
+                };
+                // If another frame is already buffered, skip this one and grab the newer one
+                // This prevents frame queuing which adds latency
+                match self.capturer.try_next_frame() {
+                    Some(_newer) => continue, // drop older frame, grab newer
+                    None => break frame,
                 }
             };
-            // If another frame is already buffered, skip this one and grab the newer one
-            // This prevents frame queuing which adds latency
-            match self.capturer.try_next_frame() {
-                Some(_newer) => continue, // drop older frame, grab newer
-                None => break frame,
-            }
-        };
 
-        self.encode_and_send(frame)
+            match self.encode_and_send(frame)? {
+                Some(update) => return Ok(Some(update)),
+                None => continue 'outer, // transient skip — pull the next frame
+            }
+        }
     }
 }
 
