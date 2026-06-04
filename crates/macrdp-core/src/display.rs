@@ -14,10 +14,12 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Hard cap for client-requested resolution.  The RDP GFX channel allows up
-/// to 8192×8192; this keeps us within that while preventing absurd allocations
-/// from a misbehaving client.
-const MAX_RESOLUTION_DIM: u16 = 8192;
+/// OpenH264 enforces max(w,h) ≤ 3840 and min(w,h) ≤ 2160 (Level 5.2).
+/// We clamp client-requested resolutions to these limits so that the
+/// software encoder fallback always succeeds.  VideoToolbox has its own
+/// constraint (native resolution only) but does not need this cap.
+const MAX_ENCODE_LONG: u16 = 3840;
+const MAX_ENCODE_SHORT: u16 = 2160;
 
 /// How long to wait after the last resize request before triggering
 /// deactivation/reactivation.  When a user drags a window corner, the RDP
@@ -169,20 +171,25 @@ impl MacDisplay {
             return;
         }
 
-        let w = width.min(MAX_RESOLUTION_DIM).min(self.native_width);
-        let h = height.min(MAX_RESOLUTION_DIM).min(self.native_height);
+        let (long, short) = if width >= height {
+            (MAX_ENCODE_LONG, MAX_ENCODE_SHORT)
+        } else {
+            (MAX_ENCODE_SHORT, MAX_ENCODE_LONG)
+        };
+        let w = width.min(long);
+        let h = height.min(short);
         if w == 0 || h == 0 || (w == self.width && h == self.height) {
             return;
         }
 
-        if width > self.native_width || height > self.native_height {
+        if w != width || h != height {
             tracing::info!(
                 requested_w = width,
                 requested_h = height,
                 clamped_w = w,
                 clamped_h = h,
                 reason,
-                "Clamped client resolution to native display size"
+                "Clamped client resolution to encoder limit"
             );
         }
 
@@ -1221,7 +1228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flexible_display_clamps_to_native_when_client_requests_larger() {
+    async fn flexible_display_adopts_client_requested_larger_size() {
         let mut display = test_display(1920, 1080, false);
 
         display.request_resize(3840, 2160);
@@ -1229,31 +1236,41 @@ mod tests {
         assert_eq!(
             display.size().await,
             DesktopSize {
-                width: 1920,
-                height: 1080,
-            },
-            "should clamp to native, not exceed it"
-        );
-        assert_eq!(
-            pending_resize(&display),
-            None,
-            "no resize pending — clamped size matches current"
+                width: 3840,
+                height: 2160,
+            }
         );
     }
 
     #[tokio::test]
-    async fn flexible_display_clamps_at_native_before_protocol_max() {
+    async fn flexible_display_clamps_at_encoder_limit() {
         let mut display = test_display(1920, 1080, false);
 
-        display.request_resize(9000, 9000);
+        display.request_resize(5000, 3000);
 
         assert_eq!(
             display.size().await,
             DesktopSize {
-                width: 1920,
-                height: 1080,
+                width: MAX_ENCODE_LONG,
+                height: MAX_ENCODE_SHORT,
             },
-            "native clamp (1920x1080) takes precedence over protocol max (8192)"
+            "landscape: clamped to 3840x2160 encoder limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn flexible_display_clamps_portrait_at_encoder_limit() {
+        let mut display = test_display(1080, 1920, false);
+
+        display.request_resize(3000, 5000);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: MAX_ENCODE_SHORT,
+                height: MAX_ENCODE_LONG,
+            },
+            "portrait: clamped to 2160x3840 encoder limit"
         );
     }
 
@@ -1399,7 +1416,7 @@ mod tests {
     fn rapid_layout_requests_coalesce_to_final_size() {
         let mut display = test_display(1920, 1080, false);
 
-        for (w, h) in [(1600, 900), (1700, 950), (1800, 1000)] {
+        for (w, h) in [(2000, 1100), (2200, 1300), (2560, 1440)] {
             let layout =
                 DisplayControlMonitorLayout::new_single_primary_monitor(w, h, None, None).unwrap();
             display.request_layout(layout);
@@ -1408,8 +1425,8 @@ mod tests {
         assert_eq!(
             pending_resize(&display),
             Some(DesktopSize {
-                width: 1800,
-                height: 1000,
+                width: 2560,
+                height: 1440,
             }),
             "only the final size should be pending after rapid requests"
         );
