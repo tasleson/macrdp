@@ -486,4 +486,58 @@ mod tests {
             "Error should mention 'too small', got: {err_msg}"
         );
     }
+
+    #[test]
+    fn test_vimage_bgra_to_nv12_size_validation() {
+        let converter = VImageConverter::new().expect("VImageConverter::new failed");
+
+        let (w, h): (u32, u32) = (64, 64);
+        let stride = w as usize * 4;
+        let bgra = vec![128u8; stride * h as usize];
+        let y_size = (w * h) as usize;
+        let uv_size = w as usize * (h as usize / 2);
+
+        // Too-small Y plane is rejected.
+        let mut y_too_small = vec![0u8; 100];
+        let mut uv_ok = vec![0u8; uv_size];
+        let err = converter
+            .bgra_to_nv12(&bgra, w, h, stride, &mut y_too_small, &mut uv_ok)
+            .expect_err("too-small Y output should fail");
+        assert!(err.contains("Y output buffer too small"), "got: {err}");
+
+        // A correctly sized Y plane paired with a too-small UV plane also fails,
+        // and the error names the UV plane specifically.
+        let mut y_ok = vec![0u8; y_size];
+        let mut uv_too_small = vec![0u8; 100];
+        let err = converter
+            .bgra_to_nv12(&bgra, w, h, stride, &mut y_ok, &mut uv_too_small)
+            .expect_err("too-small UV output should fail");
+        assert!(err.contains("UV output buffer too small"), "got: {err}");
+    }
+
+    #[test]
+    fn conversions_reject_odd_dimensions() {
+        let converter = VImageConverter::new().expect("VImageConverter::new failed");
+
+        // Odd width has no valid 4:2:0 chroma subsampling; both converters must
+        // reject it up front rather than risk an out-of-bounds vImage read.
+        // Output buffers are sized generously so the even-dimension guard is
+        // unambiguously the failure, not a buffer-size check.
+        let (w, h): (u32, u32) = (65, 64);
+        let stride = w as usize * 4;
+        let bgra = vec![128u8; stride * h as usize];
+
+        let mut yuv = vec![0u8; w as usize * h as usize * 2];
+        let err = converter
+            .bgra_to_i420(&bgra, w, h, stride, &mut yuv)
+            .expect_err("odd width should fail (i420)");
+        assert!(err.contains("must both be even"), "got: {err}");
+
+        let mut y_out = vec![0u8; w as usize * h as usize];
+        let mut uv_out = vec![0u8; w as usize * h as usize];
+        let err = converter
+            .bgra_to_nv12(&bgra, w, h, stride, &mut y_out, &mut uv_out)
+            .expect_err("odd width should fail (nv12)");
+        assert!(err.contains("must both be even"), "got: {err}");
+    }
 }
