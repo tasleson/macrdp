@@ -184,4 +184,108 @@ mod tests {
         assert_eq!(scancode_to_keycode(0x02, false), Some(0x12)); // 1
         assert_eq!(scancode_to_keycode(0x0B, false), Some(0x1D)); // 0
     }
+
+    #[test]
+    fn numpad_keys_map_to_numeric_keycodes() {
+        // Non-extended numpad scancodes always produce numeric keypad keycodes,
+        // independent of NumLock state. Their extended variants are navigation
+        // keys, covered by `shared_scancodes_disambiguate_on_extended_flag`.
+        const NUMPAD: &[(u8, u16)] = &[
+            (0x52, 0x52), // Numpad 0
+            (0x4F, 0x53), // Numpad 1
+            (0x50, 0x54), // Numpad 2
+            (0x51, 0x55), // Numpad 3
+            (0x4B, 0x56), // Numpad 4
+            (0x4C, 0x57), // Numpad 5
+            (0x4D, 0x58), // Numpad 6
+            (0x47, 0x59), // Numpad 7
+            (0x48, 0x5B), // Numpad 8
+            (0x49, 0x5C), // Numpad 9
+            (0x53, 0x41), // Numpad . (decimal)
+            (0x37, 0x43), // Numpad * (multiply)
+            (0x4A, 0x4E), // Numpad - (subtract)
+            (0x4E, 0x45), // Numpad + (add)
+        ];
+        for &(scancode, expected) in NUMPAD {
+            assert_eq!(
+                scancode_to_keycode(scancode, false),
+                Some(expected),
+                "numpad scancode {scancode:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_keys_map_correctly() {
+        const FN_KEYS: &[(u8, u16)] = &[
+            (0x3B, 0x7A), // F1
+            (0x3C, 0x78), // F2
+            (0x3D, 0x63), // F3
+            (0x3E, 0x76), // F4
+            (0x3F, 0x60), // F5
+            (0x40, 0x61), // F6
+            (0x41, 0x62), // F7
+            (0x42, 0x64), // F8
+            (0x43, 0x65), // F9
+            (0x44, 0x6D), // F10
+            (0x57, 0x67), // F11
+            (0x58, 0x6F), // F12
+        ];
+        for &(scancode, expected) in FN_KEYS {
+            assert_eq!(
+                scancode_to_keycode(scancode, false),
+                Some(expected),
+                "function-key scancode {scancode:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_scancodes_disambiguate_on_extended_flag() {
+        // These scancodes appear in both maps with different meanings; the
+        // `extended` flag is the only thing distinguishing e.g. Numpad 8 from
+        // Arrow Up, or Enter from Numpad Enter. Regressions here are silent
+        // (wrong key injected), so pin every shared scancode in both states.
+        // Columns: (scancode, non_extended_keycode, extended_keycode).
+        const SHARED: &[(u8, u16, u16)] = &[
+            (0x1C, 0x24, 0x4C), // Enter           / Numpad Enter
+            (0x1D, 0x3B, 0x3E), // Left Ctrl        / Right Ctrl
+            (0x35, 0x2C, 0x4B), // / ?             / Numpad /
+            (0x38, 0x37, 0x36), // Left Alt→Cmd     / Right Alt→Right Cmd
+            (0x47, 0x59, 0x73), // Numpad 7         / Home
+            (0x48, 0x5B, 0x7E), // Numpad 8         / Arrow Up
+            (0x49, 0x5C, 0x74), // Numpad 9         / Page Up
+            (0x4B, 0x56, 0x7B), // Numpad 4         / Arrow Left
+            (0x4D, 0x58, 0x7C), // Numpad 6         / Arrow Right
+            (0x4F, 0x53, 0x77), // Numpad 1         / End
+            (0x50, 0x54, 0x7D), // Numpad 2         / Arrow Down
+            (0x51, 0x55, 0x79), // Numpad 3         / Page Down
+            (0x52, 0x52, 0x72), // Numpad 0         / Insert
+            (0x53, 0x41, 0x75), // Numpad . (dec)   / Delete
+        ];
+        for &(scancode, non_ext, ext) in SHARED {
+            assert_eq!(
+                scancode_to_keycode(scancode, false),
+                Some(non_ext),
+                "non-extended scancode {scancode:#04x}"
+            );
+            assert_eq!(
+                scancode_to_keycode(scancode, true),
+                Some(ext),
+                "extended scancode {scancode:#04x}"
+            );
+            assert_ne!(
+                non_ext, ext,
+                "shared scancode {scancode:#04x} must resolve differently per flag"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_extended_scancode_returns_none() {
+        // Ordinary letter/number keys have no extended form.
+        assert_eq!(scancode_to_keycode(0x1E, true), None); // 'A'
+        assert_eq!(scancode_to_keycode(0x02, true), None); // '1'
+        assert_eq!(scancode_to_keycode(0xFF, true), None); // unknown
+    }
 }
