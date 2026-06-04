@@ -14,9 +14,6 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Maximum tile size for bitmap updates
-#[cfg(test)]
-const TILE_SIZE: u16 = 64;
 const ADAPTIVE_BITRATE_MIN_INTERVAL_FRAMES: u64 = 30;
 const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
 const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
@@ -58,64 +55,6 @@ fn dirty_bounding_box(
     } else {
         None
     }
-}
-
-/// Convert a captured frame into tiled BitmapUpdate chunks
-pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
-    let bgra = match frame.data.as_bgra_bytes() {
-        Some(b) => b,
-        None => return Vec::new(), // PixelBuffer frames don't go through bitmap path
-    };
-    let mut updates = Vec::new();
-    let bpp: usize = 4;
-
-    let cols = (frame.width as u16).div_ceil(tile_size);
-    let rows = (frame.height as u16).div_ceil(tile_size);
-
-    for row in 0..rows {
-        for col in 0..cols {
-            let x = col * tile_size;
-            let y = row * tile_size;
-            let w = (frame.width as u16 - x).min(tile_size);
-            let h = (frame.height as u16 - y).min(tile_size);
-
-            let Some(width) = NonZeroU16::new(w) else {
-                continue;
-            };
-            let Some(height) = NonZeroU16::new(h) else {
-                continue;
-            };
-
-            let mut tile_data = Vec::with_capacity(w as usize * h as usize * bpp);
-            for dy in 0..h {
-                let src_y = (y + dy) as usize;
-                let src_x_start = x as usize * bpp;
-                let src_x_end = src_x_start + w as usize * bpp;
-                let row_start = src_y * frame.stride;
-                if row_start + src_x_end <= bgra.len() {
-                    tile_data
-                        .extend_from_slice(&bgra[row_start + src_x_start..row_start + src_x_end]);
-                }
-            }
-
-            let stride = w as usize * bpp;
-            let Some(stride) = NonZeroUsize::new(stride) else {
-                continue;
-            };
-
-            updates.push(BitmapUpdate {
-                x,
-                y,
-                width,
-                height,
-                format: RdpPixelFormat::BgrA32,
-                data: Bytes::from(tile_data),
-                stride,
-            });
-        }
-    }
-
-    updates
 }
 
 /// Display adapter that bridges ScreenCapturer to ironrdp-server
@@ -1311,26 +1250,6 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_to_bitmap_updates() {
-        let frame = CapturedFrame {
-            width: 100,
-            height: 50,
-            data: FrameData::Raw(Bytes::from(vec![0u8; 100 * 50 * 4])),
-            stride: 400,
-            timestamp_us: 0,
-            dirty_rects: vec![],
-            dirty_rects_available: false,
-        };
-
-        let updates = frame_to_bitmap_updates(&frame, TILE_SIZE);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].x, 0);
-        assert_eq!(updates[0].width.get(), 64);
-        assert_eq!(updates[1].x, 64);
-        assert_eq!(updates[1].width.get(), 36);
-    }
-
-    #[test]
     fn dirty_bounding_box_cases() {
         fn r(x: u32, y: u32, width: u32, height: u32) -> Rect {
             Rect {
@@ -1401,22 +1320,6 @@ mod tests {
                 c.name
             );
         }
-    }
-
-    #[test]
-    fn test_frame_to_bitmap_updates_exact_tile() {
-        let frame = CapturedFrame {
-            width: 128,
-            height: 64,
-            data: FrameData::Raw(Bytes::from(vec![0u8; 128 * 64 * 4])),
-            stride: 512,
-            timestamp_us: 0,
-            dirty_rects: vec![],
-            dirty_rects_available: false,
-        };
-
-        let updates = frame_to_bitmap_updates(&frame, TILE_SIZE);
-        assert_eq!(updates.len(), 2);
     }
 
     #[test]
