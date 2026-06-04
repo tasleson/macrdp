@@ -103,6 +103,33 @@ Default layout:
 
 Each path can be overridden via the matching config field (`cert_path`, `key_path`, `log_path`) or CLI flag (`--cert-path`, `--key-path`, `--log-path`).
 
+### Keychain password storage
+
+Instead of storing the RDP password as plain text in `config.toml`, you can store it in the macOS Keychain:
+
+```bash
+# Store (prompts with no echo; --username defaults to $USER if omitted)
+macrdp-server --keychain-set-password --username alice
+
+# Start the server reading the password from Keychain
+macrdp-server --password-keychain
+```
+
+The entry is stored as a generic password with service `macrdp` and account equal to the RDP username. To manage it with standard macOS tools:
+
+```bash
+# Update — just re-run the set command; it overwrites the existing entry
+macrdp-server --keychain-set-password --username alice
+
+# Delete via the security CLI
+security delete-generic-password -s macrdp -a alice
+
+# Inspect
+security find-generic-password -s macrdp -a alice
+```
+
+You can also view or delete the entry in **Keychain Access.app** by searching for "macrdp".
+
 ---
 
 ## Running as a launchd LaunchAgent
