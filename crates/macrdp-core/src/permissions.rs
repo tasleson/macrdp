@@ -162,15 +162,28 @@ pub fn verify_sck_capture_ready() -> anyhow::Result<usize> {
     use anyhow::bail;
     match macrdp_capture::check_screen_recording_via_sck() {
         macrdp_capture::SckPreflight::Ok { display_count } => Ok(display_count),
-        macrdp_capture::SckPreflight::NoDisplays => bail!(
-            "ScreenCaptureKit reports zero displays for this process. \
-             macOS may have granted the legacy CoreGraphics screen-capture \
-             scope but not the ScreenCaptureKit scope to this specific \
-             binary. Open System Settings → Privacy & Security → \
-             Screen Recording, remove any prior entry for `macrdp-server`, \
-             and re-launch so macOS prompts again. Re-granting may be \
-             required after each `cargo build` for unsigned binaries.",
-        ),
+        macrdp_capture::SckPreflight::NoDisplays => {
+            // Distinguish a permission gap (real problem) from a transient
+            // display-sleep state (safe to continue — capture will wake the
+            // display when the first client connects).
+            if macrdp_capture::is_display_asleep() {
+                tracing::warn!(
+                    "Display is asleep; ScreenCaptureKit sees zero displays at startup. \
+                     The server will start — capture will wake the display when a \
+                     client connects."
+                );
+                return Ok(0);
+            }
+            bail!(
+                "ScreenCaptureKit reports zero displays for this process. \
+                 macOS may have granted the legacy CoreGraphics screen-capture \
+                 scope but not the ScreenCaptureKit scope to this specific \
+                 binary. Open System Settings → Privacy & Security → \
+                 Screen Recording, remove any prior entry for `macrdp-server`, \
+                 and re-launch so macOS prompts again. Re-granting may be \
+                 required after each `cargo build` for unsigned binaries.",
+            )
+        }
         macrdp_capture::SckPreflight::Error(e) => bail!(
             "SCShareableContent.get() failed: {e}. \
              Screen Recording permission is likely not granted for this \

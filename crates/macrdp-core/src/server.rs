@@ -286,6 +286,12 @@ pub async fn start_server_with_options(
     // suite stays portable.
     if options.request_permissions {
         match permissions::verify_sck_capture_ready() {
+            Ok(0) => {
+                tracing::warn!(
+                    "ScreenCaptureKit preflight: display asleep, \
+                     capture will wake it when a client connects"
+                );
+            }
             Ok(n) => {
                 tracing::info!(display_count = n, "ScreenCaptureKit preflight ok");
             }

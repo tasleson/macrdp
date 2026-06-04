@@ -284,9 +284,45 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
     Ok((display.width(), display.height()))
 }
 
+/// Returns true if the main display is physically connected but not actively
+/// rendering — i.e., in power-saving sleep. Used to distinguish a permission
+/// failure (no display in SCK list) from a transient sleep state.
+pub fn is_display_asleep() -> bool {
+    // SAFETY: CGDisplayIsOnline/CGDisplayIsActive are always safe to call.
+    unsafe {
+        CGDisplayIsOnline(CG_DIRECT_MAIN_DISPLAY) && !CGDisplayIsActive(CG_DIRECT_MAIN_DISPLAY)
+    }
+}
+
+/// Wake the main display from power-saving sleep by briefly asserting user
+/// activity via `caffeinate -u`. This is the standard macOS way to bring a
+/// sleeping display back without relying on a deprecated private API.
+pub fn wake_display() {
+    // -u: assert user activity, waking the display if it is asleep.
+    // -t 2: hold the assertion for 2 seconds then release.
+    // Spawned without waiting — the caller does its own sleep to let the
+    // display finish waking before retrying SCK enumeration.
+    match std::process::Command::new("caffeinate")
+        .args(["-u", "-t", "2"])
+        .spawn()
+    {
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Failed to spawn caffeinate to wake display: {e}"),
+    }
+}
+
 impl ScreenCapturer {
     /// Create a new screen capturer for the main display
     pub async fn new(config: CaptureConfig) -> Result<Self> {
+        // If the display is in power-saving sleep, ScreenCaptureKit may enumerate
+        // zero displays. Wake it and give the system a moment to re-enumerate
+        // before issuing the SCK query.
+        if is_display_asleep() {
+            tracing::info!("Display is asleep; waking before starting capture");
+            wake_display();
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+
         // SCShareableContent::get() is synchronous, run in blocking task
         let content = tokio::task::spawn_blocking(SCShareableContent::get)
             .await?
@@ -420,6 +456,21 @@ impl CgFallbackCapturer {
     pub fn frame_interval(&self) -> std::time::Duration {
         self.frame_interval
     }
+}
+
+// ---------------------------------------------------------------------------
+// CoreGraphics FFI for display sleep detection and wake
+// ---------------------------------------------------------------------------
+
+/// `kCGDirectMainDisplay` — the always-valid ID for the primary display.
+const CG_DIRECT_MAIN_DISPLAY: u32 = 0;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    /// Returns true when the display is actively rendering (not sleeping).
+    fn CGDisplayIsActive(display: u32) -> bool;
+    /// Returns true when display hardware is connected, even while sleeping.
+    fn CGDisplayIsOnline(display: u32) -> bool;
 }
 
 // ---------------------------------------------------------------------------
