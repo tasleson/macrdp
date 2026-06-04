@@ -14,6 +14,11 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Hard cap for client-requested resolution.  The RDP GFX channel allows up
+/// to 8192×8192; this keeps us within that while preventing absurd allocations
+/// from a misbehaving client.
+const MAX_RESOLUTION_DIM: u16 = 8192;
+
 const ADAPTIVE_BITRATE_MIN_INTERVAL_FRAMES: u64 = 30;
 const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
 const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
@@ -61,9 +66,6 @@ fn dirty_bounding_box(
 pub struct MacDisplay {
     width: u16,
     height: u16,
-    /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
-    max_width: u16,
-    max_height: u16,
     /// Native macOS display resolution. VideoToolbox silently drops frames at other sizes.
     native_width: u16,
     native_height: u16,
@@ -113,8 +115,6 @@ impl MacDisplay {
         Self {
             width,
             height,
-            max_width: width,
-            max_height: height,
             native_width,
             native_height,
             fixed_resolution,
@@ -162,8 +162,8 @@ impl MacDisplay {
             return;
         }
 
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
+        let w = width.min(MAX_RESOLUTION_DIM);
+        let h = height.min(MAX_RESOLUTION_DIM);
         if w == 0 || h == 0 || (w == self.width && h == self.height) {
             return;
         }
@@ -241,6 +241,39 @@ impl RdpServerDisplay for MacDisplay {
             }
         }
 
+        // Create the capturer first — this wakes the display if it was asleep,
+        // which lets us re-detect the true native resolution below.  We pass
+        // a preliminary pixel format (BGRA is safe for every encoder path);
+        // the final capture config is rebuilt after the encoder is chosen.
+        let preliminary_config = CaptureConfig {
+            width: self.width as u32,
+            height: self.height as u32,
+            frame_rate: self.frame_rate,
+            pixel_format: CapturePixelFormat::Bgra,
+        };
+        let capturer = ScreenCapturer::new(preliminary_config).await?;
+
+        // The display is now awake.  Re-detect native resolution so the mouse
+        // scale and VideoToolbox decision use the real values, not a fallback
+        // that was guessed while the display was asleep at startup.
+        if let Ok((w, h)) = macrdp_capture::detect_display_size() {
+            let (nw, nh) = (w as u16, h as u16);
+            if nw != self.native_width || nh != self.native_height {
+                tracing::info!(
+                    old_native_w = self.native_width,
+                    old_native_h = self.native_height,
+                    new_native_w = nw,
+                    new_native_h = nh,
+                    "Updated native display resolution (display was asleep at startup)"
+                );
+                self.native_width = nw;
+                self.native_height = nh;
+                let scale_x = (self.width as f64 / nw as f64).max(f64::EPSILON);
+                let scale_y = (self.height as f64 / nh as f64).max(f64::EPSILON);
+                *self.mouse_scale.lock().unwrap() = (scale_x, scale_y);
+            }
+        }
+
         // VideoToolbox hardware encoder silently drops frames at non-native resolutions.
         // When a resize moved us away from native, fall back to software encoding.
         let effective_encoder_pref = if self.encoder_pref.prefers_hardware_on_this_platform()
@@ -280,7 +313,13 @@ impl RdpServerDisplay for MacDisplay {
             frame_rate: self.frame_rate,
             pixel_format: capture_pixel_format(self.mode_444, encoder.as_deref()),
         };
-        let capturer = ScreenCapturer::new(capture_config.clone()).await?;
+
+        // The preliminary capturer used BGRA; recreate if the encoder needs NV12.
+        let capturer = if capture_config.pixel_format != CapturePixelFormat::Bgra {
+            ScreenCapturer::new(capture_config.clone()).await?
+        } else {
+            capturer
+        };
 
         Ok(Box::new(MacDisplayUpdates {
             capturer,
@@ -1148,7 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flexible_display_clamps_client_requested_larger_size() {
+    async fn flexible_display_adopts_client_requested_larger_size() {
         let mut display = test_display(1920, 1080, false);
 
         display.request_resize(3840, 2160);
@@ -1156,11 +1195,32 @@ mod tests {
         assert_eq!(
             display.size().await,
             DesktopSize {
-                width: 1920,
-                height: 1080,
+                width: 3840,
+                height: 2160,
             }
         );
-        assert_eq!(pending_resize(&display), None);
+        assert_eq!(
+            pending_resize(&display),
+            Some(DesktopSize {
+                width: 3840,
+                height: 2160,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn flexible_display_clamps_at_protocol_max() {
+        let mut display = test_display(1920, 1080, false);
+
+        display.request_resize(9000, 9000);
+
+        assert_eq!(
+            display.size().await,
+            DesktopSize {
+                width: MAX_RESOLUTION_DIM,
+                height: MAX_RESOLUTION_DIM,
+            }
+        );
     }
 
     #[tokio::test]

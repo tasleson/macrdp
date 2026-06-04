@@ -355,6 +355,7 @@ impl ScreenCapturer {
         let stream_config = SCStreamConfiguration::new()
             .with_width(actual_width)
             .with_height(actual_height)
+            .with_scales_to_fit(true)
             .with_minimum_frame_interval(&frame_interval)
             .with_pixel_format(match config.pixel_format {
                 CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,

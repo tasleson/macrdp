@@ -348,26 +348,6 @@ pub async fn start_server_with_options(
     let hidpi_scale = config.hidpi_scale.unwrap_or(1).clamp(1, 4);
     let (width, height) = (width * hidpi_scale as u16, height * hidpi_scale as u16);
 
-    // VideoToolbox silently drops every frame when encode size != native display size.
-    // Override to native and warn the user.
-    let (width, height) = if encoder_pref.prefers_hardware_on_this_platform()
-        && (width != logical_w || height != logical_h)
-    {
-        tracing::warn!(
-            configured_w = width,
-            configured_h = height,
-            native_w = logical_w,
-            native_h = logical_h,
-            "VideoToolbox requires native display resolution; \
-             overriding to {}x{} (use `--encoder software` for custom resolutions)",
-            logical_w,
-            logical_h,
-        );
-        (logical_w, logical_h)
-    } else {
-        (width, height)
-    };
-
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
 
