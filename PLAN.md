@@ -94,14 +94,14 @@ Goal: excellent interactive performance with predictable latency and low idle co
 - DONE: Implement `skip_unchanged` and `idle_keyframe_sec`.
 - DONE: Avoid encoding unchanged frames; send idle keyframes/keepalives only as needed.
 - DONE: Reduce avoidable allocations in bitmap dirty-region extraction and GFX PDU assembly.
-- Clean up unused/dead encode code after benchmarks identify the winning paths.
+- DONE: Clean up unused/dead encode code after benchmarks identify the winning paths.
 
 ## Phase 6: Verification and Release
 
 Goal: reproducible daemon builds and compatibility confidence.
 
-- Add CI for root Rust tests, formatting, clippy where practical, and release builds.
-- Add release profiles with real optimization for the CLI daemon.
+- DONE: Add CI for root Rust tests, formatting, clippy where practical, and release builds.
+- DONE: Add release profiles with real optimization for the CLI daemon.
 - Benchmark capture copy, BGRA to NV12/I420 conversion, VideoToolbox encode, OpenH264 encode, GFX PDU assembly, and end-to-end frame latency.
 - Add automated tests for credentials, config validation, keymap, color conversion, AVC444 split, bitmap dirty rects, adaptive bitrate decisions, and graceful shutdown.
 - Manually validate Windows Remote Desktop (`mstsc`), Microsoft Remote Desktop for macOS, Microsoft Remote Desktop for iOS/iPadOS, FreeRDP, and Remmina.

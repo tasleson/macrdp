@@ -8,7 +8,6 @@ use bytes::Bytes;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 // --- FFI declarations ---
@@ -23,9 +22,6 @@ type CFAllocatorRef = *const c_void;
 type OSStatus = i32;
 type VTEncodeInfoFlags = u32;
 
-/// VT signaled the output was produced asynchronously.
-#[allow(dead_code)]
-const K_VT_ENCODE_INFO_ASYNCHRONOUS: VTEncodeInfoFlags = 1 << 0;
 /// VT silently dropped this frame. `status == 0`, `sample_buffer == NULL`.
 /// Apple uses this when the rate controller, profile constraint, or input
 /// validation rejects a frame without surfacing it as an error.
@@ -48,15 +44,6 @@ impl CMTime {
             flags: 1,
             epoch: 0,
         } // flags=1 = valid
-    }
-    #[allow(dead_code)]
-    fn invalid() -> Self {
-        Self {
-            value: 0,
-            timescale: 0,
-            flags: 0,
-            epoch: 0,
-        }
     }
 }
 
@@ -125,47 +112,8 @@ extern "C" {
         nal_unit_header_length_out: *mut i32,
     ) -> OSStatus;
 
-    fn CVPixelBufferCreateWithBytes(
-        allocator: CFAllocatorRef,
-        width: usize,
-        height: usize,
-        pixel_format: u32,
-        base_address: *mut c_void,
-        bytes_per_row: usize,
-        release_callback: *const c_void,
-        release_ref_con: *mut c_void,
-        pixel_buffer_attributes: CFDictionaryRef,
-        pixel_buffer_out: *mut CVPixelBufferRef,
-    ) -> OSStatus;
-    fn CVPixelBufferCreateWithPlanarBytes(
-        allocator: CFAllocatorRef,
-        width: usize,
-        height: usize,
-        pixel_format_type: u32,
-        data_ptr: *mut c_void, // top-level data pointer (NULL for biplanar)
-        data_size: usize,      // total data size
-        number_of_planes: usize,
-        plane_base_address: *const *mut c_void,
-        plane_width: *const usize,
-        plane_height: *const usize,
-        plane_bytes_per_row: *const usize,
-        release_callback: *const c_void,
-        release_ref_con: *mut c_void,
-        pixel_buffer_attributes: CFDictionaryRef,
-        pixel_buffer_out: *mut CVPixelBufferRef,
-    ) -> OSStatus;
-    fn CVPixelBufferCreate(
-        allocator: CFAllocatorRef,
-        width: usize,
-        height: usize,
-        pixel_format_type: u32,
-        pixel_buffer_attributes: CFDictionaryRef,
-        pixel_buffer_out: *mut CVPixelBufferRef,
-    ) -> OSStatus;
     fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u64) -> OSStatus;
     fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u64) -> OSStatus;
-    fn CVPixelBufferGetBaseAddress(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
-    fn CVPixelBufferGetBytesPerRow(pixel_buffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferRelease(pixel_buffer: CVPixelBufferRef);
     fn CVPixelBufferGetBaseAddressOfPlane(
         pixel_buffer: CVPixelBufferRef,
@@ -186,7 +134,6 @@ extern "C" {
     static kCVPixelBufferWidthKey: CFStringRef;
     static kCVPixelBufferHeightKey: CFStringRef;
 
-    static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
     static kVTCompressionPropertyKey_RealTime: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
@@ -199,10 +146,7 @@ extern "C" {
     static kVTCompressionPropertyKey_AllowTemporalCompression: CFStringRef;
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
-    static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
-    static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
     static kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel: CFStringRef;
-    static kVTH264EntropyMode_CABAC: CFStringRef;
     static kVTH264EntropyMode_CAVLC: CFStringRef;
 
     static kCFBooleanTrue: CFTypeRef;
@@ -217,12 +161,6 @@ extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
-    fn CFArrayCreate(
-        allocator: CFAllocatorRef,
-        values: *const *const c_void,
-        num_values: isize,
-        callbacks: *const c_void,
-    ) -> CFTypeRef;
     fn CFRelease(cf: *const c_void);
     fn CFStringCreateWithCString(
         alloc: CFAllocatorRef,
@@ -230,12 +168,7 @@ extern "C" {
         encoding: u32,
     ) -> CFStringRef;
 
-    static kCFTypeArrayCallBacks: c_void;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
-    static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
-    static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
-    static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
-    static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
     static kCMFormatDescriptionExtension_FullRangeVideo: CFStringRef;
 }
 
@@ -494,11 +427,6 @@ pub struct VtEncoder {
     mode_444: bool,
     yuv444_buf: Option<Yuv444Buffers>,
     pending_force_keyframe: bool,
-    /// vImage SIMD converter for CG fallback path (BGRA→NV12).
-    /// Will be used when the CG fallback path is refactored to avoid
-    /// the hand-written conversion loop.
-    #[allow(dead_code)]
-    vimage: Option<VImageConverter>,
 }
 
 // VTCompressionSession is thread-safe per Apple docs
@@ -534,10 +462,6 @@ impl VtEncoder {
             None
         };
 
-        let vimage = VImageConverter::new()
-            .map_err(|e| tracing::warn!("vImage init failed: {e}"))
-            .ok();
-
         tracing::info!(
             width,
             height,
@@ -559,7 +483,6 @@ impl VtEncoder {
             mode_444,
             yuv444_buf,
             pending_force_keyframe: false,
-            vimage,
         })
     }
 
@@ -811,101 +734,6 @@ impl VtEncoder {
         Ok(pb)
     }
 
-    /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
-    /// BT.601 full range: Y=0-255, UV=0-255.
-    #[allow(dead_code)]
-    fn create_nv12_from_bgra(
-        session: VTCompressionSessionRef,
-        enc_w: u32,
-        enc_h: u32,
-        data: &[u8],
-        src_w: u32,
-        src_h: u32,
-        stride: usize,
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = enc_w as usize;
-        let h = enc_h as usize;
-        let sw = src_w as usize;
-        let sh = src_h as usize;
-
-        unsafe {
-            let pool = VTCompressionSessionGetPixelBufferPool(session);
-            if pool.is_null() {
-                anyhow::bail!("VT pixel buffer pool is null");
-            }
-            let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferPoolCreatePixelBuffer failed: {status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-
-            if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 plane address is null");
-            }
-
-            let rows = sh.min(h);
-            let cols = sw.min(w);
-
-            // Y plane: full resolution, BT.601 full range
-            for row in 0..rows {
-                let bgra_row = row * stride;
-                let y_row = row * y_bpr;
-                for col in 0..cols {
-                    let px = bgra_row + col * 4;
-                    let b = data[px] as i32;
-                    let g = data[px + 1] as i32;
-                    let r = data[px + 2] as i32;
-                    *y_base.add(y_row + col) = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
-                }
-            }
-
-            // UV plane: half resolution, 2x2 averaged, BT.601 full range
-            let uv_rows = rows / 2;
-            let uv_cols = cols / 2;
-            for row in 0..uv_rows {
-                let r0 = row * 2;
-                let r1 = r0 + 1;
-                let uv_row_off = row * uv_bpr;
-                for col in 0..uv_cols {
-                    let c0 = col * 2;
-                    let c1 = c0 + 1;
-                    // 2x2 block averaging
-                    let mut rb = 0i32;
-                    let mut gb = 0i32;
-                    let mut bb = 0i32;
-                    for &sr in &[r0, r1] {
-                        for &sc in &[c0, c1] {
-                            let px = sr * stride + sc * 4;
-                            bb += data[px] as i32;
-                            gb += data[px + 1] as i32;
-                            rb += data[px + 2] as i32;
-                        }
-                    }
-                    rb >>= 2;
-                    gb >>= 2;
-                    bb >>= 2; // /4
-                    let u = (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    let v = (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    let off = uv_row_off + col * 2;
-                    *uv_base.add(off) = u;
-                    *uv_base.add(off + 1) = v;
-                }
-            }
-
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-        Ok(pb)
-    }
-
     /// Allocate NV12 pixel buffer from VT session's pool (IOSurface-backed, hardware compatible)
     /// and fill with I420 plane data.
     fn create_nv12_from_session_pool(
@@ -970,85 +798,6 @@ impl VtEncoder {
                     if src_idx < u_plane.len() && src_idx < v_plane.len() {
                         *uv_base.add(dst_off) = u_plane[src_idx];
                         *uv_base.add(dst_off + 1) = v_plane[src_idx];
-                    }
-                }
-            }
-
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-
-        Ok(pb)
-    }
-
-    /// Create an IOSurface-backed NV12 CVPixelBuffer from I420 planes.
-    /// Uses CVPixelBufferCreate + memcpy into planes (IOSurface-backed = VT hardware compatible).
-    #[allow(dead_code)]
-    fn create_nv12_pixelbuffer(
-        width: u32,
-        height: u32,
-        y_plane: &[u8],
-        u_plane: &[u8],
-        v_plane: &[u8],
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = width as usize;
-        let h = height as usize;
-
-        unsafe {
-            // Create NV12 pixel buffer without IOSurface properties.
-            // VT will handle the memory backing internally.
-            let status = CVPixelBufferCreate(
-                std::ptr::null(),
-                w,
-                h,
-                K_CV_PIXEL_FORMAT_420F,
-                std::ptr::null(), // no attributes — avoids CVPixelBufferCreate+IOSurface+NV12 crash
-                &mut pb,
-            );
-
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferCreate NV12 failed: status={status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-
-            // Plane 0: Y (full resolution)
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            if y_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 Y plane is null");
-            }
-            for row in 0..h {
-                let src_start = row * w;
-                let dst_start = row * y_bpr;
-                if src_start + w <= y_plane.len() {
-                    std::ptr::copy_nonoverlapping(
-                        y_plane.as_ptr().add(src_start),
-                        y_base.add(dst_start),
-                        w.min(y_bpr),
-                    );
-                }
-            }
-
-            // Plane 1: interleaved UV (NV12 CbCr)
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-            if uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 UV plane is null");
-            }
-            let uv_w = w / 2;
-            let uv_h = h / 2;
-            for row in 0..uv_h {
-                for col in 0..uv_w {
-                    let src_idx = row * uv_w + col;
-                    let dst_offset = row * uv_bpr + col * 2;
-                    if src_idx < u_plane.len() && src_idx < v_plane.len() {
-                        *uv_base.add(dst_offset) = u_plane[src_idx];
-                        *uv_base.add(dst_offset + 1) = v_plane[src_idx];
                     }
                 }
             }

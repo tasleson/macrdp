@@ -19,6 +19,12 @@ edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

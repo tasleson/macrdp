@@ -685,7 +685,6 @@ impl MacDisplayUpdates {
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
-
         let (gfx, pending_acks) = {
             let state = self.gfx_state.lock().unwrap();
             if state.channel_id.is_some() && !state.caps_confirmed {
@@ -1638,10 +1637,7 @@ mod tests {
 
         let effective = pacer.effective_interval();
         let base = Duration::from_secs_f64(1.0 / 60.0);
-        assert_eq!(
-            effective, base,
-            "fast encode should use base interval"
-        );
+        assert_eq!(effective, base, "fast encode should use base interval");
     }
 
     #[test]

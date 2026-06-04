@@ -411,10 +411,18 @@ impl GfxState {
             1.0
         } else if self.ack_queue_trend <= 0.5 {
             // Queue stable or shrinking — client keeping up, even with pipeline latency.
-            if self.pending_acks_ewma < 15.0 { 1.0 } else { 0.85 }
+            if self.pending_acks_ewma < 15.0 {
+                1.0
+            } else {
+                0.85
+            }
         } else if self.ack_queue_trend <= 2.0 {
             // Queue growing slowly — early congestion or transient burst.
-            if net_rtt_ms < 30.0 { 0.85 } else { 0.6 }
+            if net_rtt_ms < 30.0 {
+                0.85
+            } else {
+                0.6
+            }
         } else if self.ack_queue_trend <= 5.0 {
             0.4
         } else {
@@ -457,30 +465,39 @@ impl GfxHandler {
 
         // First frame: surface setup (CapConfirm already sent by DVC handler)
         if !state.surface_created {
-            encode_pdu_into(&mut raw_pdus, &ServerPdu::ResetGraphics(ResetGraphicsPdu {
-                width: state.width as u32,
-                height: state.height as u32,
-                monitors: vec![Monitor {
-                    left: 0,
-                    top: 0,
-                    right: state.width as i32 - 1,
-                    bottom: state.height as i32 - 1,
-                    flags: MonitorFlags::PRIMARY,
-                }],
-            }));
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: state.width as u32,
+                    height: state.height as u32,
+                    monitors: vec![Monitor {
+                        left: 0,
+                        top: 0,
+                        right: state.width as i32 - 1,
+                        bottom: state.height as i32 - 1,
+                        flags: MonitorFlags::PRIMARY,
+                    }],
+                }),
+            );
 
-            encode_pdu_into(&mut raw_pdus, &ServerPdu::CreateSurface(CreateSurfacePdu {
-                surface_id: 0,
-                width: enc_w,
-                height: enc_h,
-                pixel_format: GfxPixelFormat::XRgb,
-            }));
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::CreateSurface(CreateSurfacePdu {
+                    surface_id: 0,
+                    width: enc_w,
+                    height: enc_h,
+                    pixel_format: GfxPixelFormat::XRgb,
+                }),
+            );
 
-            encode_pdu_into(&mut raw_pdus, &ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
-                surface_id: 0,
-                output_origin_x: 0,
-                output_origin_y: 0,
-            }));
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                    surface_id: 0,
+                    output_origin_x: 0,
+                    output_origin_y: 0,
+                }),
+            );
 
             state.surface_created = true;
             info!(
@@ -491,15 +508,18 @@ impl GfxHandler {
 
         let frame_id = state.next_frame_id();
 
-        encode_pdu_into(&mut raw_pdus, &ServerPdu::StartFrame(StartFramePdu {
-            timestamp: Timestamp {
-                milliseconds: 0,
-                seconds: 0,
-                minutes: 0,
-                hours: 0,
-            },
-            frame_id,
-        }));
+        encode_pdu_into(
+            &mut raw_pdus,
+            &ServerPdu::StartFrame(StartFramePdu {
+                timestamp: Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id,
+            }),
+        );
 
         let make_rect = || InclusiveRectangle {
             left: 0,
@@ -542,13 +562,16 @@ impl GfxHandler {
             };
 
             if let Ok(avc444_data) = encode_vec(&avc444_stream) {
-                encode_pdu_into(&mut raw_pdus, &ServerPdu::WireToSurface1(WireToSurface1Pdu {
-                    surface_id: 0,
-                    codec_id: Codec1Type::Avc444,
-                    pixel_format: GfxPixelFormat::XRgb,
-                    destination_rectangle: make_dest_rect(),
-                    bitmap_data: avc444_data,
-                }));
+                encode_pdu_into(
+                    &mut raw_pdus,
+                    &ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                        surface_id: 0,
+                        codec_id: Codec1Type::Avc444,
+                        pixel_format: GfxPixelFormat::XRgb,
+                        destination_rectangle: make_dest_rect(),
+                        bitmap_data: avc444_data,
+                    }),
+                );
             }
         } else {
             // AVC420 path: WireToSurface1 + Avc420BitmapStream
@@ -559,17 +582,23 @@ impl GfxHandler {
             };
 
             if let Ok(avc_data) = encode_vec(&avc_stream) {
-                encode_pdu_into(&mut raw_pdus, &ServerPdu::WireToSurface1(WireToSurface1Pdu {
-                    surface_id: 0,
-                    codec_id: Codec1Type::Avc420,
-                    pixel_format: GfxPixelFormat::XRgb,
-                    destination_rectangle: make_dest_rect(),
-                    bitmap_data: avc_data,
-                }));
+                encode_pdu_into(
+                    &mut raw_pdus,
+                    &ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                        surface_id: 0,
+                        codec_id: Codec1Type::Avc420,
+                        pixel_format: GfxPixelFormat::XRgb,
+                        destination_rectangle: make_dest_rect(),
+                        bitmap_data: avc_data,
+                    }),
+                );
             }
         }
 
-        encode_pdu_into(&mut raw_pdus, &ServerPdu::EndFrame(EndFramePdu { frame_id }));
+        encode_pdu_into(
+            &mut raw_pdus,
+            &ServerPdu::EndFrame(EndFramePdu { frame_id }),
+        );
 
         debug!(
             frame_id,
