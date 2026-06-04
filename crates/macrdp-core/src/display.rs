@@ -986,7 +986,7 @@ impl MacDisplayUpdates {
                     Err(e) => {
                         tracing::warn!(
                             display_frame = self.display_frame_count,
-                            "H.264 encode failed: {e}"
+                            "H.264 encode failed: {e:#}"
                         );
                     }
                 }

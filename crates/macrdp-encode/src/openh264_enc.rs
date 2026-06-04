@@ -53,9 +53,14 @@ impl Yuv444SplitBufs {
     }
 }
 
+/// OpenH264 rejects bitrates above the level-dependent MaxSpatialBitrate
+/// (288 Mbps at Level 5.2). Cap to 250 Mbps to stay safely within bounds.
+const OPENH264_MAX_BITRATE: u32 = 250_000_000;
+
 fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Result<Encoder> {
+    let capped = bitrate.min(OPENH264_MAX_BITRATE);
     let config = EncoderConfig::new()
-        .bitrate(openh264::encoder::BitRate::from_bps(bitrate))
+        .bitrate(openh264::encoder::BitRate::from_bps(capped))
         .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
         .background_detection(false)
@@ -404,5 +409,23 @@ mod tests {
             "1080p60 HighQuality should be > 30Mbps, got {}",
             br
         );
+    }
+
+    #[test]
+    fn encode_4k_at_server_bitrate() {
+        let bitrate = crate::screen_bitrate(3840, 2160, 60.0, crate::Quality::HighQuality);
+        let mut encoder = OpenH264Encoder::new(3840, 2160, 60.0, bitrate, false).unwrap();
+        let bgra = vec![128u8; 3840 * 2160 * 4];
+        let frame = encoder.encode_bgra(&bgra, 3840, 2160, 3840 * 4).unwrap();
+        assert!(!frame.data.is_empty());
+    }
+
+    #[test]
+    fn encode_4k_with_larger_stride() {
+        let stride = 3840 * 4 + 64; // extra padding per row
+        let mut encoder = OpenH264Encoder::new(3840, 2160, 60.0, 50_000_000, false).unwrap();
+        let bgra = vec![128u8; stride * 2160];
+        let frame = encoder.encode_bgra(&bgra, 3840, 2160, stride).unwrap();
+        assert!(!frame.data.is_empty());
     }
 }
