@@ -117,6 +117,21 @@ pub struct VImageConverter {
     nv12_info: VImageARGBToYpCbCr,
 }
 
+/// Validate that BGRA input dimensions are even and the buffer is large enough.
+fn validate_bgra_input(w: usize, h: usize, stride: usize, bgra: &[u8]) -> Result<(), String> {
+    if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+        return Err(format!("width ({w}) and height ({h}) must both be even"));
+    }
+    if bgra.len() < (h - 1) * stride + w * 4 {
+        return Err(format!(
+            "BGRA buffer too small: need at least {} bytes, got {}",
+            (h - 1) * stride + w * 4,
+            bgra.len()
+        ));
+    }
+    Ok(())
+}
+
 impl VImageConverter {
     /// Create a new converter using BT.601 full-range (0-255 for Y/Cb/Cr).
     pub fn new() -> Result<Self, String> {
@@ -199,16 +214,7 @@ impl VImageConverter {
         let uv_size = uv_w * uv_h;
         let required = y_size + uv_size * 2;
 
-        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
-            return Err(format!("width ({w}) and height ({h}) must both be even"));
-        }
-        if bgra.len() < (h - 1) * stride + w * 4 {
-            return Err(format!(
-                "BGRA buffer too small: need at least {} bytes, got {}",
-                (h - 1) * stride + w * 4,
-                bgra.len()
-            ));
-        }
+        validate_bgra_input(w, h, stride, bgra)?;
         if yuv_out.len() < required {
             return Err(format!(
                 "I420 output buffer too small: need {required}, got {}",
@@ -290,16 +296,7 @@ impl VImageConverter {
         let y_size = w * h;
         let uv_size = w * (h / 2); // interleaved CbCr: (w/2) samples * 2 bytes = w bytes per row, h/2 rows
 
-        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
-            return Err(format!("width ({w}) and height ({h}) must both be even"));
-        }
-        if bgra.len() < (h - 1) * stride + w * 4 {
-            return Err(format!(
-                "BGRA buffer too small: need at least {} bytes, got {}",
-                (h - 1) * stride + w * 4,
-                bgra.len()
-            ));
-        }
+        validate_bgra_input(w, h, stride, bgra)?;
         if y_out.len() < y_size {
             return Err(format!(
                 "Y output buffer too small: need {y_size}, got {}",
