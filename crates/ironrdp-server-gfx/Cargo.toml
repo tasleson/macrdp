@@ -155,6 +155,9 @@ optional = true
 version = "1"
 features = ["sync"]
 
+[dev-dependencies.rcgen]
+version = "0.13"
+
 [lints.clippy]
 alloc_instead_of_core = "warn"
 allow_attributes = "warn"

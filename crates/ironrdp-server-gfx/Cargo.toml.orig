@@ -54,6 +54,7 @@ zstd-safe = { version = "7.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync"] }
+rcgen = "0.13"
 
 [lints]
 workspace = true

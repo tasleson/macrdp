@@ -44,20 +44,10 @@ impl TlsIdentityCtx {
         };
 
         let pub_key = {
-            use x509_cert::der::Decode as _;
-
             let cert = certs
                 .first()
                 .ok_or_else(|| std::io::Error::other("invalid cert"))?;
-            let cert = x509_cert::Certificate::from_der(cert).map_err(std::io::Error::other)?;
-            cert.tbs_certificate
-                .subject_public_key_info
-                .subject_public_key
-                .as_bytes()
-                .ok_or_else(|| {
-                    std::io::Error::other("subject public key BIT STRING is not aligned")
-                })?
-                .to_owned()
+            credssp_public_key_from_cert_der(cert.as_ref())?
         };
 
         Ok(Self {
@@ -77,5 +67,41 @@ impl TlsIdentityCtx {
         server_config.key_log = Arc::new(rustls::KeyLogFile::new());
 
         Ok(TlsAcceptor::from(Arc::new(server_config)))
+    }
+}
+
+fn credssp_public_key_from_cert_der(cert_der: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use x509_cert::der::Decode as _;
+
+    let cert = x509_cert::Certificate::from_der(cert_der).context("parsing server certificate")?;
+
+    cert.tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| std::io::Error::other("subject public key BIT STRING is not aligned"))
+        .map(ToOwned::to_owned)
+        .context("reading CredSSP SubjectPublicKey bytes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credssp_public_key_uses_raw_subject_public_key_bytes() {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::default()
+            .self_signed(&key_pair)
+            .unwrap();
+        let cert = CertificateDer::from_pem_slice(cert.pem().as_bytes()).unwrap();
+
+        let public_key = credssp_public_key_from_cert_der(cert.as_ref()).unwrap();
+
+        assert_eq!(
+            public_key.first(),
+            Some(&0x04),
+            "P-256 SubjectPublicKey bytes must start with the uncompressed EC point marker"
+        );
     }
 }
