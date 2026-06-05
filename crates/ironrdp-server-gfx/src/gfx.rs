@@ -18,7 +18,7 @@ use ironrdp_pdu::{decode, PduResult};
 type DvcMessage = ironrdp_dvc::DvcMessage;
 use tracing::{debug, info};
 
-use crate::display::GfxFrameUpdate;
+use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -608,6 +608,103 @@ impl GfxHandler {
         );
 
         // Single ZGFX wrap for all concatenated PDUs
+        wrap_zgfx(&raw_pdus)
+    }
+
+    /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
+    /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
+    pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
+        let mut raw_pdus = Vec::new();
+
+        if !state.surface_created {
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: u32::from(state.width),
+                    height: u32::from(state.height),
+                    monitors: vec![Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(state.width) - 1,
+                        bottom: i32::from(state.height) - 1,
+                        flags: MonitorFlags::PRIMARY,
+                    }],
+                }),
+            );
+
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::CreateSurface(CreateSurfacePdu {
+                    surface_id: 0,
+                    width: update.width,
+                    height: update.height,
+                    pixel_format: GfxPixelFormat::XRgb,
+                }),
+            );
+
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                    surface_id: 0,
+                    output_origin_x: 0,
+                    output_origin_y: 0,
+                }),
+            );
+
+            state.surface_created = true;
+            info!(
+                "GFX surface created (uncompressed): {}x{}",
+                update.width, update.height
+            );
+        }
+
+        let frame_id = state.next_frame_id();
+
+        encode_pdu_into(
+            &mut raw_pdus,
+            &ServerPdu::StartFrame(StartFramePdu {
+                timestamp: Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id,
+            }),
+        );
+
+        let mut total_bytes = 0usize;
+        for rect in &update.rects {
+            encode_pdu_into(
+                &mut raw_pdus,
+                &ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                    surface_id: 0,
+                    codec_id: Codec1Type::Uncompressed,
+                    pixel_format: GfxPixelFormat::XRgb,
+                    destination_rectangle: InclusiveRectangle {
+                        left: rect.x,
+                        top: rect.y,
+                        right: rect.x + rect.width,
+                        bottom: rect.y + rect.height,
+                    },
+                    bitmap_data: rect.pixel_data.to_vec(),
+                }),
+            );
+            total_bytes += rect.pixel_data.len();
+        }
+
+        encode_pdu_into(
+            &mut raw_pdus,
+            &ServerPdu::EndFrame(EndFramePdu { frame_id }),
+        );
+
+        debug!(
+            frame_id,
+            rects = update.rects.len(),
+            raw_bytes = total_bytes,
+            "GFX uncompressed frame PDU created",
+        );
+
         wrap_zgfx(&raw_pdus)
     }
 }

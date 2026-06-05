@@ -571,6 +571,39 @@ impl RdpServer {
             }
         }
 
+        // Handle GFX uncompressed dirty rect updates through the DVC channel
+        if let DisplayUpdate::GfxUncompressed(ref gfx_uncompressed) = update {
+            let mut state = gfx_state.lock().unwrap();
+            if state.channel_id.is_some() && state.caps_confirmed {
+                if let Some(drdynvc_id) = drdynvc_channel_id {
+                    let channel_id = state.channel_id.unwrap();
+                    let pdu_data =
+                        GfxHandler::create_uncompressed_pdu(&mut state, gfx_uncompressed);
+                    drop(state);
+
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let svc_messages = dvc::encode_dvc_messages(
+                        channel_id,
+                        dvc_messages,
+                        ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+                    )
+                    .context("Failed to encode DVC messages")?;
+
+                    let data =
+                        server_encode_svc_messages(svc_messages, drdynvc_id, user_channel_id)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .context("failed to write GFX uncompressed frame")?;
+
+                    return Ok((RunState::Continue, encoder));
+                }
+            } else {
+                drop(state);
+            }
+        }
+
         let mut encoder_iter = encoder.update(update);
         loop {
             let Some(fragmenter) = encoder_iter.next().await else {
