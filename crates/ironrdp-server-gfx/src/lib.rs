@@ -2,7 +2,8 @@
 #![doc(
     html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg"
 )]
-#![allow(clippy::arithmetic_side_effects)] // TODO: should we enable this lint back?
+#![allow(clippy::arithmetic_side_effects)]
+// TODO: should we enable this lint back?
 // Upstream ironrdp code uses `as` casts extensively for wire-format protocol fields.
 // Suppressing these lints avoids churn in patched upstream code.
 #![allow(

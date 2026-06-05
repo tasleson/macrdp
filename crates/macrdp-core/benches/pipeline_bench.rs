@@ -83,7 +83,9 @@ fn bench_gfx_pdu_assembly(c: &mut Criterion) {
     let frame = dummy_encoded_frame(width, height, REPRESENTATIVE_FRAME_BYTES);
 
     let mut group = c.benchmark_group("gfx_pdu_assembly");
-    group.throughput(criterion::Throughput::Bytes(REPRESENTATIVE_FRAME_BYTES as u64));
+    group.throughput(criterion::Throughput::Bytes(
+        REPRESENTATIVE_FRAME_BYTES as u64,
+    ));
 
     group.bench_function("first_frame", |b| {
         b.iter_batched(

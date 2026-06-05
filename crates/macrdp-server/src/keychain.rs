@@ -23,7 +23,9 @@ pub fn get_password(username: Option<&str>) -> anyhow::Result<String> {
     keyring::Entry::new(SERVICE, &acct)
         .context("Failed to create keychain entry")?
         .get_password()
-        .context("Failed to read password from keychain; run with --keychain-set-password to store one")
+        .context(
+            "Failed to read password from keychain; run with --keychain-set-password to store one",
+        )
 }
 
 #[cfg(test)]

@@ -5,9 +5,9 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use macrdp_encode::color_convert::VImageConverter;
-use macrdp_encode::{align16, OpenH264Encoder, VideoEncoder};
 #[cfg(target_os = "macos")]
 use macrdp_encode::VtEncoder;
+use macrdp_encode::{align16, OpenH264Encoder, VideoEncoder};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -198,16 +198,16 @@ fn bench_videotoolbox_encode(c: &mut Criterion) {
         let bgra = generate_test_pattern(width, height, stride);
         // The daemon creates the session at 16-aligned dimensions and feeds the
         // raw frame size; mirror that here.
-        let mut encoder = match VtEncoder::new(align16(width), align16(height), 120.0, bitrate, false)
-        {
-            Ok(e) => e,
-            // VideoToolbox needs a real GPU/codec; skip rather than fail when
-            // unavailable (e.g. headless CI without hardware encode).
-            Err(e) => {
-                eprintln!("skipping {label}: VtEncoder unavailable: {e}");
-                continue;
-            }
-        };
+        let mut encoder =
+            match VtEncoder::new(align16(width), align16(height), 120.0, bitrate, false) {
+                Ok(e) => e,
+                // VideoToolbox needs a real GPU/codec; skip rather than fail when
+                // unavailable (e.g. headless CI without hardware encode).
+                Err(e) => {
+                    eprintln!("skipping {label}: VtEncoder unavailable: {e}");
+                    continue;
+                }
+            };
 
         group.bench_function(label, |b| {
             b.iter(|| {

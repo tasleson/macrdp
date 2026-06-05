@@ -555,11 +555,8 @@ impl RdpServer {
                     )
                     .context("Failed to encode DVC messages")?;
 
-                    let data = server_encode_svc_messages(
-                        svc_messages,
-                        drdynvc_id,
-                        user_channel_id,
-                    )?;
+                    let data =
+                        server_encode_svc_messages(svc_messages, drdynvc_id, user_channel_id)?;
                     writer
                         .write_all(&data)
                         .await

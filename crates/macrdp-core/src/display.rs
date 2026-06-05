@@ -219,8 +219,13 @@ impl MacDisplay {
             gfx.height = h;
         }
 
-        *self.pending_resize.lock().unwrap() =
-            Some((DesktopSize { width: w, height: h }, Instant::now()));
+        *self.pending_resize.lock().unwrap() = Some((
+            DesktopSize {
+                width: w,
+                height: h,
+            },
+            Instant::now(),
+        ));
     }
 }
 
