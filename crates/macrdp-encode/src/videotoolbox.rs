@@ -887,6 +887,82 @@ impl VtEncoder {
 
         Ok(result)
     }
+
+    /// Build the force-keyframe CFDictionary and clear the pending flag.
+    /// Returns null when no keyframe was pending.
+    fn take_force_keyframe_props(&mut self) -> CFDictionaryRef {
+        if self.pending_force_keyframe {
+            self.pending_force_keyframe = false;
+            unsafe {
+                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+                CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    1,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            }
+        } else {
+            std::ptr::null()
+        }
+    }
+}
+
+/// Log a NAL-unit breakdown for the first 10 frames of a session.
+fn log_nal_diagnostic(frame_count: u64, nal_data: &[u8], is_keyframe: bool, label: &str) {
+    let mut nal_types = Vec::new();
+    let mut profile_info = String::new();
+    let mut scan = 0usize;
+    while scan + 4 < nal_data.len() {
+        if nal_data[scan] == 0
+            && nal_data[scan + 1] == 0
+            && nal_data[scan + 2] == 0
+            && nal_data[scan + 3] == 1
+        {
+            scan += 4;
+            if scan < nal_data.len() {
+                let nal_type = nal_data[scan] & 0x1F;
+                let nal_name = match nal_type {
+                    1 => "P-slice",
+                    5 => "IDR",
+                    6 => "SEI",
+                    7 => "SPS",
+                    8 => "PPS",
+                    9 => "AUD",
+                    _ => "other",
+                };
+                nal_types.push(format!("{}({})", nal_name, nal_type));
+                if nal_type == 7 && scan + 3 < nal_data.len() {
+                    let profile_idc = nal_data[scan + 1];
+                    let constraint = nal_data[scan + 2];
+                    let level_idc = nal_data[scan + 3];
+                    let name = match profile_idc {
+                        66 => "Baseline",
+                        77 => "Main",
+                        100 => "High",
+                        _ => "Unknown",
+                    };
+                    profile_info = format!(
+                        "{}(idc={},constraint=0x{:02X},level={})",
+                        name, profile_idc, constraint, level_idc
+                    );
+                }
+            }
+        } else {
+            scan += 1;
+        }
+    }
+    tracing::info!(
+        frame = frame_count,
+        output_bytes = nal_data.len(),
+        is_keyframe,
+        nal_units = nal_types.join(", "),
+        profile = profile_info,
+        "{label}"
+    );
 }
 
 impl VideoEncoder for VtEncoder {
@@ -912,24 +988,7 @@ impl VideoEncoder for VtEncoder {
             stride,
         )?;
 
-        // Build frame properties dict to force IDR when requested
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        let frame_props = self.take_force_keyframe_props();
 
         let (nal_data, is_keyframe) = Self::encode_session_frame(
             self.session,
@@ -952,59 +1011,8 @@ impl VideoEncoder for VtEncoder {
 
         self.frame_count += 1;
 
-        // NAL type diagnostic for first 10 frames (info level so it's always visible)
         if self.frame_count <= 10 {
-            let mut nal_types = Vec::new();
-            let mut profile_info = String::new();
-            let mut scan = 0usize;
-            while scan + 4 < nal_data.len() {
-                if nal_data[scan] == 0
-                    && nal_data[scan + 1] == 0
-                    && nal_data[scan + 2] == 0
-                    && nal_data[scan + 3] == 1
-                {
-                    scan += 4;
-                    if scan < nal_data.len() {
-                        let nal_type = nal_data[scan] & 0x1F;
-                        let nal_name = match nal_type {
-                            1 => "P-slice",
-                            5 => "IDR",
-                            6 => "SEI",
-                            7 => "SPS",
-                            8 => "PPS",
-                            9 => "AUD",
-                            _ => "other",
-                        };
-                        nal_types.push(format!("{}({})", nal_name, nal_type));
-                        // Extract SPS profile info
-                        if nal_type == 7 && scan + 3 < nal_data.len() {
-                            let profile_idc = nal_data[scan + 1];
-                            let constraint = nal_data[scan + 2];
-                            let level_idc = nal_data[scan + 3];
-                            let name = match profile_idc {
-                                66 => "Baseline",
-                                77 => "Main",
-                                100 => "High",
-                                _ => "Unknown",
-                            };
-                            profile_info = format!(
-                                "{}(idc={},constraint=0x{:02X},level={})",
-                                name, profile_idc, constraint, level_idc
-                            );
-                        }
-                    }
-                } else {
-                    scan += 1;
-                }
-            }
-            tracing::info!(
-                frame = self.frame_count,
-                output_bytes = nal_data.len(),
-                is_keyframe,
-                nal_units = nal_types.join(", "),
-                profile = profile_info,
-                "VideoToolbox NAL diagnostic"
-            );
+            log_nal_diagnostic(self.frame_count, &nal_data, is_keyframe, "VideoToolbox NAL diagnostic");
         }
 
         if self.frame_count.is_multiple_of(300) {
@@ -1037,24 +1045,7 @@ impl VideoEncoder for VtEncoder {
         let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let duration = CMTime::make(frame_duration, 600);
 
-        // Build frame properties for force keyframe if needed
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        let frame_props = self.take_force_keyframe_props();
 
         // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
         let (nal_data, is_keyframe) = Self::encode_session_frame(
@@ -1075,41 +1066,8 @@ impl VideoEncoder for VtEncoder {
 
         self.frame_count += 1;
 
-        // NAL diagnostic for first 10 frames (zero-copy path)
         if self.frame_count <= 10 {
-            let mut nal_types = Vec::new();
-            let mut scan = 0usize;
-            while scan + 4 < nal_data.len() {
-                if nal_data[scan] == 0
-                    && nal_data[scan + 1] == 0
-                    && nal_data[scan + 2] == 0
-                    && nal_data[scan + 3] == 1
-                {
-                    scan += 4;
-                    if scan < nal_data.len() {
-                        let nal_type = nal_data[scan] & 0x1F;
-                        let nal_name = match nal_type {
-                            1 => "P-slice",
-                            5 => "IDR",
-                            6 => "SEI",
-                            7 => "SPS",
-                            8 => "PPS",
-                            9 => "AUD",
-                            _ => "other",
-                        };
-                        nal_types.push(format!("{}({})", nal_name, nal_type));
-                    }
-                } else {
-                    scan += 1;
-                }
-            }
-            tracing::info!(
-                frame = self.frame_count,
-                output_bytes = nal_data.len(),
-                is_keyframe,
-                nal_units = nal_types.join(", "),
-                "VideoToolbox zero-copy NAL diagnostic"
-            );
+            log_nal_diagnostic(self.frame_count, &nal_data, is_keyframe, "VideoToolbox zero-copy NAL diagnostic");
         }
 
         Ok(EncodedFrame {
@@ -1131,6 +1089,10 @@ impl VideoEncoder for VtEncoder {
         height: u32,
         stride: usize,
     ) -> Result<Avc444EncodedFrame> {
+        // Force IDR on both streams when requested, to keep them in sync.
+        // Must be called before borrowing self.yuv444_buf.
+        let frame_props = self.take_force_keyframe_props();
+
         let bufs = self
             .yuv444_buf
             .as_mut()
@@ -1163,25 +1125,6 @@ impl VideoEncoder for VtEncoder {
         // Single encoder session, sequential: main (frame 2N) then aux (frame 2N+1).
         let frame_duration = (600.0 / self.fps as f64) as i64;
         let duration = CMTime::make(frame_duration, 600);
-
-        // Build frame properties dict to force IDR on both streams when requested
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    1,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
 
         // Step 2: Encode main view — standard YUV420 from B-area split
         let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);

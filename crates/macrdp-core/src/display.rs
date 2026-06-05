@@ -838,6 +838,18 @@ impl MacDisplayUpdates {
         self.backpressure_skip_remaining = skip;
     }
 
+    fn record_gfx_frame_sent(&mut self, encode_ms: f64, frame_bytes: usize, pending_acks: u32) {
+        {
+            let mut st = self.gfx_state.lock().unwrap();
+            st.last_encode_ms = encode_ms;
+            st.last_frame_bytes = frame_bytes as u32;
+        }
+        self.frame_pacer.record_encode(encode_ms);
+        self.frame_pacer.record_sent(Instant::now());
+        self.update_backpressure(pending_acks);
+        self.idle_frames.record_sent(Instant::now());
+    }
+
     fn apply_adaptive_bitrate(&mut self) {
         let target_bitrate = {
             let state = self.gfx_state.lock().unwrap();
@@ -940,15 +952,7 @@ impl MacDisplayUpdates {
                                     encode_ms = format!("{:.1}", encode_ms),
                                     "Display: sending zero-copy GFX frame"
                                 );
-                                {
-                                    let mut st = self.gfx_state.lock().unwrap();
-                                    st.last_encode_ms = encode_ms;
-                                    st.last_frame_bytes = encoded.data.len() as u32;
-                                }
-                                self.frame_pacer.record_encode(encode_ms);
-                                self.frame_pacer.record_sent(Instant::now());
-                                self.update_backpressure(pending_acks);
-                                self.idle_frames.record_sent(Instant::now());
+                                self.record_gfx_frame_sent(encode_ms, encoded.data.len(), pending_acks);
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
@@ -990,15 +994,7 @@ impl MacDisplayUpdates {
                                 encode_ms = format!("{:.1}", encode_ms),
                                 "Display: sending AVC444 GFX frame"
                             );
-                            {
-                                let mut st = self.gfx_state.lock().unwrap();
-                                st.last_encode_ms = encode_ms;
-                                st.last_frame_bytes = total_bytes as u32;
-                            }
-                            self.frame_pacer.record_encode(encode_ms);
-                            self.frame_pacer.record_sent(Instant::now());
-                            self.update_backpressure(pending_acks);
-                            self.idle_frames.record_sent(Instant::now());
+                            self.record_gfx_frame_sent(encode_ms, total_bytes, pending_acks);
                             return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
                                 width: frame.width as u16,
@@ -1037,15 +1033,7 @@ impl MacDisplayUpdates {
                             encode_ms = format!("{:.1}", encode_ms),
                             "Display: sending GFX frame"
                         );
-                        {
-                            let mut st = self.gfx_state.lock().unwrap();
-                            st.last_encode_ms = encode_ms;
-                            st.last_frame_bytes = encoded.data.len() as u32;
-                        }
-                        self.frame_pacer.record_encode(encode_ms);
-                        self.frame_pacer.record_sent(Instant::now());
-                        self.update_backpressure(pending_acks);
-                        self.idle_frames.record_sent(Instant::now());
+                        self.record_gfx_frame_sent(encode_ms, encoded.data.len(), pending_acks);
                         return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
                             width: frame.width as u16,
