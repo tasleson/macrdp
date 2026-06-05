@@ -627,12 +627,11 @@ impl Sequence for Acceptor {
 
                     let credential_check = check_credentials(self.creds.as_ref(), &creds);
 
-                    if credential_check != CredentialCheck::Accepted {
+                    if credential_check == CredentialCheck::Rejected {
                         warn!(
                             client_user = %creds.username,
                             client_domain = ?creds.domain,
                             server_user = ?self.creds.as_ref().map(|c| &c.username),
-                            credential_check = ?credential_check,
                             "Credential mismatch \u{2014} rejecting"
                         );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
@@ -650,7 +649,11 @@ impl Sequence for Acceptor {
 
                         return Err(ConnectorError::general("invalid credentials"));
                     }
-                    debug!(user = %creds.username, domain = ?creds.domain, "Credentials accepted");
+                    if credential_check == CredentialCheck::NeedsClientPrompt {
+                        debug!(user = %creds.username, domain = ?creds.domain, "Empty credentials — client will prompt user");
+                    } else {
+                        debug!(user = %creds.username, domain = ?creds.domain, "Credentials accepted");
+                    }
                 }
 
                 (
