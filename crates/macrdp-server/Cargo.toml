@@ -13,6 +13,9 @@ clap = { version = "4", features = ["derive"] }
 keyring = "3"
 rpassword = "7"
 
+[build-dependencies]
+macrdp-build = { path = "../macrdp-build" }
+
 [dev-dependencies]
 tempfile = "3"
 toml = "0.8"

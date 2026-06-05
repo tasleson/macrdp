@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/macrdp-server",
     "crates/macrdp-core",
+    "crates/macrdp-build",
     "crates/macrdp-capture",
     "crates/macrdp-input",
     "crates/macrdp-encode",

@@ -57,24 +57,10 @@ impl Database {
         let client_name = client_name.unwrap_or("");
         let today = now.format("%Y-%m-%d").to_string();
 
-        conn.execute(
-            "INSERT INTO connections (client_ip, client_name, connected_at, disconnected_at, duration_secs, bytes_total)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-            rusqlite::params![client_ip, client_name, connected_at, disconnected_at, bytes_total as i64],
+        insert_connection_and_traffic(
+            &conn, client_ip, client_name, connected_at, &disconnected_at,
+            0, bytes_total, &today,
         )
-        .map_err(|e| format!("Failed to insert connection: {}", e))?;
-
-        conn.execute(
-            "INSERT INTO traffic_daily (date, bytes_sent, connection_count)
-             VALUES (?1, ?2, 1)
-             ON CONFLICT(date) DO UPDATE SET
-                 bytes_sent = bytes_sent + excluded.bytes_sent,
-                 connection_count = connection_count + 1",
-            rusqlite::params![today, bytes_total as i64],
-        )
-        .map_err(|e| format!("Failed to upsert traffic_daily: {}", e))?;
-
-        Ok(())
     }
 
     /// Record a disconnection with full details (connected_at, duration, etc.).
@@ -92,24 +78,10 @@ impl Database {
 
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-        conn.execute(
-            "INSERT INTO connections (client_ip, client_name, connected_at, disconnected_at, duration_secs, bytes_total)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![client_ip, client_name, connected_at, disconnected_at, duration_secs as i64, bytes_total as i64],
+        insert_connection_and_traffic(
+            &conn, client_ip, client_name, connected_at, disconnected_at,
+            duration_secs, bytes_total, &today,
         )
-        .map_err(|e| format!("Failed to insert connection: {}", e))?;
-
-        conn.execute(
-            "INSERT INTO traffic_daily (date, bytes_sent, connection_count)
-             VALUES (?1, ?2, 1)
-             ON CONFLICT(date) DO UPDATE SET
-                 bytes_sent = bytes_sent + excluded.bytes_sent,
-                 connection_count = connection_count + 1",
-            rusqlite::params![today, bytes_total as i64],
-        )
-        .map_err(|e| format!("Failed to upsert traffic_daily: {}", e))?;
-
-        Ok(())
     }
 
     /// Retrieve connection history with pagination.
@@ -193,4 +165,34 @@ impl Database {
     ) -> Result<Vec<serde_json::Value>, String> {
         Ok(vec![])
     }
+}
+
+fn insert_connection_and_traffic(
+    conn: &Connection,
+    client_ip: &str,
+    client_name: &str,
+    connected_at: &str,
+    disconnected_at: &str,
+    duration_secs: u64,
+    bytes_total: u64,
+    today: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO connections (client_ip, client_name, connected_at, disconnected_at, duration_secs, bytes_total)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![client_ip, client_name, connected_at, disconnected_at, duration_secs as i64, bytes_total as i64],
+    )
+    .map_err(|e| format!("Failed to insert connection: {}", e))?;
+
+    conn.execute(
+        "INSERT INTO traffic_daily (date, bytes_sent, connection_count)
+         VALUES (?1, ?2, 1)
+         ON CONFLICT(date) DO UPDATE SET
+             bytes_sent = bytes_sent + excluded.bytes_sent,
+             connection_count = connection_count + 1",
+        rusqlite::params![today, bytes_total as i64],
+    )
+    .map_err(|e| format!("Failed to upsert traffic_daily: {}", e))?;
+
+    Ok(())
 }
