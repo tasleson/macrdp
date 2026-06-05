@@ -989,6 +989,116 @@ impl VtEncoder {
             std::ptr::null()
         }
     }
+
+    /// Submit a frame for async encoding (reset callback + submit). Returns immediately.
+    fn submit_session_frame(
+        session: VTCompressionSessionRef,
+        ctx: &Arc<CallbackCtx>,
+        pixel_buffer: CVPixelBufferRef,
+        pts: CMTime,
+        duration: CMTime,
+        frame_properties: CFDictionaryRef,
+    ) -> Result<()> {
+        {
+            let mut guard = ctx.output.lock().unwrap();
+            *guard = None;
+            ctx.has_data
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        unsafe {
+            let status = VTCompressionSessionEncodeFrame(
+                session,
+                pixel_buffer,
+                pts,
+                duration,
+                frame_properties,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if status != 0 {
+                anyhow::bail!("VTCompressionSessionEncodeFrame failed: {status}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect the result from a previous submit. Blocks up to `timeout`.
+    fn collect_session_frame(
+        session: VTCompressionSessionRef,
+        ctx: &Arc<CallbackCtx>,
+        timeout: std::time::Duration,
+    ) -> Result<Option<(Vec<u8>, bool)>> {
+        let timed_out;
+        {
+            let guard = ctx.output.lock().unwrap();
+            let (guard2, wait_result) = ctx
+                .ready
+                .wait_timeout_while(guard, timeout, |_| {
+                    !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
+                })
+                .unwrap();
+            timed_out = wait_result.timed_out();
+            drop(guard2);
+        }
+
+        if timed_out {
+            tracing::warn!("VT collect timeout \u{2014} forcing CompleteFrames");
+            unsafe {
+                let pts = CMTime {
+                    value: 0,
+                    timescale: 1,
+                    flags: 0,
+                    epoch: 0,
+                };
+                VTCompressionSessionCompleteFrames(session, pts);
+            }
+            let guard = ctx.output.lock().unwrap();
+            let (guard2, _) = ctx
+                .ready
+                .wait_timeout_while(guard, std::time::Duration::from_millis(50), |_| {
+                    !ctx.has_data.load(std::sync::atomic::Ordering::Acquire)
+                })
+                .unwrap();
+            drop(guard2);
+        }
+
+        let mut guard = ctx.output.lock().unwrap();
+        if ctx.has_data.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(guard.take())
+        } else {
+            tracing::warn!("VT collect: no data after timeout + CompleteFrames");
+            Ok(None)
+        }
+    }
+
+    /// Compute PTS and duration for the current frame.
+    fn make_pts_duration(&self) -> (CMTime, CMTime) {
+        let frame_duration = (600.0 / self.fps as f64) as i64;
+        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
+        let duration = CMTime::make(frame_duration, 600);
+        (pts, duration)
+    }
+
+    /// Build a force-keyframe properties dict if pending, otherwise return null.
+    fn make_force_keyframe_props(&mut self) -> CFDictionaryRef {
+        if self.pending_force_keyframe {
+            self.pending_force_keyframe = false;
+            unsafe {
+                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+                CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    1,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            }
+        } else {
+            std::ptr::null()
+        }
+    }
 }
 
 /// Log a NAL-unit breakdown for the first 10 frames of a session.
@@ -1284,6 +1394,80 @@ impl VideoEncoder for VtEncoder {
 
     fn supports_444(&self) -> bool {
         self.mode_444
+    }
+
+    fn supports_pipelining(&self) -> bool {
+        true
+    }
+
+    fn submit_bgra(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> Result<()> {
+        let pixel_buffer =
+            self.create_nv12_vimage(self.session, self.width, self.height, data, width, height, stride)?;
+        let (pts, duration) = self.make_pts_duration();
+        let frame_props = self.make_force_keyframe_props();
+
+        let result = Self::submit_session_frame(
+            self.session,
+            &self.callback_ctx,
+            pixel_buffer,
+            pts,
+            duration,
+            frame_props,
+        );
+
+        if !frame_props.is_null() {
+            unsafe {
+                CFRelease(frame_props);
+            }
+        }
+        unsafe {
+            CVPixelBufferRelease(pixel_buffer);
+        }
+        self.frame_count += 1;
+        result
+    }
+
+    fn submit_pixel_buffer(&mut self, ptr: *mut std::ffi::c_void) -> Result<()> {
+        let (pts, duration) = self.make_pts_duration();
+        let frame_props = self.make_force_keyframe_props();
+
+        let result = Self::submit_session_frame(
+            self.session,
+            &self.callback_ctx,
+            ptr as CVPixelBufferRef,
+            pts,
+            duration,
+            frame_props,
+        );
+
+        if !frame_props.is_null() {
+            unsafe {
+                CFRelease(frame_props);
+            }
+        }
+        self.frame_count += 1;
+        result
+    }
+
+    fn collect_encoded(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<EncodedFrame>> {
+        match Self::collect_session_frame(self.session, &self.callback_ctx, timeout)? {
+            Some((nal_data, is_keyframe)) => Ok(Some(EncodedFrame {
+                data: Bytes::from(nal_data),
+                is_keyframe,
+                width: self.width,
+                height: self.height,
+            })),
+            None => Ok(None),
+        }
     }
 }
 
