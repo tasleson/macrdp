@@ -346,7 +346,10 @@ pub async fn start_server_with_options(
 
     // HiDPI
     let hidpi_scale = config.hidpi_scale.unwrap_or(1).clamp(1, 4);
-    let (width, height) = (width * hidpi_scale as u16, height * hidpi_scale as u16);
+    let (width, height) = (
+        width.saturating_mul(hidpi_scale as u16),
+        height.saturating_mul(hidpi_scale as u16),
+    );
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
