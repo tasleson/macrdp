@@ -8,6 +8,7 @@ use bytes::Bytes;
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 // --- FFI declarations ---
@@ -411,6 +412,9 @@ pub struct VtEncoder {
     mode_444: bool,
     yuv444_buf: Option<Yuv444SplitBufs>,
     pending_force_keyframe: bool,
+    vimage: Option<VImageConverter>,
+    nv12_y_buf: Vec<u8>,
+    nv12_uv_buf: Vec<u8>,
 }
 
 // VTCompressionSession is thread-safe per Apple docs
@@ -446,6 +450,13 @@ impl VtEncoder {
             None
         };
 
+        let vimage = VImageConverter::new()
+            .map_err(|e| tracing::warn!("vImage init failed: {e}"))
+            .ok();
+
+        let nv12_y_buf = vec![0u8; (width * height) as usize];
+        let nv12_uv_buf = vec![0u8; (width * height / 2) as usize];
+
         tracing::info!(
             width,
             height,
@@ -467,6 +478,9 @@ impl VtEncoder {
             mode_444,
             yuv444_buf,
             pending_force_keyframe: false,
+            vimage,
+            nv12_y_buf,
+            nv12_uv_buf,
         })
     }
 
@@ -718,6 +732,94 @@ impl VtEncoder {
         Ok(pb)
     }
 
+    /// Create NV12 CVPixelBuffer using vImage SIMD acceleration.
+    /// Falls back to scalar create_nv12_from_bgra_fast if vImage unavailable.
+    fn create_nv12_vimage(
+        &mut self,
+        session: VTCompressionSessionRef,
+        enc_w: u32,
+        enc_h: u32,
+        data: &[u8],
+        src_w: u32,
+        src_h: u32,
+        stride: usize,
+    ) -> Result<CVPixelBufferRef> {
+        let vimage = match &self.vimage {
+            Some(v) => v,
+            None => {
+                return Self::create_nv12_from_bgra_fast(
+                    session, enc_w, enc_h, data, src_w, src_h, stride,
+                )
+            }
+        };
+
+        let w = src_w.min(enc_w) as usize;
+        let h = src_h.min(enc_h) as usize;
+        let y_size = w * h;
+        let uv_size = w * h / 2;
+
+        if self.nv12_y_buf.len() < y_size {
+            self.nv12_y_buf.resize(y_size, 0);
+        }
+        if self.nv12_uv_buf.len() < uv_size {
+            self.nv12_uv_buf.resize(uv_size, 0);
+        }
+
+        vimage
+            .bgra_to_nv12(
+                data,
+                src_w,
+                src_h,
+                stride,
+                &mut self.nv12_y_buf[..y_size],
+                &mut self.nv12_uv_buf[..uv_size],
+            )
+            .map_err(|e| anyhow::anyhow!("vImage bgra_to_nv12 failed: {e}"))?;
+
+        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
+        unsafe {
+            let pool = VTCompressionSessionGetPixelBufferPool(session);
+            if pool.is_null() {
+                anyhow::bail!("VT pixel buffer pool is null");
+            }
+            let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
+            if status != 0 || pb.is_null() {
+                anyhow::bail!("Pool alloc failed: {status}");
+            }
+
+            CVPixelBufferLockBaseAddress(pb, 0);
+            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
+            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
+            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+
+            if y_base.is_null() || uv_base.is_null() {
+                CVPixelBufferUnlockBaseAddress(pb, 0);
+                CVPixelBufferRelease(pb);
+                anyhow::bail!("NV12 plane is null");
+            }
+
+            for row in 0..h {
+                std::ptr::copy_nonoverlapping(
+                    self.nv12_y_buf[row * w..].as_ptr(),
+                    y_base.add(row * y_bpr),
+                    w,
+                );
+            }
+            let uv_h = h / 2;
+            for row in 0..uv_h {
+                std::ptr::copy_nonoverlapping(
+                    self.nv12_uv_buf[row * w..].as_ptr(),
+                    uv_base.add(row * uv_bpr),
+                    w,
+                );
+            }
+
+            CVPixelBufferUnlockBaseAddress(pb, 0);
+        }
+        Ok(pb)
+    }
+
     /// Allocate NV12 pixel buffer from VT session's pool (IOSurface-backed, hardware compatible)
     /// and fill with I420 plane data.
     fn create_nv12_from_session_pool(
@@ -955,15 +1057,9 @@ impl VideoEncoder for VtEncoder {
         let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let duration = CMTime::make(frame_duration, 600);
 
-        // Convert BGRA → NV12 full-range via session pool buffer.
-        let pixel_buffer = Self::create_nv12_from_bgra_fast(
-            self.session,
-            self.width,
-            self.height,
-            data,
-            width,
-            height,
-            stride,
+        // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
+        let pixel_buffer = self.create_nv12_vimage(
+            self.session, self.width, self.height, data, width, height, stride,
         )?;
 
         let frame_props = self.take_force_keyframe_props();
