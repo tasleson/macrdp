@@ -650,7 +650,7 @@ impl Sequence for Acceptor {
                         return Err(ConnectorError::general("invalid credentials"));
                     }
                     if credential_check == CredentialCheck::NeedsClientPrompt {
-                        debug!(user = %creds.username, domain = ?creds.domain, "Empty credentials — client will prompt user");
+                        debug!(user = %creds.username, domain = ?creds.domain, "Empty credentials \u{2014} client will prompt user");
                     } else {
                         debug!(user = %creds.username, domain = ?creds.domain, "Credentials accepted");
                     }
