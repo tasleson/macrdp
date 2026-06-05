@@ -157,18 +157,21 @@ impl SCStreamOutputTrait for OutputHandler {
     }
 }
 
-fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
+fn should_skip_frame(sample: &CMSampleBuffer) -> bool {
     use screencapturekit::cm::SCFrameStatus;
-
-    // Skip non-complete frames (idle, blank, suspended, etc.)
-    match sample.frame_status() {
+    matches!(
+        sample.frame_status(),
         Some(SCFrameStatus::Idle)
-        | Some(SCFrameStatus::Blank)
-        | Some(SCFrameStatus::Suspended)
-        | Some(SCFrameStatus::Stopped) => {
-            return None;
-        }
-        _ => {}
+            | Some(SCFrameStatus::Blank)
+            | Some(SCFrameStatus::Suspended)
+            | Some(SCFrameStatus::Stopped)
+    )
+}
+
+fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
+    // Skip non-complete frames (idle, blank, suspended, etc.)
+    if should_skip_frame(sample) {
+        return None;
     }
 
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
@@ -209,17 +212,9 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
 /// Extract a frame in NV12 mode — zero-copy CVPixelBuffer wrapped as SafePixelBuffer.
 /// The pixel buffer is retained and passed through the channel without locking or copying.
 fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
-    use screencapturekit::cm::SCFrameStatus;
-
     // Skip non-complete frames (idle, blank, suspended, etc.)
-    match sample.frame_status() {
-        Some(SCFrameStatus::Idle)
-        | Some(SCFrameStatus::Blank)
-        | Some(SCFrameStatus::Suspended)
-        | Some(SCFrameStatus::Stopped) => {
-            return None;
-        }
-        _ => {}
+    if should_skip_frame(sample) {
+        return None;
     }
 
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
