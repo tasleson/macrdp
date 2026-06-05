@@ -1,5 +1,7 @@
 //! OpenH264 software H.264 encoder optimized for screen content
 
+use std::ffi::c_void;
+
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use openh264::encoder::{Encoder, EncoderConfig, FrameType};
@@ -336,13 +338,46 @@ impl VideoEncoder for OpenH264Encoder {
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {
+        if self.target_bitrate == bitrate_bps {
+            return;
+        }
         self.target_bitrate = bitrate_bps;
-        tracing::info!(
-            bitrate_mbps = bitrate_bps as f64 / 1_000_000.0,
-            "Bitrate updated"
-        );
-        // OpenH264 doesn't support runtime bitrate change without reinit
-        // The new bitrate will take effect on encoder recreation
+        unsafe {
+            let raw = self.encoder.raw_api();
+            let mut bitrate_info = openh264_sys2::SBitrateInfo {
+                iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+                iBitrate: bitrate_bps as i32,
+            };
+            let ret = raw.set_option(
+                openh264_sys2::ENCODER_OPTION_BITRATE,
+                &mut bitrate_info as *mut _ as *mut c_void,
+            );
+            if ret != 0 {
+                tracing::warn!(
+                    ret,
+                    "OpenH264 set_option(BITRATE) failed, bitrate change deferred"
+                );
+            } else {
+                tracing::info!(
+                    bitrate_mbps = bitrate_bps as f64 / 1_000_000.0,
+                    "Bitrate updated via SetOption"
+                );
+            }
+        }
+        if let Some(ref mut aux) = self.encoder_aux {
+            let aux_bitrate = (bitrate_bps as f64 * 0.7) as u32;
+            unsafe {
+                let raw = aux.raw_api();
+                let mut bitrate_info = openh264_sys2::SBitrateInfo {
+                    iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+                    iBitrate: aux_bitrate as i32,
+                };
+                let _ = raw.set_option(
+                    openh264_sys2::ENCODER_OPTION_BITRATE,
+                    &mut bitrate_info as *mut _ as *mut c_void,
+                );
+            }
+        }
     }
 
     fn force_keyframe(&mut self) {
