@@ -266,9 +266,11 @@ fn write_pasteboard_text(text: &str) -> anyhow::Result<()> {
     let mut child = Command::new("/usr/bin/pbcopy")
         .stdin(Stdio::piped())
         .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(text.as_bytes())?;
-    }
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("pbcopy stdin not available"))?
+        .write_all(text.as_bytes())?;
 
     let status = child.wait()?;
     anyhow::ensure!(status.success(), "pbcopy exited with status {status}");
