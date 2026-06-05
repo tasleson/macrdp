@@ -523,6 +523,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.quality,
             args.encoder_pref,
             args.mode_444,
+            args.config.show_cursor.unwrap_or(true),
             bitrate_override,
             skip_unchanged,
             idle_keyframe_sec,

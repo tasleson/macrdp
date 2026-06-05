@@ -67,6 +67,11 @@ frame_rate = 60
 # Mouse coordinates are automatically mapped back to logical points.
 # hidpi_scale = 2
 
+# Include the macOS cursor in captured video frames.
+# Default: true. This shows real macOS cursor shapes such as resize handles and
+# text I-beams. When disabled, macrdp sends a fixed synthetic RDP arrow cursor.
+# show_cursor = true
+
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 
 # Video quality preset

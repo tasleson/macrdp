@@ -3,7 +3,7 @@ use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     gfx::GfxState, BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate,
-    PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
+    PixelFormat as RdpPixelFormat, RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use macrdp_capture::{
     CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, Rect,
@@ -33,6 +33,7 @@ const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
 const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
 const ADAPTIVE_BITRATE_FLOOR_BPS: u32 = 500_000;
 const GFX_CAPS_WAIT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_CURSOR_SIZE: u16 = 24;
 
 /// Compute the clamped bounding box `(x, y, width, height)` that covers every
 /// dirty rect, or `None` when there is nothing worth sending: no rects, or a
@@ -85,6 +86,7 @@ pub struct MacDisplay {
     encoder_pref: macrdp_encode::EncoderPreference,
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
+    show_cursor: bool,
     base_bitrate: u32,
     skip_unchanged: bool,
     idle_keyframe_interval: Option<Duration>,
@@ -107,6 +109,7 @@ impl MacDisplay {
         quality: Quality,
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
+        show_cursor: bool,
         bitrate_override: Option<u32>,
         skip_unchanged: bool,
         idle_keyframe_sec: Option<u32>,
@@ -131,6 +134,7 @@ impl MacDisplay {
             quality,
             encoder_pref,
             mode_444,
+            show_cursor,
             base_bitrate,
             skip_unchanged,
             idle_keyframe_interval: idle_keyframe_sec
@@ -273,6 +277,7 @@ impl RdpServerDisplay for MacDisplay {
             height: self.height as u32,
             frame_rate: self.frame_rate,
             pixel_format: CapturePixelFormat::Bgra,
+            show_cursor: self.show_cursor,
         };
         let capturer = ScreenCapturer::new(preliminary_config).await?;
 
@@ -335,6 +340,7 @@ impl RdpServerDisplay for MacDisplay {
             height: self.height as u32,
             frame_rate: self.frame_rate,
             pixel_format: capture_pixel_format(self.mode_444, encoder.as_deref()),
+            show_cursor: self.show_cursor,
         };
 
         // The preliminary capturer used BGRA; recreate if the encoder needs NV12.
@@ -359,7 +365,69 @@ impl RdpServerDisplay for MacDisplay {
             last_backpressure_warn: None,
             gfx_wait_frames: 0,
             gfx_no_caps_frames: 0,
+            sent_pointer: false,
         }))
+    }
+}
+
+fn default_arrow_pointer() -> RGBAPointer {
+    let size = DEFAULT_CURSOR_SIZE as usize;
+    let mut top_down = vec![0u8; size * size * 4];
+
+    let mut set_pixel = |x: usize, y: usize, color: [u8; 4]| {
+        if x < size && y < size {
+            let i = (y * size + x) * 4;
+            top_down[i..i + 4].copy_from_slice(&color);
+        }
+    };
+
+    for y in 0..18usize {
+        let fill_end = if y < 12 {
+            y
+        } else if y < 15 {
+            11
+        } else {
+            5
+        };
+
+        for x in 0..=fill_end {
+            let border = x == 0 || x == fill_end || y == 0 || (y >= 12 && (x == 5 || x == 11));
+            set_pixel(
+                x,
+                y,
+                if border {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                },
+            );
+        }
+    }
+
+    // RDP 32bpp pointer XOR masks are stored bottom-up as BGRA.
+    let mut data = Vec::with_capacity(top_down.len());
+    for y in (0..size).rev() {
+        for x in 0..size {
+            let i = (y * size + x) * 4;
+            let [r, g, b, a] = top_down[i..i + 4].try_into().unwrap();
+            data.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+
+    RGBAPointer {
+        width: DEFAULT_CURSOR_SIZE,
+        height: DEFAULT_CURSOR_SIZE,
+        hot_x: 0,
+        hot_y: 0,
+        data,
+    }
+}
+
+fn initial_pointer_update(show_captured_cursor: bool) -> DisplayUpdate {
+    if show_captured_cursor {
+        DisplayUpdate::HidePointer
+    } else {
+        DisplayUpdate::RGBAPointer(default_arrow_pointer())
     }
 }
 
@@ -394,6 +462,8 @@ struct MacDisplayUpdates {
     gfx_wait_frames: u64,
     /// Consecutive frames spent with the GFX channel open but no capabilities advertised
     gfx_no_caps_frames: u64,
+    /// Some clients hide their local cursor and wait for a server pointer shape.
+    sent_pointer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -654,6 +724,13 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // ever surface an actual `DisplayUpdate`; genuine capture loss is
         // handled inline by the CoreGraphics fallback below.
         'outer: loop {
+            if !self.sent_pointer {
+                self.sent_pointer = true;
+                return Ok(Some(initial_pointer_update(
+                    self.capture_config.show_cursor,
+                )));
+            }
+
             // Debounce resize: only fire after no new request for RESIZE_DEBOUNCE.
             // During a window drag, the client sends a new display-control PDU
             // every mouse-move frame; we coalesce them into a single reactivation
@@ -879,13 +956,11 @@ impl MacDisplayUpdates {
                             }
                             Ok(_) => {
                                 tracing::warn!("Zero-copy encode returned empty data");
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
+                                return Ok(None);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Zero-copy encode failed: {e}, falling back to DefaultPointer"
-                                );
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
+                                tracing::warn!("Zero-copy encode failed: {e}, dropping frame");
+                                return Ok(None);
                             }
                         }
                     }
@@ -934,7 +1009,7 @@ impl MacDisplayUpdates {
                                 display_frame = self.display_frame_count,
                                 "AVC444 encode returned EMPTY data — frame dropped!"
                             );
-                            return Ok(Some(DisplayUpdate::DefaultPointer));
+                            return Ok(None);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -981,7 +1056,7 @@ impl MacDisplayUpdates {
                             display_frame = self.display_frame_count,
                             "H.264 encode returned EMPTY data — frame dropped!"
                         );
-                        return Ok(Some(DisplayUpdate::DefaultPointer));
+                        return Ok(None);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1003,7 +1078,7 @@ impl MacDisplayUpdates {
                     "GFX not ready — waiting for DVC channel/capabilities (white screen until ready)"
                 );
             }
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            return Ok(None);
         } else if gfx.hopeless {
             // GFX cannot become usable. Fall through to bitmap path, which only
             // works if capture is BGRA, not NV12/PixelBuffer.
@@ -1044,12 +1119,12 @@ impl MacDisplayUpdates {
                     tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
                 }
             }
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            return Ok(None);
         }
 
         let FrameData::Raw(bgra_bitmap) = &frame.data else {
             tracing::warn!("Bitmap fallback reached without BGRA frame data");
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            return Ok(None);
         };
 
         let now = Instant::now();
@@ -1150,6 +1225,7 @@ mod tests {
             Quality::Balanced,
             macrdp_encode::EncoderPreference::Software,
             false,
+            false,
             None,
             false,
             None,
@@ -1164,6 +1240,33 @@ mod tests {
             .unwrap()
             .as_ref()
             .map(|(ds, _)| *ds)
+    }
+
+    #[test]
+    fn default_arrow_pointer_has_expected_shape() {
+        let pointer = default_arrow_pointer();
+
+        assert_eq!(pointer.width, DEFAULT_CURSOR_SIZE);
+        assert_eq!(pointer.height, DEFAULT_CURSOR_SIZE);
+        assert_eq!(pointer.hot_x, 0);
+        assert_eq!(pointer.hot_y, 0);
+        assert_eq!(
+            pointer.data.len(),
+            DEFAULT_CURSOR_SIZE as usize * DEFAULT_CURSOR_SIZE as usize * 4
+        );
+        assert!(pointer.data.chunks_exact(4).any(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn initial_pointer_update_hides_client_pointer_when_cursor_is_captured() {
+        assert!(matches!(
+            initial_pointer_update(true),
+            DisplayUpdate::HidePointer
+        ));
+        assert!(matches!(
+            initial_pointer_update(false),
+            DisplayUpdate::RGBAPointer(_)
+        ));
     }
 
     struct StubEncoder {
@@ -1358,6 +1461,7 @@ mod tests {
             Quality::Balanced,
             macrdp_encode::EncoderPreference::Software,
             false,
+            false,
             None,
             false,
             None,
@@ -1389,6 +1493,7 @@ mod tests {
             60,
             Quality::Balanced,
             macrdp_encode::EncoderPreference::Software,
+            false,
             false,
             None,
             false,
@@ -1802,6 +1907,7 @@ mod tests {
             Quality::Balanced,
             macrdp_encode::EncoderPreference::Auto,
             false,
+            false,
             None,
             false,
             None,
@@ -1823,6 +1929,7 @@ mod tests {
             Quality::Balanced,
             macrdp_encode::EncoderPreference::Auto,
             false,
+            false,
             None,
             false,
             None,
@@ -1843,6 +1950,7 @@ mod tests {
             60,
             Quality::Balanced,
             macrdp_encode::EncoderPreference::Software,
+            false,
             false,
             None,
             false,

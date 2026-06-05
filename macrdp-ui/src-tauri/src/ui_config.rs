@@ -45,7 +45,7 @@ impl Default for UiConfig {
             username: "macrdp".to_string(),
             password: String::new(),
             hidpi_scale: 2,
-            show_cursor: false,
+            show_cursor: true,
             log_level: "warn".to_string(),
             theme: "system".to_string(),
             autostart: false,
@@ -211,10 +211,12 @@ impl UiConfig {
             log_path: None,
             idle_timeout_secs: self.idle_timeout_secs,
             log_level: Some(self.log_level.clone()),
+            log_format: None,
             quality: None,
             encoder: Some(self.encoder.clone()),
             chroma_mode: Some(self.chroma_mode.clone()),
             hidpi_scale: Some(self.hidpi_scale),
+            show_cursor: Some(self.show_cursor),
             bitrate_mbps: Some(self.bitrate_mbps),
             skip_unchanged: None,
             idle_keyframe_sec: None,
@@ -249,5 +251,12 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, "unknown config key: max_connections");
+    }
+
+    #[test]
+    fn default_config_shows_captured_cursor() {
+        let config = UiConfig::default();
+        assert!(config.show_cursor);
+        assert_eq!(config.to_server_config().show_cursor, Some(true));
     }
 }

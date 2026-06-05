@@ -126,6 +126,7 @@ pub struct CaptureConfig {
     pub height: u32,
     pub frame_rate: u32,
     pub pixel_format: CapturePixelFormat,
+    pub show_cursor: bool,
 }
 
 /// Screen capturer using ScreenCaptureKit
@@ -361,7 +362,7 @@ impl ScreenCapturer {
                 CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
                 CapturePixelFormat::Bgra => PixelFormat::BGRA,
             })
-            .with_shows_cursor(true);
+            .with_shows_cursor(config.show_cursor);
 
         // Channel for frames: buffer 2 frames to allow for jitter
         let (frame_tx, frame_rx) = mpsc::channel(2);

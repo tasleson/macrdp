@@ -35,6 +35,9 @@ pub struct ServerConfig {
     pub chroma_mode: Option<String>,
     /// HiDPI scale factor (default: 1)
     pub hidpi_scale: Option<u32>,
+    /// Include the macOS cursor in captured frames. Usually false for RDP
+    /// because clients draw a local cursor.
+    pub show_cursor: Option<bool>,
     /// Target bitrate in Mbps (default: auto-calculated)
     pub bitrate_mbps: Option<u32>,
     /// Skip encoding unchanged frames when capture can detect them.
@@ -67,6 +70,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("encoder", &self.encoder)
             .field("chroma_mode", &self.chroma_mode)
             .field("hidpi_scale", &self.hidpi_scale)
+            .field("show_cursor", &self.show_cursor)
             .field("bitrate_mbps", &self.bitrate_mbps)
             .field("skip_unchanged", &self.skip_unchanged)
             .field("idle_keyframe_sec", &self.idle_keyframe_sec)
@@ -95,6 +99,7 @@ impl Default for ServerConfig {
             encoder: None,
             chroma_mode: None,
             hidpi_scale: None,
+            show_cursor: None,
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,
@@ -222,6 +227,15 @@ mod tests {
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.skip_unchanged, Some(false));
         assert_eq!(config.idle_keyframe_sec, Some(5));
+    }
+
+    #[test]
+    fn test_parse_cursor_capture_config() {
+        let toml_str = r#"
+            show_cursor = true
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.show_cursor, Some(true));
     }
 
     #[test]
