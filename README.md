@@ -22,6 +22,9 @@ A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or
 - **High fidelity color** — AVC444 mode for pixel-perfect color reproduction (RDP 10)
 - **Full keyboard & mouse** — complete input injection with 104-key mapping, numpad, modifiers, scroll
 - **HiDPI / Retina support** — capture at 2x/3x resolution for sharp 4K remote display
+- **Dynamic resolution** — automatically follows client window resize; the server reacts to display-control PDUs and adjusts the session resolution on the fly
+- **Native cursor embedding** — real macOS cursor shapes (resize handles, I-beams, etc.) are streamed in the video; configurable via `show_cursor`
+- **Display sleep tolerance** — server starts and accepts connections even when the Mac display is asleep; the display is woken automatically on the first client connect
 - **Configurable** — resolution, frame rate, bitrate, encoder, quality presets, all via simple TOML config
 - **Secure** — NLA/CredSSP authentication with auto-generated TLS certificates
 - **Lock screen capture** — automatic CoreGraphics fallback when the screen is locked
@@ -40,15 +43,23 @@ A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or
 
 ## Quick Start
 
+**Option A — pre-built binary (Apple Silicon)**
+
+Download the latest `macrdp-server-*-aarch64-apple-darwin.tar.gz` from [GitHub Releases](https://github.com/tasleson/macrdp/releases), then:
+
 ```bash
-# Build
-cargo build --release
-
-# Run
-cargo run --release --bin macrdp-server
-
-# Connect from any RDP client → your-mac-ip:3389
+tar -xzf macrdp-server-*-aarch64-apple-darwin.tar.gz
+./macrdp-server
 ```
+
+**Option B — build from source**
+
+```bash
+cargo build --release
+cargo run --release --bin macrdp-server
+```
+
+Connect from any RDP client → `your-mac-ip:3389`
 
 macrdp v1 supports one active RDP client at a time. Starting a second concurrent
 session is unsupported; disconnect the active client before reconnecting from
@@ -75,6 +86,7 @@ width = 0          # 0 = auto-detect
 height = 0
 frame_rate = 60
 hidpi_scale = 2    # 2x for 4K on Retina
+show_cursor = true  # embed macOS cursor shapes in video stream
 
 # Encoding
 quality = "high_quality"    # low_latency / balanced / high_quality

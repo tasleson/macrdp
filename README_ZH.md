@@ -22,6 +22,9 @@
 - **高保真色彩** — AVC444 模式像素级色彩还原（RDP 10）
 - **完整键鼠支持** — 104 键映射、数字键盘、修饰键、滚轮，完整输入注入
 - **HiDPI / Retina 支持** — 2x/3x 倍率采集，远程 4K 高清显示
+- **动态分辨率** — 自动跟随客户端窗口大小调整；服务端响应 display-control PDU 并实时更新会话分辨率
+- **原生光标嵌入** — 真实 macOS 光标样式（缩放手柄、文字光标等）流式传输至视频中；可通过 `show_cursor` 配置
+- **睡眠显示器容错** — 即使 Mac 显示器处于睡眠状态，服务端仍可启动并接受连接；客户端首次连接时自动唤醒显示器
 - **灵活配置** — 分辨率、帧率、码率、编码器、质量预设，简单 TOML 配置
 - **安全连接** — NLA/CredSSP 认证 + 自动生成 TLS 证书
 - **锁屏采集** — 锁屏时自动切换 CoreGraphics 回退
@@ -40,15 +43,23 @@
 
 ## 快速开始
 
+**方式一 — 预编译二进制（Apple Silicon）**
+
+从 [GitHub Releases](https://github.com/tasleson/macrdp/releases) 下载最新的 `macrdp-server-*-aarch64-apple-darwin.tar.gz`，然后：
+
 ```bash
-# 编译
-cargo build --release
-
-# 运行
-cargo run --release --bin macrdp-server
-
-# 从任意 RDP 客户端连接 → Mac-IP:3389
+tar -xzf macrdp-server-*-aarch64-apple-darwin.tar.gz
+./macrdp-server
 ```
+
+**方式二 — 从源码编译**
+
+```bash
+cargo build --release
+cargo run --release --bin macrdp-server
+```
+
+从任意 RDP 客户端连接 → `Mac-IP:3389`
 
 macrdp v1 一次只支持一个活跃 RDP 客户端。不支持并发会话；如需从其他
 设备连接，请先断开当前客户端。
@@ -74,6 +85,7 @@ width = 0          # 0 = 自动检测
 height = 0
 frame_rate = 60
 hidpi_scale = 2    # Retina 上 2 倍缩放获得 4K
+show_cursor = true  # 将 macOS 光标样式嵌入视频流
 
 # 编码
 quality = "high_quality"    # low_latency / balanced / high_quality
@@ -101,6 +113,33 @@ log_path = "/path/to/macrdp.log"
 | `<base>/logs/macrdp.log` | 守护进程日志                          |
 
 每个路径都可以通过对应的配置字段 (`cert_path`、`key_path`、`log_path`) 或 CLI 参数 (`--cert-path`、`--key-path`、`--log-path`) 进行覆盖。
+
+### Keychain 密码存储
+
+除了在 `config.toml` 中明文存储 RDP 密码，你也可以将其存储在 macOS Keychain 中：
+
+```bash
+# 存储密码（无回显输入；--username 默认为 $USER）
+macrdp-server --keychain-set-password --username alice
+
+# 启动服务端，从 Keychain 读取密码
+macrdp-server --password-keychain
+```
+
+密码以通用密码条目形式存储，服务名为 `macrdp`，账户名为 RDP 用户名。使用标准 macOS 工具管理：
+
+```bash
+# 更新 — 重新执行 set 命令即可覆盖
+macrdp-server --keychain-set-password --username alice
+
+# 通过 security CLI 删除
+security delete-generic-password -s macrdp -a alice
+
+# 查看条目
+security find-generic-password -s macrdp -a alice
+```
+
+也可在 **Keychain Access.app** 中搜索 "macrdp" 查看或删除该条目。
 
 ---
 
