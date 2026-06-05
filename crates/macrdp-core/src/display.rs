@@ -1207,22 +1207,40 @@ impl MacDisplayUpdates {
 mod tests {
     use super::*;
 
-    fn test_display(width: u16, height: u16, fixed_resolution: bool) -> MacDisplay {
+    fn test_display_custom(
+        width: u16,
+        height: u16,
+        native_width: u16,
+        native_height: u16,
+        fixed_resolution: bool,
+        encoder_pref: macrdp_encode::EncoderPreference,
+    ) -> MacDisplay {
         MacDisplay::new(
             width,
             height,
-            width,
-            height,
+            native_width,
+            native_height,
             fixed_resolution,
             60,
             Quality::Balanced,
-            macrdp_encode::EncoderPreference::Software,
+            encoder_pref,
             false,
             false,
             None,
             false,
             None,
             Arc::new(Mutex::new(GfxState::new(width, height, false))),
+        )
+    }
+
+    fn test_display(width: u16, height: u16, fixed_resolution: bool) -> MacDisplay {
+        test_display_custom(
+            width,
+            height,
+            width,
+            height,
+            fixed_resolution,
+            macrdp_encode::EncoderPreference::Software,
         )
     }
 
@@ -1444,21 +1462,13 @@ mod tests {
     #[test]
     fn mouse_scale_reflects_non_native_initial_resolution() {
         // Software encoder with a smaller configured resolution: scale < 1.
-        let display = MacDisplay::new(
+        let display = test_display_custom(
             1280,
             720,
             1920,
             1080,
-            true, // fixed
-            60,
-            Quality::Balanced,
+            true,
             macrdp_encode::EncoderPreference::Software,
-            false,
-            false,
-            None,
-            false,
-            None,
-            Arc::new(Mutex::new(GfxState::new(1280, 720, false))),
         );
         let (sx, sy) = *display.mouse_scale().lock().unwrap();
         let expected_x = 1280.0 / 1920.0;
@@ -1477,21 +1487,13 @@ mod tests {
     fn mouse_scale_updates_on_client_resize() {
         // Regression: mouse coords were injected using the original startup scale
         // even after a client requested a smaller resolution, causing cursor mismatch.
-        let mut display = MacDisplay::new(
+        let mut display = test_display_custom(
             1920,
             1080,
             1920,
             1080,
             false,
-            60,
-            Quality::Balanced,
             macrdp_encode::EncoderPreference::Software,
-            false,
-            false,
-            None,
-            false,
-            None,
-            Arc::new(Mutex::new(GfxState::new(1920, 1080, false))),
         );
         let scale = display.mouse_scale();
 
@@ -1890,21 +1892,13 @@ mod tests {
     #[test]
     fn vt_encoder_falls_back_to_software_at_non_native_resolution() {
         // At native resolution, hardware preference is preserved
-        let display = MacDisplay::new(
+        let display = test_display_custom(
             1920,
             1080,
             1920,
             1080,
             false,
-            60,
-            Quality::Balanced,
             macrdp_encode::EncoderPreference::Auto,
-            false,
-            false,
-            None,
-            false,
-            None,
-            Arc::new(Mutex::new(GfxState::new(1920, 1080, false))),
         );
         assert_eq!(
             display.effective_encoder_pref(),
@@ -1912,21 +1906,13 @@ mod tests {
         );
 
         // After resize away from native, hardware preference should become software
-        let display = MacDisplay::new(
+        let display = test_display_custom(
             1280,
             720,
             1920,
             1080,
             false,
-            60,
-            Quality::Balanced,
             macrdp_encode::EncoderPreference::Auto,
-            false,
-            false,
-            None,
-            false,
-            None,
-            Arc::new(Mutex::new(GfxState::new(1280, 720, false))),
         );
         assert_eq!(
             display.effective_encoder_pref(),
@@ -1934,21 +1920,13 @@ mod tests {
         );
 
         // Software preference is unchanged regardless of native match
-        let display = MacDisplay::new(
+        let display = test_display_custom(
             1280,
             720,
             1920,
             1080,
             false,
-            60,
-            Quality::Balanced,
             macrdp_encode::EncoderPreference::Software,
-            false,
-            false,
-            None,
-            false,
-            None,
-            Arc::new(Mutex::new(GfxState::new(1280, 720, false))),
         );
         assert_eq!(
             display.effective_encoder_pref(),
