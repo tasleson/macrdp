@@ -991,7 +991,12 @@ impl VideoEncoder for VtEncoder {
         self.frame_count += 1;
 
         if self.frame_count <= 10 {
-            log_nal_diagnostic(self.frame_count, &nal_data, is_keyframe, "VideoToolbox NAL diagnostic");
+            log_nal_diagnostic(
+                self.frame_count,
+                &nal_data,
+                is_keyframe,
+                "VideoToolbox NAL diagnostic",
+            );
         }
 
         if self.frame_count.is_multiple_of(300) {
@@ -1046,7 +1051,12 @@ impl VideoEncoder for VtEncoder {
         self.frame_count += 1;
 
         if self.frame_count <= 10 {
-            log_nal_diagnostic(self.frame_count, &nal_data, is_keyframe, "VideoToolbox zero-copy NAL diagnostic");
+            log_nal_diagnostic(
+                self.frame_count,
+                &nal_data,
+                is_keyframe,
+                "VideoToolbox zero-copy NAL diagnostic",
+            );
         }
 
         Ok(EncodedFrame {
@@ -1149,7 +1159,14 @@ impl VideoEncoder for VtEncoder {
             "AVC444 dual-stream encode"
         );
 
-        Ok(Avc444EncodedFrame::new(main_nal, main_keyframe, aux_nal, aux_keyframe, w, h))
+        Ok(Avc444EncodedFrame::new(
+            main_nal,
+            main_keyframe,
+            aux_nal,
+            aux_keyframe,
+            w,
+            h,
+        ))
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {

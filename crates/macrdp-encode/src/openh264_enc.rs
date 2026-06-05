@@ -325,7 +325,14 @@ impl VideoEncoder for OpenH264Encoder {
             "AVC444 OpenH264 dual-stream encode complete"
         );
 
-        Ok(Avc444EncodedFrame::new(main_nal, main_keyframe, aux_nal, aux_keyframe, w, h))
+        Ok(Avc444EncodedFrame::new(
+            main_nal,
+            main_keyframe,
+            aux_nal,
+            aux_keyframe,
+            w,
+            h,
+        ))
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {

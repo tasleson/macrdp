@@ -952,7 +952,11 @@ impl MacDisplayUpdates {
                                     encode_ms = format!("{:.1}", encode_ms),
                                     "Display: sending zero-copy GFX frame"
                                 );
-                                self.record_gfx_frame_sent(encode_ms, encoded.data.len(), pending_acks);
+                                self.record_gfx_frame_sent(
+                                    encode_ms,
+                                    encoded.data.len(),
+                                    pending_acks,
+                                );
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
