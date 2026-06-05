@@ -395,28 +395,7 @@ extern "C" fn encode_callback(
     ctx.ready.notify_one();
 }
 
-// --- YUV444 reusable buffers for AVC444 mode ---
-
-struct Yuv444Buffers {
-    y444: Vec<u8>,
-    u444: Vec<u8>,
-    v444: Vec<u8>,
-    main_view: crate::yuv444_split::Yuv420Frame,
-    aux_view: crate::yuv444_split::Yuv420Frame,
-}
-
-impl Yuv444Buffers {
-    fn new(width: u32, height: u32) -> Self {
-        let full = (width * height) as usize;
-        Self {
-            y444: vec![0u8; full],
-            u444: vec![0u8; full],
-            v444: vec![0u8; full],
-            main_view: crate::yuv444_split::Yuv420Frame::new(width, height),
-            aux_view: crate::yuv444_split::Yuv420Frame::new(width, height),
-        }
-    }
-}
+use crate::Yuv444SplitBufs;
 
 // --- Encoder ---
 
@@ -430,7 +409,7 @@ pub struct VtEncoder {
     frame_count: u64,
     fps: f32,
     mode_444: bool,
-    yuv444_buf: Option<Yuv444Buffers>,
+    yuv444_buf: Option<Yuv444SplitBufs>,
     pending_force_keyframe: bool,
 }
 
@@ -462,7 +441,7 @@ impl VtEncoder {
             (None::<VTCompressionSessionRef>, None::<Arc<CallbackCtx>>);
 
         let yuv444_buf = if mode_444 {
-            Some(Yuv444Buffers::new(width, height))
+            Some(Yuv444SplitBufs::new(width, height))
         } else {
             None
         };
@@ -1101,26 +1080,7 @@ impl VideoEncoder for VtEncoder {
         let w = self.width;
         let h = self.height;
 
-        // Step 1: BGRA → YUV444 → B-area split (only needed for aux view)
-        crate::yuv444_split::bgra_to_yuv444(
-            data,
-            width,
-            height,
-            stride,
-            &mut bufs.y444,
-            &mut bufs.u444,
-            &mut bufs.v444,
-        );
-        // Main view = standard YUV420, aux view = chroma compensation
-        crate::yuv444_split::yuv444_split_to_yuv420(
-            &bufs.y444,
-            &bufs.u444,
-            &bufs.v444,
-            w,
-            h,
-            &mut bufs.main_view,
-            &mut bufs.aux_view,
-        );
+        bufs.split_bgra(data, width, height, stride, w, h);
 
         // Single encoder session, sequential: main (frame 2N) then aux (frame 2N+1).
         let frame_duration = (600.0 / self.fps as f64) as i64;
@@ -1189,20 +1149,7 @@ impl VideoEncoder for VtEncoder {
             "AVC444 dual-stream encode"
         );
 
-        Ok(Avc444EncodedFrame {
-            main_view: EncodedFrame {
-                data: Bytes::from(main_nal),
-                is_keyframe: main_keyframe,
-                width: w,
-                height: h,
-            },
-            aux_view: EncodedFrame {
-                data: Bytes::from(aux_nal),
-                is_keyframe: aux_keyframe,
-                width: w,
-                height: h,
-            },
-        })
+        Ok(Avc444EncodedFrame::new(main_nal, main_keyframe, aux_nal, aux_keyframe, w, h))
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {

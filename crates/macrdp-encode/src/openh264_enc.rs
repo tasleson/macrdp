@@ -22,31 +22,23 @@ pub struct OpenH264Encoder {
     /// vImage SIMD accelerated BGRA→I420 converter (macOS Accelerate.framework)
     vimage: Option<VImageConverter>,
     /// Reusable buffers for AVC444 YUV444 split
-    yuv444_bufs: Option<Yuv444SplitBufs>,
+    yuv444_bufs: Option<OpenH264Yuv444Bufs>,
 }
 
-/// Reusable buffers for AVC444 encoding
-struct Yuv444SplitBufs {
-    y444: Vec<u8>,
-    u444: Vec<u8>,
-    v444: Vec<u8>,
-    main_view: crate::yuv444_split::Yuv420Frame,
-    aux_view: crate::yuv444_split::Yuv420Frame,
+/// OpenH264-specific wrapper: adds packed I420 buffers on top of the shared split buffers.
+struct OpenH264Yuv444Bufs {
+    inner: crate::Yuv444SplitBufs,
     main_yuv_buf: Vec<u8>,
     aux_yuv_buf: Vec<u8>,
 }
 
-impl Yuv444SplitBufs {
+impl OpenH264Yuv444Bufs {
     fn new(width: u32, height: u32) -> Self {
         let full = (width * height) as usize;
         let quarter = ((width / 2) * (height / 2)) as usize;
         let yuv420_size = full + quarter * 2;
         Self {
-            y444: vec![0u8; full],
-            u444: vec![0u8; full],
-            v444: vec![0u8; full],
-            main_view: crate::yuv444_split::Yuv420Frame::new(width, height),
-            aux_view: crate::yuv444_split::Yuv420Frame::new(width, height),
+            inner: crate::Yuv444SplitBufs::new(width, height),
             main_yuv_buf: vec![0u8; yuv420_size],
             aux_yuv_buf: vec![0u8; yuv420_size],
         }
@@ -103,7 +95,7 @@ impl OpenH264Encoder {
         let yuv_size = (width * height * 3 / 2) as usize;
 
         let yuv444_bufs = if mode_444 {
-            Some(Yuv444SplitBufs::new(width, height))
+            Some(OpenH264Yuv444Bufs::new(width, height))
         } else {
             None
         };
@@ -293,33 +285,13 @@ impl VideoEncoder for OpenH264Encoder {
         let w = self.width;
         let h = self.height;
 
-        // Step 1: BGRA -> YUV444
-        crate::yuv444_split::bgra_to_yuv444(
-            data,
-            width,
-            height,
-            stride,
-            &mut bufs.y444,
-            &mut bufs.u444,
-            &mut bufs.v444,
-        );
+        bufs.inner.split_bgra(data, width, height, stride, w, h);
 
-        // Step 2: YUV444 -> Main YUV420 + Aux YUV420 (B-area split)
-        crate::yuv444_split::yuv444_split_to_yuv420(
-            &bufs.y444,
-            &bufs.u444,
-            &bufs.v444,
-            w,
-            h,
-            &mut bufs.main_view,
-            &mut bufs.aux_view,
-        );
-
-        // Step 3: Pack into I420 and encode both streams
+        // Pack into I420 and encode both streams
         pack_i420(
-            &bufs.main_view.y,
-            &bufs.main_view.u,
-            &bufs.main_view.v,
+            &bufs.inner.main_view.y,
+            &bufs.inner.main_view.u,
+            &bufs.inner.main_view.v,
             &mut bufs.main_yuv_buf,
         );
         let main_yuv = YUVBuffer::from_vec(bufs.main_yuv_buf.clone(), w as usize, h as usize);
@@ -332,9 +304,9 @@ impl VideoEncoder for OpenH264Encoder {
         let main_keyframe = matches!(main_bitstream.frame_type(), FrameType::IDR | FrameType::I);
 
         pack_i420(
-            &bufs.aux_view.y,
-            &bufs.aux_view.u,
-            &bufs.aux_view.v,
+            &bufs.inner.aux_view.y,
+            &bufs.inner.aux_view.u,
+            &bufs.inner.aux_view.v,
             &mut bufs.aux_yuv_buf,
         );
         let aux_yuv = YUVBuffer::from_vec(bufs.aux_yuv_buf.clone(), w as usize, h as usize);
@@ -353,20 +325,7 @@ impl VideoEncoder for OpenH264Encoder {
             "AVC444 OpenH264 dual-stream encode complete"
         );
 
-        Ok(Avc444EncodedFrame {
-            main_view: EncodedFrame {
-                data: Bytes::from(main_nal),
-                is_keyframe: main_keyframe,
-                width: w,
-                height: h,
-            },
-            aux_view: EncodedFrame {
-                data: Bytes::from(aux_nal),
-                is_keyframe: aux_keyframe,
-                width: w,
-                height: h,
-            },
-        })
+        Ok(Avc444EncodedFrame::new(main_nal, main_keyframe, aux_nal, aux_keyframe, w, h))
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {

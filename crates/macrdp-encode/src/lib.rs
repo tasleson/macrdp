@@ -32,6 +32,83 @@ pub struct Avc444EncodedFrame {
     pub aux_view: EncodedFrame,
 }
 
+impl Avc444EncodedFrame {
+    pub fn new(
+        main_data: Vec<u8>,
+        main_keyframe: bool,
+        aux_data: Vec<u8>,
+        aux_keyframe: bool,
+        w: u32,
+        h: u32,
+    ) -> Self {
+        Self {
+            main_view: EncodedFrame {
+                data: Bytes::from(main_data),
+                is_keyframe: main_keyframe,
+                width: w,
+                height: h,
+            },
+            aux_view: EncodedFrame {
+                data: Bytes::from(aux_data),
+                is_keyframe: aux_keyframe,
+                width: w,
+                height: h,
+            },
+        }
+    }
+}
+
+/// Reusable buffers for AVC444 YUV444 → dual YUV420 split
+pub(crate) struct Yuv444SplitBufs {
+    pub y444: Vec<u8>,
+    pub u444: Vec<u8>,
+    pub v444: Vec<u8>,
+    pub main_view: yuv444_split::Yuv420Frame,
+    pub aux_view: yuv444_split::Yuv420Frame,
+}
+
+impl Yuv444SplitBufs {
+    pub fn new(width: u32, height: u32) -> Self {
+        let full = (width * height) as usize;
+        Self {
+            y444: vec![0u8; full],
+            u444: vec![0u8; full],
+            v444: vec![0u8; full],
+            main_view: yuv444_split::Yuv420Frame::new(width, height),
+            aux_view: yuv444_split::Yuv420Frame::new(width, height),
+        }
+    }
+
+    pub fn split_bgra(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+        enc_w: u32,
+        enc_h: u32,
+    ) {
+        yuv444_split::bgra_to_yuv444(
+            data,
+            width,
+            height,
+            stride,
+            &mut self.y444,
+            &mut self.u444,
+            &mut self.v444,
+        );
+        yuv444_split::yuv444_split_to_yuv420(
+            &self.y444,
+            &self.u444,
+            &self.v444,
+            enc_w,
+            enc_h,
+            &mut self.main_view,
+            &mut self.aux_view,
+        );
+    }
+}
+
 /// Quality preset
 #[derive(Debug, Clone, Copy)]
 pub enum Quality {
