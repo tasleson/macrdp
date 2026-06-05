@@ -8,9 +8,9 @@ The primary deliverable is a reliable CLI daemon, not a desktop management app. 
 
 ## Current State
 
-macrdp is already a substantial prototype. It includes ScreenCaptureKit capture, CoreGraphics fallback capture, keyboard and mouse injection, CredSSP/NLA, TLS certificate generation, an RDPGFX H.264 path, VideoToolbox NV12 zero-copy encoding, OpenH264 fallback, AVC444 work, a Tauri UI, tray integration, metrics, and persistent UI config.
+macrdp is already a substantial prototype. It includes ScreenCaptureKit capture, CoreGraphics fallback capture, keyboard and mouse injection, CredSSP/NLA, TLS certificate generation, an RDPGFX H.264 path, VideoToolbox NV12 zero-copy encoding, OpenH264 fallback, AVC444 work, daemon metrics, and CLI-driven configuration.
 
-The remaining work should be judged against the CLI daemon goal. Anything that improves daemon stability, protocol compatibility, performance, security, observability, or macOS service integration is in scope. UI/Tauri work is optional and should not block the CLI daemon.
+The remaining work should be judged against the CLI daemon goal. Anything that improves daemon stability, protocol compatibility, performance, security, observability, or macOS service integration is in scope.
 
 ## Highest-Risk Findings
 
@@ -108,16 +108,12 @@ Goal: reproducible daemon builds and compatibility confidence.
 
 ## Non-Goals for the CLI Daemon
 
-- The Tauri UI, tray, React frontend, dashboard, settings pages, popover, theme settings, UI database/history, and `npm` build path are not required for the CLI daemon.
+- A desktop GUI, tray, React frontend, dashboard, settings pages, popover, theme settings, UI database/history, and `npm` build path are not part of this fork's release scope.
 - UI-only config fields such as `autostart`, `theme`, frontend hot-update controls, and connection history should not drive daemon scope.
 - Multiple concurrent clients are not required for v1.
 - AVC444 is not required for v1 if AVC420 is stable and performant.
 - Audio, printer redirection, file redirection, smartcard, and broad multi-monitor support are deferred unless a concrete deployment requires them.
 - Code signing, notarization, and `.app` packaging are not required for a CLI daemon release, though binary signing may be considered later.
-
-## Optional Desktop App Track
-
-The existing Tauri UI can remain as a separate optional product track. If revived, it should consume the same `macrdp-core` daemon runtime and must not introduce runtime drift. Its build/test issues, including Swift runtime rpath for Tauri tests and frontend `npm` availability, should be tracked separately from CLI daemon readiness.
 
 ## Performance Targets
 
@@ -131,5 +127,3 @@ The existing Tauri UI can remain as a separate optional product track. If revive
 ## Validation Snapshot
 
 - `cargo test` from the repository root previously passed: 26 tests passed across capture, encode, input, and CLI server crates.
-- `cargo test --manifest-path macrdp-ui/src-tauri/Cargo.toml --no-run` compiled after recent UI config edits.
-- `npm run build` could not run because `npm` was not installed in the current environment; this is not blocking for the CLI daemon track.

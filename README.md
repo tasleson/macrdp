@@ -11,6 +11,10 @@ English | **[中文](README_ZH.md)**
 
 A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or Android — using any standard RDP client like Windows Remote Desktop (mstsc), Microsoft Remote Desktop, or FreeRDP.
 
+This fork focuses on the macOS RDP service itself and the simplest practical
+way to run it: the `macrdp-server` CLI. The desktop GUI from the upstream
+prototype is intentionally not part of this fork's release scope.
+
 > **Why macrdp?** macOS has no built-in RDP server. VNC is slow and blurry. macrdp gives your Mac a first-class remote desktop experience — fast, sharp, and compatible with every RDP client out of the box.
 
 ---

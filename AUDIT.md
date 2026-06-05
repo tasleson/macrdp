@@ -3,7 +3,7 @@
 **Date:** 2026-04-15
 **Overall Assessment: No backdoors or malicious exploitation code detected.**
 
-The project is a macOS RDP (Remote Desktop Protocol) server built in Rust with a Tauri desktop UI. All 46 Rust source files, the TypeScript/React frontend, build scripts, configuration, dependencies, and git history were audited. Here are the findings:
+The project is a macOS RDP (Remote Desktop Protocol) server built in Rust. This report originally covered the fork while it still carried a Tauri desktop UI; that GUI has since been pruned from the release scope. Here are the findings:
 
 ---
 
@@ -16,10 +16,8 @@ The project is a macOS RDP (Remote Desktop Protocol) server built in Rust with a
 - **No obfuscated code** — No base64-encoded payloads, `eval()`, dynamic script injection, or deliberately unclear logic.
 - **No suspicious file access** — No reads from `~/.ssh`, `/etc/shadow`, browser profiles, etc. File access is limited to config files and TLS certs in `~/.macrdp/` or `~/.config/macrdp/`.
 - **No privilege escalation** — No `setuid`, `chmod`, or privilege escalation attempts.
-- **No suspicious dependencies** — All Rust crates (tokio, ironrdp, rcgen, clap, serde, etc.) and npm packages (@tauri-apps, @radix-ui, react, tailwind) are well-known and legitimate. No git dependencies pointing to unusual repos.
-- **No malicious build scripts** — Makefile runs standard cargo/npm build commands. build.rs files are minimal (Swift library linking and `tauri_build::build()`). No `curl | sh` patterns.
-- **No data exfiltration in UI** — Frontend communicates only through Tauri IPC. No `fetch()` to external servers. `check_for_updates()` is hardcoded to return `false`.
-- **Database stores only connection metadata** — SQLite at `~/.macrdp/macrdp.db` stores client IPs, timestamps, duration, and byte counts. Uses parameterized queries (no SQL injection).
+- **No suspicious dependencies** — The Rust crates in the release path (tokio, ironrdp, rcgen, clap, serde, etc.) are well-known and legitimate. No git dependencies pointing to unusual repos.
+- **No malicious build scripts** — Build scripts are minimal and do not use `curl | sh` patterns.
 
 ---
 
@@ -54,6 +52,5 @@ This appears to be leftover debugging code, not a backdoor. However, it could ex
 | Privilege escalation | Clean |
 | Supply chain (dependencies) | Clean |
 | Build-time attacks | Clean |
-| UI data exfiltration | Clean |
 
 The codebase appears to be a legitimate macOS RDP server implementation. The only actionable finding is the password byte logging, which should be sanitized.

@@ -11,6 +11,10 @@
 
 原生 macOS RDP 服务端。从 Windows、Linux、iOS 或 Android 远程连接你的 Mac — 支持任何标准 RDP 客户端，如 Windows 远程桌面 (mstsc)、Microsoft Remote Desktop、FreeRDP。
 
+这个 fork 专注于 macOS RDP 服务本身，并采用最简单实用的使用方式：
+通过 `macrdp-server` CLI 运行服务。上游原型中的桌面 GUI 不属于这个
+fork 的发布范围。
+
 > **为什么选 macrdp？** macOS 没有内置 RDP 服务端，自带的 VNC 又慢又模糊。macrdp 让你的 Mac 拥有一流的远程桌面体验 — 快速、清晰、开箱即用兼容所有 RDP 客户端。
 
 ---

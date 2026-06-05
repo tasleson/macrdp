@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Server configuration (loaded from TOML, shared between CLI and UI).
+/// Server configuration loaded from TOML by the CLI daemon.
 ///
 /// `Debug` is implemented manually so the password never appears in log output.
 #[derive(Clone, Serialize, Deserialize)]
