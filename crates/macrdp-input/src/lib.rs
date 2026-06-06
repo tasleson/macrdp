@@ -1,12 +1,32 @@
 //! Keyboard and mouse input injection via CGEvent
 
+use core_graphics::event::CGEventTapLocation;
+
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
 
-pub use keyboard::KeyboardInjector;
+pub use keyboard::{KeyboardInjector, KeyboardInjectorConfig};
 pub use keymap::scancode_to_keycode;
-pub use mouse::{MouseButton, MouseInjector};
+pub use mouse::{MouseButton, MouseInjector, MouseInjectorConfig};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputTapLocation {
+    Hid,
+    #[default]
+    Session,
+    AnnotatedSession,
+}
+
+impl InputTapLocation {
+    pub fn as_cg_event_tap_location(self) -> CGEventTapLocation {
+        match self {
+            Self::Hid => CGEventTapLocation::HID,
+            Self::Session => CGEventTapLocation::Session,
+            Self::AnnotatedSession => CGEventTapLocation::AnnotatedSession,
+        }
+    }
+}
 
 // FFI for Accessibility APIs
 extern "C" {

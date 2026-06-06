@@ -83,6 +83,12 @@ pub enum MouseEvent {
 pub trait RdpServerInputHandler: Send {
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
+
+    /// Release any input state the handler may have injected into the host.
+    ///
+    /// Called when a client session ends so a dropped release event cannot leave
+    /// the host with a stuck remote mouse button or modifier key.
+    fn reset(&mut self) {}
 }
 
 impl From<(u8, fast_path::KeyboardFlags)> for KeyboardEvent {

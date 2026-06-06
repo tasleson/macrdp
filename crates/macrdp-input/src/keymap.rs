@@ -1,7 +1,25 @@
-/// Convert an RDP scancode (Set 1) to a macOS virtual keycode.
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+/// A normalized action for an RDP scancode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    /// A normal macOS virtual keycode injected with `CGEventCreateKeyboardEvent`.
+    MacKeyCode(u16),
+    /// A media/consumer key injected as a macOS system-defined auxiliary event.
+    Media(MediaKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKey {
+    VolumeUp,
+    VolumeDown,
+}
+
+/// Convert an RDP scancode (Set 1) to a normalized key action.
 /// `extended` indicates an extended key (e.g., right Ctrl, arrow keys).
 /// Returns None if the scancode has no known mapping.
-pub fn scancode_to_keycode(scancode: u8, extended: bool) -> Option<u16> {
+pub fn scancode_to_action(scancode: u8, extended: bool) -> Option<KeyAction> {
     if extended {
         EXTENDED_SCANCODE_MAP.get(&scancode).copied()
     } else {
@@ -9,138 +27,152 @@ pub fn scancode_to_keycode(scancode: u8, extended: bool) -> Option<u16> {
     }
 }
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+/// Convert an RDP scancode (Set 1) to a macOS virtual keycode.
+/// Returns None for media keys and unknown scancodes.
+pub fn scancode_to_keycode(scancode: u8, extended: bool) -> Option<u16> {
+    match scancode_to_action(scancode, extended) {
+        Some(KeyAction::MacKeyCode(keycode)) => Some(keycode),
+        Some(KeyAction::Media(_)) | None => None,
+    }
+}
 
 /// Standard (non-extended) RDP scancode → macOS keycode
-static SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
+static SCANCODE_MAP: LazyLock<HashMap<u8, KeyAction>> = LazyLock::new(|| {
+    use KeyAction::MacKeyCode as Key;
+
     HashMap::from([
         // Row 1: Escape + F-keys
-        (0x01, 0x35u16), // Escape
-        (0x3B, 0x7A),    // F1
-        (0x3C, 0x78),    // F2
-        (0x3D, 0x63),    // F3
-        (0x3E, 0x76),    // F4
-        (0x3F, 0x60),    // F5
-        (0x40, 0x61),    // F6
-        (0x41, 0x62),    // F7
-        (0x42, 0x64),    // F8
-        (0x43, 0x65),    // F9
-        (0x44, 0x6D),    // F10
-        (0x57, 0x67),    // F11
-        (0x58, 0x6F),    // F12
+        (0x01, Key(0x35u16)), // Escape
+        (0x3B, Key(0x7A)),    // F1
+        (0x3C, Key(0x78)),    // F2
+        (0x3D, Key(0x63)),    // F3
+        (0x3E, Key(0x76)),    // F4
+        (0x3F, Key(0x60)),    // F5
+        (0x40, Key(0x61)),    // F6
+        (0x41, Key(0x62)),    // F7
+        (0x42, Key(0x64)),    // F8
+        (0x43, Key(0x65)),    // F9
+        (0x44, Key(0x6D)),    // F10
+        (0x57, Key(0x67)),    // F11
+        (0x58, Key(0x6F)),    // F12
         // Row 2: Number row
-        (0x29, 0x32), // ` ~
-        (0x02, 0x12), // 1
-        (0x03, 0x13), // 2
-        (0x04, 0x14), // 3
-        (0x05, 0x15), // 4
-        (0x06, 0x17), // 5
-        (0x07, 0x16), // 6
-        (0x08, 0x1A), // 7
-        (0x09, 0x1C), // 8
-        (0x0A, 0x19), // 9
-        (0x0B, 0x1D), // 0
-        (0x0C, 0x1B), // - _
-        (0x0D, 0x18), // = +
-        (0x0E, 0x33), // Backspace
+        (0x29, Key(0x32)), // ` ~
+        (0x02, Key(0x12)), // 1
+        (0x03, Key(0x13)), // 2
+        (0x04, Key(0x14)), // 3
+        (0x05, Key(0x15)), // 4
+        (0x06, Key(0x17)), // 5
+        (0x07, Key(0x16)), // 6
+        (0x08, Key(0x1A)), // 7
+        (0x09, Key(0x1C)), // 8
+        (0x0A, Key(0x19)), // 9
+        (0x0B, Key(0x1D)), // 0
+        (0x0C, Key(0x1B)), // - _
+        (0x0D, Key(0x18)), // = +
+        (0x0E, Key(0x33)), // Backspace
         // Row 3: QWERTY
-        (0x0F, 0x30), // Tab
-        (0x10, 0x0C), // Q
-        (0x11, 0x0D), // W
-        (0x12, 0x0E), // E
-        (0x13, 0x0F), // R
-        (0x14, 0x11), // T
-        (0x15, 0x10), // Y
-        (0x16, 0x20), // U
-        (0x17, 0x22), // I
-        (0x18, 0x1F), // O
-        (0x19, 0x23), // P
-        (0x1A, 0x21), // [ {
-        (0x1B, 0x1E), // ] }
-        (0x2B, 0x2A), // \ |
+        (0x0F, Key(0x30)), // Tab
+        (0x10, Key(0x0C)), // Q
+        (0x11, Key(0x0D)), // W
+        (0x12, Key(0x0E)), // E
+        (0x13, Key(0x0F)), // R
+        (0x14, Key(0x11)), // T
+        (0x15, Key(0x10)), // Y
+        (0x16, Key(0x20)), // U
+        (0x17, Key(0x22)), // I
+        (0x18, Key(0x1F)), // O
+        (0x19, Key(0x23)), // P
+        (0x1A, Key(0x21)), // [ {
+        (0x1B, Key(0x1E)), // ] }
+        (0x2B, Key(0x2A)), // \ |
         // Row 4: ASDF
-        (0x3A, 0x39), // Caps Lock
-        (0x1E, 0x00), // A
-        (0x1F, 0x01), // S
-        (0x20, 0x02), // D
-        (0x21, 0x03), // F
-        (0x22, 0x05), // G
-        (0x23, 0x04), // H
-        (0x24, 0x26), // J
-        (0x25, 0x28), // K
-        (0x26, 0x25), // L
-        (0x27, 0x29), // ; :
-        (0x28, 0x27), // ' "
-        (0x1C, 0x24), // Enter
+        (0x3A, Key(0x39)), // Caps Lock
+        (0x1E, Key(0x00)), // A
+        (0x1F, Key(0x01)), // S
+        (0x20, Key(0x02)), // D
+        (0x21, Key(0x03)), // F
+        (0x22, Key(0x05)), // G
+        (0x23, Key(0x04)), // H
+        (0x24, Key(0x26)), // J
+        (0x25, Key(0x28)), // K
+        (0x26, Key(0x25)), // L
+        (0x27, Key(0x29)), // ; :
+        (0x28, Key(0x27)), // ' "
+        (0x1C, Key(0x24)), // Enter
         // Row 5: ZXCV
-        (0x2A, 0x38), // Left Shift
-        (0x2C, 0x06), // Z
-        (0x2D, 0x07), // X
-        (0x2E, 0x08), // C
-        (0x2F, 0x09), // V
-        (0x30, 0x0B), // B
-        (0x31, 0x2D), // N
-        (0x32, 0x2E), // M
-        (0x33, 0x2B), // , <
-        (0x34, 0x2F), // . >
-        (0x35, 0x2C), // / ?
-        (0x36, 0x3C), // Right Shift
+        (0x2A, Key(0x38)), // Left Shift
+        (0x2C, Key(0x06)), // Z
+        (0x2D, Key(0x07)), // X
+        (0x2E, Key(0x08)), // C
+        (0x2F, Key(0x09)), // V
+        (0x30, Key(0x0B)), // B
+        (0x31, Key(0x2D)), // N
+        (0x32, Key(0x2E)), // M
+        (0x33, Key(0x2B)), // , <
+        (0x34, Key(0x2F)), // . >
+        (0x35, Key(0x2C)), // / ?
+        (0x36, Key(0x3C)), // Right Shift
         // Row 6: Bottom — modifier mapping for Windows/Linux/Mac clients → macOS
         // Physical layout: [Ctrl] [Win/Super/Cmd] [Alt/Option] [Space] ...
         //         macOS:   [Ctrl] [Cmd]           [Option]     [Space] ...
         // This preserves semantic modifiers, so a Mac client Command+T reaches
         // macOS as Command+T instead of Option+T.
-        (0x1D, 0x3B), // Left Ctrl → Left Control
-        (0x38, 0x3A), // Left Alt/Option → Left Option
-        (0x39, 0x31), // Space
+        (0x1D, Key(0x3B)), // Left Ctrl → Left Control
+        (0x38, Key(0x3A)), // Left Alt/Option → Left Option
+        (0x39, Key(0x31)), // Space
         // Numpad — always treat as numeric input (ignore NumLock state).
         // Non-extended scancodes map to numpad digits/operators;
         // extended versions of same scancodes map to navigation (in EXTENDED_SCANCODE_MAP).
-        (0x52, 0x52), // Numpad 0
-        (0x4F, 0x53), // Numpad 1
-        (0x50, 0x54), // Numpad 2
-        (0x51, 0x55), // Numpad 3
-        (0x4B, 0x56), // Numpad 4
-        (0x4C, 0x57), // Numpad 5
-        (0x4D, 0x58), // Numpad 6
-        (0x47, 0x59), // Numpad 7
-        (0x48, 0x5B), // Numpad 8
-        (0x49, 0x5C), // Numpad 9
-        (0x53, 0x41), // Numpad . (decimal)
-        (0x37, 0x43), // Numpad * (multiply)
-        (0x4A, 0x4E), // Numpad - (subtract)
-        (0x4E, 0x45), // Numpad + (add)
+        (0x52, Key(0x52)), // Numpad 0
+        (0x4F, Key(0x53)), // Numpad 1
+        (0x50, Key(0x54)), // Numpad 2
+        (0x51, Key(0x55)), // Numpad 3
+        (0x4B, Key(0x56)), // Numpad 4
+        (0x4C, Key(0x57)), // Numpad 5
+        (0x4D, Key(0x58)), // Numpad 6
+        (0x47, Key(0x59)), // Numpad 7
+        (0x48, Key(0x5B)), // Numpad 8
+        (0x49, Key(0x5C)), // Numpad 9
+        (0x53, Key(0x41)), // Numpad . (decimal)
+        (0x37, Key(0x43)), // Numpad * (multiply)
+        (0x4A, Key(0x4E)), // Numpad - (subtract)
+        (0x4E, Key(0x45)), // Numpad + (add)
         // Misc
-        (0x45, 0x47), // Num Lock → Clear (macOS equivalent)
-        (0x46, 0x6B), // Scroll Lock → F14
+        (0x45, Key(0x47)), // Num Lock → Clear (macOS equivalent)
+        (0x46, Key(0x6B)), // Scroll Lock → F14
     ])
 });
 
-/// Extended RDP scancode → macOS keycode
-static EXTENDED_SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
+/// Extended RDP scancode → normalized key action
+static EXTENDED_SCANCODE_MAP: LazyLock<HashMap<u8, KeyAction>> = LazyLock::new(|| {
+    use KeyAction::{MacKeyCode as Key, Media};
+
     HashMap::from([
         // Modifier keys — preserve semantic modifiers:
         // Ctrl→Control, Alt/Option→Option, Win/Super/Command→Command
-        (0x1D, 0x3Eu16), // Right Ctrl → Right Control
-        (0x38, 0x3D),    // Right Alt/Option → Right Option
-        (0x5B, 0x37),    // Left Win/Super/Command → Left Command
-        (0x5C, 0x36),    // Right Win/Super/Command → Right Command
+        (0x1D, Key(0x3Eu16)), // Right Ctrl → Right Control
+        (0x38, Key(0x3D)),    // Right Alt/Option → Right Option
+        (0x5B, Key(0x37)),    // Left Win/Super/Command → Left Command
+        (0x5C, Key(0x36)),    // Right Win/Super/Command → Right Command
         // Arrow keys
-        (0x48, 0x7E), // Up
-        (0x50, 0x7D), // Down
-        (0x4B, 0x7B), // Left
-        (0x4D, 0x7C), // Right
+        (0x48, Key(0x7E)), // Up
+        (0x50, Key(0x7D)), // Down
+        (0x4B, Key(0x7B)), // Left
+        (0x4D, Key(0x7C)), // Right
         // Navigation
-        (0x47, 0x73), // Home
-        (0x4F, 0x77), // End
-        (0x49, 0x74), // Page Up
-        (0x51, 0x79), // Page Down
-        (0x52, 0x72), // Insert (→ Help on Mac)
-        (0x53, 0x75), // Delete
+        (0x47, Key(0x73)), // Home
+        (0x4F, Key(0x77)), // End
+        (0x49, Key(0x74)), // Page Up
+        (0x51, Key(0x79)), // Page Down
+        (0x52, Key(0x72)), // Insert (→ Help on Mac)
+        (0x53, Key(0x75)), // Delete
         // Numpad (extended)
-        (0x35, 0x4B), // Numpad / (divide)
-        (0x1C, 0x4C), // Numpad Enter
+        (0x35, Key(0x4B)), // Numpad / (divide)
+        (0x1C, Key(0x4C)), // Numpad Enter
+        // Media keys observed from some clients. These scancodes are normal
+        // letter keys when non-extended, so only map the extended form.
+        (0x30, Media(MediaKey::VolumeUp)),
+        (0x2E, Media(MediaKey::VolumeDown)),
     ])
 });
 
@@ -288,5 +320,22 @@ mod tests {
         assert_eq!(scancode_to_keycode(0x1E, true), None); // 'A'
         assert_eq!(scancode_to_keycode(0x02, true), None); // '1'
         assert_eq!(scancode_to_keycode(0xFF, true), None); // unknown
+    }
+
+    #[test]
+    fn media_keys_are_extended_only_actions() {
+        assert_eq!(scancode_to_keycode(0x30, false), Some(0x0B)); // B
+        assert_eq!(scancode_to_keycode(0x2E, false), Some(0x08)); // C
+
+        assert_eq!(
+            scancode_to_action(0x30, true),
+            Some(KeyAction::Media(MediaKey::VolumeUp))
+        );
+        assert_eq!(
+            scancode_to_action(0x2E, true),
+            Some(KeyAction::Media(MediaKey::VolumeDown))
+        );
+        assert_eq!(scancode_to_keycode(0x30, true), None);
+        assert_eq!(scancode_to_keycode(0x2E, true), None);
     }
 }

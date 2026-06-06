@@ -281,6 +281,17 @@ fn resolve_chroma_mode(chroma_mode: Option<&str>) -> Result<bool> {
     }
 }
 
+fn resolve_input_tap(input_tap: Option<&str>) -> Result<macrdp_input::InputTapLocation> {
+    match input_tap {
+        None | Some("session") => Ok(macrdp_input::InputTapLocation::Session),
+        Some("annotated_session") => Ok(macrdp_input::InputTapLocation::AnnotatedSession),
+        Some("hid") => Ok(macrdp_input::InputTapLocation::Hid),
+        Some(other) => {
+            bail!("Invalid input_tap `{other}`; expected `session`, `annotated_session`, or `hid`")
+        }
+    }
+}
+
 /// Start the RDP server with the given configuration and event handler.
 /// Returns a handle to control the running server.
 pub async fn start_server(
@@ -618,7 +629,19 @@ fn run_server_thread(args: ServerThreadArgs) {
             coord_mapper.clone(),
         );
 
-        let input_handler = MacInputHandler::new(coord_mapper);
+        let input_tap = match resolve_input_tap(args.config.input_tap.as_deref()) {
+            Ok(tap) => tap,
+            Err(e) => {
+                tracing::error!("{e}");
+                args.handler.on_status_change(ServerStatus {
+                    running: false,
+                    state: format!("error: {e}"),
+                    uptime_secs: 0,
+                });
+                return;
+            }
+        };
+        let input_handler = MacInputHandler::new_with_tap_location(coord_mapper, input_tap);
 
         // Build RDP server (this is the !Send type)
         let builder = match RdpServer::builder().with_listener(args.listener) {
@@ -646,6 +669,9 @@ fn run_server_thread(args: ServerThreadArgs) {
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));
+        let advanced_input = args.config.advanced_input.unwrap_or(false);
+        server.set_advanced_input_enabled(advanced_input);
+        tracing::info!(advanced_input, "Advanced input channel configuration");
 
         server.set_credentials(Some(Credentials {
             username: args.credentials.username.clone(),
@@ -890,5 +916,36 @@ mod tests {
         let err = resolve_chroma_mode(Some("h264")).unwrap_err();
 
         assert!(err.to_string().contains("Invalid chroma_mode"));
+    }
+
+    #[test]
+    fn input_tap_defaults_to_session() {
+        assert_eq!(
+            resolve_input_tap(None).unwrap(),
+            macrdp_input::InputTapLocation::Session
+        );
+        assert_eq!(
+            resolve_input_tap(Some("session")).unwrap(),
+            macrdp_input::InputTapLocation::Session
+        );
+    }
+
+    #[test]
+    fn input_tap_allows_explicit_hid_and_annotated_session() {
+        assert_eq!(
+            resolve_input_tap(Some("hid")).unwrap(),
+            macrdp_input::InputTapLocation::Hid
+        );
+        assert_eq!(
+            resolve_input_tap(Some("annotated_session")).unwrap(),
+            macrdp_input::InputTapLocation::AnnotatedSession
+        );
+    }
+
+    #[test]
+    fn input_tap_rejects_unknown_values() {
+        let err = resolve_input_tap(Some("device")).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid input_tap"));
     }
 }

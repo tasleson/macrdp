@@ -45,6 +45,12 @@ pub struct ServerConfig {
     pub skip_unchanged: Option<bool>,
     /// Seconds between idle keyframes/keepalives.
     pub idle_keyframe_sec: Option<u32>,
+    /// CoreGraphics event tap used for injected input: "session" (default),
+    /// "annotated_session", or "hid" (legacy low-level path).
+    pub input_tap: Option<String>,
+    /// Advertise the FreeRDP advanced-input dynamic channel. Standard
+    /// fast-path keyboard/mouse remains enabled when this is false.
+    pub advanced_input: Option<bool>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -75,6 +81,8 @@ impl std::fmt::Debug for ServerConfig {
             .field("bitrate_mbps", &self.bitrate_mbps)
             .field("skip_unchanged", &self.skip_unchanged)
             .field("idle_keyframe_sec", &self.idle_keyframe_sec)
+            .field("input_tap", &self.input_tap)
+            .field("advanced_input", &self.advanced_input)
             .finish()
     }
 }
@@ -104,6 +112,8 @@ impl Default for ServerConfig {
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,
+            input_tap: None,
+            advanced_input: None,
         }
     }
 }
@@ -237,6 +247,17 @@ mod tests {
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.show_cursor, Some(true));
+    }
+
+    #[test]
+    fn test_parse_input_tap_config() {
+        let toml_str = r#"
+            input_tap = "hid"
+            advanced_input = true
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.input_tap.as_deref(), Some("hid"));
+        assert_eq!(config.advanced_input, Some(true));
     }
 
     #[test]

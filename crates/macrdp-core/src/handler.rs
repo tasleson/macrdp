@@ -1,5 +1,8 @@
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
-use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use macrdp_input::{
+    InputTapLocation, KeyboardInjector, KeyboardInjectorConfig, MouseButton, MouseInjector,
+    MouseInjectorConfig,
+};
 use std::sync::{Arc, Mutex};
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
@@ -56,28 +59,82 @@ pub struct MacInputHandler {
     mouse: Option<MouseInjector>,
     last_mouse_x: u16,
     last_mouse_y: u16,
+    left_pressed: bool,
+    right_pressed: bool,
+    middle_pressed: bool,
     coord_mapper: MouseCoordMapper,
 }
 
 impl MacInputHandler {
     pub fn new(coord_mapper: MouseCoordMapper) -> Self {
-        let keyboard = KeyboardInjector::new()
+        Self::new_with_tap_location(coord_mapper, InputTapLocation::default())
+    }
+
+    pub fn new_with_tap_location(
+        coord_mapper: MouseCoordMapper,
+        tap_location: InputTapLocation,
+    ) -> Self {
+        let keyboard = KeyboardInjector::new_with_config(KeyboardInjectorConfig { tap_location })
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
-        let mouse = MouseInjector::new()
+        let mouse = MouseInjector::new_with_config(MouseInjectorConfig { tap_location })
             .map_err(|e| tracing::error!("Failed to create mouse injector: {e}"))
             .ok();
 
         if keyboard.is_none() || mouse.is_none() {
             tracing::warn!("Input injection may fail — ensure Accessibility permission is granted");
         }
+        tracing::info!(?tap_location, "Input injection tap location configured");
 
         Self {
             keyboard,
             mouse,
             last_mouse_x: 0,
             last_mouse_y: 0,
+            left_pressed: false,
+            right_pressed: false,
+            middle_pressed: false,
             coord_mapper,
+        }
+    }
+
+    fn inject_button(&mut self, button: MouseButton, pressed: bool) -> anyhow::Result<()> {
+        let Some(mouse) = &self.mouse else {
+            return Ok(());
+        };
+
+        mouse.button_event(button, pressed, self.last_mouse_x, self.last_mouse_y)?;
+        self.set_button_state(button, pressed);
+        Ok(())
+    }
+
+    fn set_button_state(&mut self, button: MouseButton, pressed: bool) {
+        match button {
+            MouseButton::Left => self.left_pressed = pressed,
+            MouseButton::Right => self.right_pressed = pressed,
+            MouseButton::Middle => self.middle_pressed = pressed,
+        }
+    }
+
+    fn reset_mouse_buttons(&mut self) {
+        let pressed_buttons = [
+            (MouseButton::Left, self.left_pressed),
+            (MouseButton::Right, self.right_pressed),
+            (MouseButton::Middle, self.middle_pressed),
+        ];
+
+        for (button, pressed) in pressed_buttons {
+            if !pressed {
+                continue;
+            }
+
+            let result = self.mouse.as_ref().map_or(Ok(()), |mouse| {
+                mouse.button_event(button, false, self.last_mouse_x, self.last_mouse_y)
+            });
+            if let Err(e) = result {
+                tracing::warn!(?button, "Mouse button release during reset failed: {e}");
+            }
+            self.set_button_state(button, false);
         }
     }
 }
@@ -100,52 +157,25 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        let Some(m) = &self.mouse else { return };
-
         let result = match event {
             MouseEvent::Move { x, y } => {
                 let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
-                m.move_to(mx, my)
+                self.mouse
+                    .as_ref()
+                    .map_or(Ok(()), |mouse| mouse.move_to(mx, my))
             }
-            MouseEvent::LeftPressed => m.button_event(
-                MouseButton::Left,
-                true,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::LeftReleased => m.button_event(
-                MouseButton::Left,
-                false,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::RightPressed => m.button_event(
-                MouseButton::Right,
-                true,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::RightReleased => m.button_event(
-                MouseButton::Right,
-                false,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::MiddlePressed => m.button_event(
-                MouseButton::Middle,
-                true,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::MiddleReleased => m.button_event(
-                MouseButton::Middle,
-                false,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::Scroll { x, y } => m.scroll(x, y),
+            MouseEvent::LeftPressed => self.inject_button(MouseButton::Left, true),
+            MouseEvent::LeftReleased => self.inject_button(MouseButton::Left, false),
+            MouseEvent::RightPressed => self.inject_button(MouseButton::Right, true),
+            MouseEvent::RightReleased => self.inject_button(MouseButton::Right, false),
+            MouseEvent::MiddlePressed => self.inject_button(MouseButton::Middle, true),
+            MouseEvent::MiddleReleased => self.inject_button(MouseButton::Middle, false),
+            MouseEvent::Scroll { x, y } => self
+                .mouse
+                .as_ref()
+                .map_or(Ok(()), |mouse| mouse.scroll(x, y)),
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");
                 Ok(())
@@ -154,6 +184,16 @@ impl RdpServerInputHandler for MacInputHandler {
 
         if let Err(e) = result {
             tracing::warn!("Mouse injection failed: {e}");
+        }
+    }
+
+    fn reset(&mut self) {
+        self.reset_mouse_buttons();
+
+        if let Some(kb) = &mut self.keyboard {
+            if let Err(e) = kb.reset_modifiers() {
+                tracing::warn!("Keyboard modifier reset failed: {e}");
+            }
         }
     }
 }

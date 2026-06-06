@@ -71,6 +71,14 @@ pub struct Cli {
     #[arg(long, value_parser = ["text", "json"])]
     pub log_format: Option<String>,
 
+    /// CoreGraphics input tap: session (default), annotated_session, or hid
+    #[arg(long, value_parser = ["session", "annotated_session", "hid"])]
+    pub input_tap: Option<String>,
+
+    /// Advertise the FreeRDP advanced-input channel
+    #[arg(long)]
+    pub advanced_input: bool,
+
     /// Print the macOS Screen Recording and Accessibility permission status
     /// and exit. Exit status is 0 if both are granted, 1 otherwise. Safe in a
     /// noninteractive context — never opens System Settings or prompts.
@@ -135,6 +143,12 @@ pub fn load_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     }
     if let Some(format) = &cli.log_format {
         config.log_format = Some(format.clone());
+    }
+    if let Some(input_tap) = &cli.input_tap {
+        config.input_tap = Some(input_tap.clone());
+    }
+    if cli.advanced_input {
+        config.advanced_input = Some(true);
     }
     if let Some(cert_path) = &cli.cert_path {
         config.cert_path = Some(cert_path.clone());
@@ -241,6 +255,8 @@ mod tests {
             chroma_mode: Some("avc444".to_string()),
             resolution: Some("2".to_string()),
             log_level: Some("debug".to_string()),
+            input_tap: Some("hid".to_string()),
+            advanced_input: true,
             ..Cli::default()
         };
 
@@ -255,6 +271,8 @@ mod tests {
         assert_eq!(config.bitrate_mbps, Some(20));
         assert_eq!(config.chroma_mode.as_deref(), Some("avc444"));
         assert_eq!(config.resolution.as_deref(), Some("2"));
+        assert_eq!(config.input_tap.as_deref(), Some("hid"));
+        assert_eq!(config.advanced_input, Some(true));
         assert_eq!(
             config.cert_path.as_deref(),
             Some(dir.path().join("cert.pem").as_path())

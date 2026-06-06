@@ -123,6 +123,16 @@ log_level = "info"
 # Default: <base>/logs/macrdp.log
 # log_path = "/path/to/macrdp.log"
 
+# CoreGraphics event tap for injected keyboard/mouse events.
+# Default: "session" keeps injected events out of the low-level HID tap.
+# Use "hid" only if an app requires the legacy low-level injection path.
+# Options: "session", "annotated_session", "hid"
+# input_tap = "session"
+
+# Advertise FreeRDP's advanced-input dynamic channel.
+# Default: false. Standard RDP keyboard/mouse input still works.
+# advanced_input = false
+
 # ─── Session ───────────────────────────────────────────────────────────────────
 
 # Idle timeout in seconds (disconnect after no input)

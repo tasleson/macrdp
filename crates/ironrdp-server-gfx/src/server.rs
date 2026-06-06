@@ -1,7 +1,8 @@
 use core::net::SocketAddr;
+use std::io;
 use std::net::TcpListener as StdTcpListener;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
@@ -12,7 +13,7 @@ use ironrdp_core::{decode, encode_vec, impl_as_any, WriteBuf};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
-use ironrdp_pdu::input::InputEventPdu;
+use ironrdp_pdu::input::{InputEvent, InputEventPdu};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
 use ironrdp_pdu::rdp::capability_sets::{
     BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags,
@@ -105,7 +106,7 @@ impl RdpServerSecurity {
 }
 
 struct AInputHandler {
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    handler: Arc<StdMutex<Box<dyn RdpServerInputHandler>>>,
 }
 
 impl_as_any!(AInputHandler);
@@ -131,8 +132,9 @@ impl dvc::DvcProcessor for AInputHandler {
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
                 let handler = Arc::clone(&self.handler);
-                task::spawn_blocking(move || {
-                    handler.blocking_lock().mouse(pdu.into());
+                task::spawn_blocking(move || match handler.lock() {
+                    Ok(mut handler) => handler.mouse(pdu.into()),
+                    Err(_) => warn!("input handler lock poisoned; dropping advanced mouse event"),
                 });
             }
         }
@@ -224,7 +226,7 @@ impl DisplayControlHandler for DisplayControlBackend {
 pub struct RdpServer {
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    handler: Arc<StdMutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
@@ -235,6 +237,7 @@ pub struct RdpServer {
     local_addr: Option<SocketAddr>,
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
+    advanced_input_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -280,7 +283,7 @@ impl RdpServer {
         }
         Self {
             opts,
-            handler: Arc::new(Mutex::new(handler)),
+            handler: Arc::new(StdMutex::new(handler)),
             display: Arc::new(Mutex::new(display)),
             static_channels: StaticChannelSet::new(),
             sound_factory,
@@ -291,6 +294,7 @@ impl RdpServer {
             local_addr: None,
             gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false))),
             gfx_enabled: true,
+            advanced_input_enabled: false,
         }
     }
 
@@ -309,12 +313,88 @@ impl RdpServer {
         self.gfx_enabled = enabled;
     }
 
+    pub fn set_advanced_input_enabled(&mut self, enabled: bool) {
+        self.advanced_input_enabled = enabled;
+    }
+
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
         builder::RdpServerBuilder::new()
     }
 
     pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
         &self.ev_sender
+    }
+
+    fn reset_input_handler(&mut self) {
+        match self.handler.lock() {
+            Ok(mut handler) => handler.reset(),
+            Err(_) => warn!("input handler lock poisoned; unable to reset input state"),
+        }
+    }
+
+    fn dispatch_fastpath_input_event(
+        handler: &mut dyn RdpServerInputHandler,
+        event: FastPathInputEvent,
+    ) {
+        match event {
+            FastPathInputEvent::KeyboardEvent(flags, key) => {
+                handler.keyboard((key, flags).into());
+            }
+
+            FastPathInputEvent::UnicodeKeyboardEvent(flags, key) => {
+                handler.keyboard((key, flags).into());
+            }
+
+            FastPathInputEvent::SyncEvent(flags) => {
+                handler.keyboard(flags.into());
+            }
+
+            FastPathInputEvent::MouseEvent(mouse) => {
+                handler.mouse(mouse.into());
+            }
+
+            FastPathInputEvent::MouseEventEx(mouse) => {
+                handler.mouse(mouse.into());
+            }
+
+            FastPathInputEvent::MouseEventRel(mouse) => {
+                handler.mouse(mouse.into());
+            }
+
+            FastPathInputEvent::QoeEvent(quality) => {
+                warn!("Received QoE: {}", quality);
+            }
+        }
+    }
+
+    fn dispatch_slowpath_input_event(handler: &mut dyn RdpServerInputHandler, event: InputEvent) {
+        match event {
+            InputEvent::ScanCode(key) => {
+                handler.keyboard((key.key_code, key.flags).into());
+            }
+
+            InputEvent::Unicode(key) => {
+                handler.keyboard((key.unicode_code, key.flags).into());
+            }
+
+            InputEvent::Sync(sync) => {
+                handler.keyboard(sync.flags.into());
+            }
+
+            InputEvent::Mouse(mouse) => {
+                handler.mouse(mouse.into());
+            }
+
+            InputEvent::MouseX(mouse) => {
+                handler.mouse(mouse.into());
+            }
+
+            InputEvent::MouseRel(mouse) => {
+                handler.mouse(mouse.into());
+            }
+
+            InputEvent::Unused(_) => {}
+        }
     }
 
     fn attach_channels(&mut self, acceptor: &mut Acceptor) {
@@ -334,10 +414,16 @@ impl RdpServer {
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
         let mut dvc = dvc::DrdynvcServer::new()
-            .with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
-            })
             .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+
+        if self.advanced_input_enabled {
+            dvc = dvc.with_dynamic_channel(AInputHandler {
+                handler: Arc::clone(&self.handler),
+            });
+            debug!("Advanced input channel registered");
+        } else {
+            debug!("Advanced input channel disabled");
+        }
 
         // Only register GFX channel if GFX frame sending is enabled
         if self.gfx_enabled {
@@ -773,7 +859,14 @@ impl RdpServer {
         let this = Rc::clone(&s);
         let dispatch_pdu = async move {
             loop {
-                let (action, bytes) = reader.read_pdu().await?;
+                let (action, bytes) = match reader.read_pdu().await {
+                    Ok(pdu) => pdu,
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        debug!("Client closed the connection while waiting for a PDU");
+                        break Ok(RunState::Disconnect);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 let mut this = this.lock().await;
                 match this
                     .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
@@ -851,6 +944,11 @@ impl RdpServer {
             state = dispatch_display => state,
             state = dispatch_events => state,
         );
+
+        if !matches!(state, Ok(RunState::DeactivationReactivation { .. })) {
+            let mut this = s.lock().await;
+            this.reset_input_handler();
+        }
 
         debug!("End of client loop: {state:?}");
         state
@@ -1023,37 +1121,22 @@ impl RdpServer {
     }
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {
-        for event in input.input_events().iter().copied() {
-            let mut handler = self.handler.lock().await;
-            match event {
-                FastPathInputEvent::KeyboardEvent(flags, key) => {
-                    handler.keyboard((key, flags).into());
-                }
+        let events = input.input_events().to_vec();
+        let handler = Arc::clone(&self.handler);
+        let result = task::spawn_blocking(move || {
+            let Ok(mut handler) = handler.lock() else {
+                warn!("input handler lock poisoned; dropping fast-path input batch");
+                return;
+            };
 
-                FastPathInputEvent::UnicodeKeyboardEvent(flags, key) => {
-                    handler.keyboard((key, flags).into());
-                }
-
-                FastPathInputEvent::SyncEvent(flags) => {
-                    handler.keyboard(flags.into());
-                }
-
-                FastPathInputEvent::MouseEvent(mouse) => {
-                    handler.mouse(mouse.into());
-                }
-
-                FastPathInputEvent::MouseEventEx(mouse) => {
-                    handler.mouse(mouse.into());
-                }
-
-                FastPathInputEvent::MouseEventRel(mouse) => {
-                    handler.mouse(mouse.into());
-                }
-
-                FastPathInputEvent::QoeEvent(quality) => {
-                    warn!("Received QoE: {}", quality);
-                }
+            for event in events {
+                Self::dispatch_fastpath_input_event(handler.as_mut(), event);
             }
+        })
+        .await;
+
+        if let Err(e) = result {
+            warn!("fast-path input worker failed: {e}");
         }
     }
 
@@ -1132,35 +1215,22 @@ impl RdpServer {
     }
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
-        for event in input.0 {
-            let mut handler = self.handler.lock().await;
-            match event {
-                ironrdp_pdu::input::InputEvent::ScanCode(key) => {
-                    handler.keyboard((key.key_code, key.flags).into());
-                }
+        let events = input.0;
+        let handler = Arc::clone(&self.handler);
+        let result = task::spawn_blocking(move || {
+            let Ok(mut handler) = handler.lock() else {
+                warn!("input handler lock poisoned; dropping slow-path input batch");
+                return;
+            };
 
-                ironrdp_pdu::input::InputEvent::Unicode(key) => {
-                    handler.keyboard((key.unicode_code, key.flags).into());
-                }
-
-                ironrdp_pdu::input::InputEvent::Sync(sync) => {
-                    handler.keyboard(sync.flags.into());
-                }
-
-                ironrdp_pdu::input::InputEvent::Mouse(mouse) => {
-                    handler.mouse(mouse.into());
-                }
-
-                ironrdp_pdu::input::InputEvent::MouseX(mouse) => {
-                    handler.mouse(mouse.into());
-                }
-
-                ironrdp_pdu::input::InputEvent::MouseRel(mouse) => {
-                    handler.mouse(mouse.into());
-                }
-
-                ironrdp_pdu::input::InputEvent::Unused(_) => {}
+            for event in events {
+                Self::dispatch_slowpath_input_event(handler.as_mut(), event);
             }
+        })
+        .await;
+
+        if let Err(e) = result {
+            warn!("slow-path input worker failed: {e}");
         }
     }
 
@@ -1330,7 +1400,7 @@ where
     W: FramedWrite,
 {
     type WriteAllFut<'write>
-        = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'write>>
+        = core::pin::Pin<Box<dyn core::future::Future<Output = io::Result<()>> + 'write>>
     where
         Self: 'write;
 

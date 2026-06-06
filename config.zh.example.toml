@@ -122,6 +122,16 @@ log_level = "info"
 # 默认值: <base>/logs/macrdp.log
 # log_path = "/path/to/macrdp.log"
 
+# 键盘/鼠标注入使用的 CoreGraphics event tap。
+# 默认值: "session"，避免把注入事件放入底层 HID tap。
+# 仅当应用需要旧的底层注入路径时才使用 "hid"。
+# 可选值: "session", "annotated_session", "hid"
+# input_tap = "session"
+
+# 是否通告 FreeRDP advanced-input 动态通道。
+# 默认值: false。标准 RDP 键盘/鼠标输入仍然可用。
+# advanced_input = false
+
 # ─── 会话 ─────────────────────────────────────────────────────────────────────
 
 # 空闲超时时间 (秒), 无输入操作后自动断开连接

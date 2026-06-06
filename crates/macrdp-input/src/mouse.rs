@@ -4,6 +4,8 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
 
+use crate::InputTapLocation;
+
 extern "C" {
     fn CGEventCreateScrollWheelEvent2(
         source: *mut core_graphics::sys::CGEventSource,
@@ -32,14 +34,27 @@ const LINES_PER_DETENT: i32 = 1;
 /// unusually large rotation can't ask macOS to jump an absurd distance.
 const MAX_SCROLL_LINES: i32 = 64;
 
-pub struct MouseInjector;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MouseInjectorConfig {
+    pub tap_location: InputTapLocation,
+}
+
+pub struct MouseInjector {
+    tap_location: InputTapLocation,
+}
 
 impl MouseInjector {
     pub fn new() -> Result<Self> {
+        Self::new_with_config(MouseInjectorConfig::default())
+    }
+
+    pub fn new_with_config(config: MouseInjectorConfig) -> Result<Self> {
         let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
             anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
         })?;
-        Ok(Self)
+        Ok(Self {
+            tap_location: config.tap_location,
+        })
     }
 
     fn source() -> Result<CGEventSource> {
@@ -54,7 +69,7 @@ impl MouseInjector {
             CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
                 .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
 
-        event.post(CGEventTapLocation::HID);
+        event.post(self.cg_event_tap_location());
         tracing::trace!(x, y, "Mouse moved");
         Ok(())
     }
@@ -74,7 +89,7 @@ impl MouseInjector {
         let event = CGEvent::new_mouse_event(source, event_type, point, cg_button)
             .map_err(|_| anyhow::anyhow!("Failed to create mouse button event"))?;
 
-        event.post(CGEventTapLocation::HID);
+        event.post(self.cg_event_tap_location());
         tracing::trace!(?button, pressed, x, y, "Mouse button event");
         Ok(())
     }
@@ -104,7 +119,7 @@ impl MouseInjector {
                 return Err(anyhow::anyhow!("Failed to create scroll event"));
             }
             let event = CGEvent::from_ptr(event_ref);
-            event.post(CGEventTapLocation::HID);
+            event.post(self.cg_event_tap_location());
         }
         tracing::trace!(horizontal, vertical, "Mouse scroll");
         Ok(())
@@ -118,6 +133,10 @@ impl MouseInjector {
     fn units_to_lines(units: i32) -> i32 {
         let lines = units.saturating_mul(LINES_PER_DETENT) / WHEEL_DELTA;
         lines.clamp(-MAX_SCROLL_LINES, MAX_SCROLL_LINES)
+    }
+
+    fn cg_event_tap_location(&self) -> CGEventTapLocation {
+        self.tap_location.as_cg_event_tap_location()
     }
 }
 
