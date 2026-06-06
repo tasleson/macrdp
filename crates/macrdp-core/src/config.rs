@@ -81,7 +81,7 @@ impl std::fmt::Debug for ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "::".to_string(),
             port: 3389,
             frame_rate: 60,
             width: 0,
@@ -180,7 +180,7 @@ mod tests {
     fn test_default_config() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 3389);
-        assert_eq!(config.bind_address, "0.0.0.0");
+        assert_eq!(config.bind_address, "::");
         assert_eq!(config.frame_rate, 60);
         assert!(config.username.is_none());
     }

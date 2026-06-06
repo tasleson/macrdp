@@ -19,9 +19,9 @@
 port = 13389
 
 # IP address to listen on
-# Default: 0.0.0.0 (all IPv4 interfaces)
-# Use 127.0.0.1 to accept local connections only.
-bind_address = "0.0.0.0"
+# Default: :: (all interfaces, dual-stack IPv4 + IPv6).
+# Use 0.0.0.0 for IPv4-only, or 127.0.0.1 to accept local connections only.
+bind_address = "::"
 
 # v1 supports one active RDP session at a time.
 # Concurrent client sessions are unsupported.

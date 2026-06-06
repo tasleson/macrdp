@@ -78,7 +78,7 @@ Copy `config.example.toml` to `config.toml` and edit as needed:
 ```toml
 # Network
 port = 13389
-bind_address = "0.0.0.0"
+bind_address = "::"  # dual-stack IPv4 + IPv6; use "0.0.0.0" to force IPv4-only
 
 # Authentication
 username = "admin"

@@ -169,8 +169,28 @@ fn validate_bind_address(bind_address: &str, port: u16) -> Result<(TcpListener, 
         format!("Invalid bind_address `{bind_address}`; expected an IP address")
     })?;
     let requested_addr = SocketAddr::new(ip, port);
-    let listener = TcpListener::bind(requested_addr)
-        .with_context(|| format!("Failed to bind to {requested_addr}"))?;
+
+    // For the IPv6 unspecified address (`::`), build a dual-stack listener so
+    // mDNS or other resolvers handing the client an IPv4-mapped address still
+    // reach us. macOS defaults IPV6_V6ONLY to true, so clear it explicitly.
+    let listener = if matches!(ip, IpAddr::V6(v6) if v6.is_unspecified()) {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+            .context("Failed to create IPv6 TCP socket")?;
+        socket
+            .set_only_v6(false)
+            .context("Failed to clear IPV6_V6ONLY for dual-stack listener")?;
+        socket
+            .bind(&requested_addr.into())
+            .with_context(|| format!("Failed to bind to {requested_addr}"))?;
+        socket
+            .listen(1024)
+            .with_context(|| format!("Failed to listen on {requested_addr}"))?;
+        TcpListener::from(socket)
+    } else {
+        TcpListener::bind(requested_addr)
+            .with_context(|| format!("Failed to bind to {requested_addr}"))?
+    };
     let actual_addr = listener.local_addr()?;
     Ok((listener, actual_addr))
 }
@@ -775,6 +795,20 @@ mod tests {
         let err = validate_bind_address("localhost", 3389).unwrap_err();
 
         assert!(err.to_string().contains("Invalid bind_address"));
+    }
+
+    #[test]
+    fn bind_validation_dual_stack_accepts_ipv4_clients() {
+        // The IPv6 unspecified address must produce a dual-stack listener so
+        // mDNS/IPv4 clients can still reach the server. Without IPV6_V6ONLY
+        // cleared this connect() would be refused on macOS.
+        let (listener, addr) = validate_bind_address("::", 0).unwrap();
+        let port = addr.port();
+
+        let v4 = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .expect("IPv4 client should reach dual-stack listener");
+        drop(v4);
+        drop(listener);
     }
 
     #[test]
