@@ -47,7 +47,7 @@ GFX ack timing. New file macrdp-core/src/bitrate_controller.rs plus integration
 into macrdp-core/src/server.rs. This is the most invasive change — touches the
 core server loop and depends on several of the items below.
 
-**Static scene detection** (c2a915d)
+**Static scene detection** (c2a915d) — DONE
 Idle tracking with IDR keepalive — stops encoding when the screen is static.
 Integrated into macrdp-core alongside BitrateController.
 
