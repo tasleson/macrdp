@@ -57,7 +57,7 @@ for static scene detection.
 Uses SetOption API to change bitrate at runtime instead of requiring session
 recreation. In macrdp-encode/src/openh264_enc.rs. Prereq for BitrateController.
 
-**Runtime FPS control** (e882751)
+**Runtime FPS control** (e882751) — DONE
 SCStream::update_configuration changes capture framerate dynamically. In
 macrdp-capture/src/lib.rs. Used by BitrateController to drop FPS on congestion.
 
