@@ -48,9 +48,9 @@ core server loop and depends on several of the items below.
 Idle tracking with IDR keepalive — stops encoding when the screen is static.
 Integrated into macrdp-core alongside BitrateController.
 
-**CaptureEvent / Idle propagation** (476085e, 55c1e57)
+**CaptureEvent / Idle propagation** (476085e, 55c1e57) — DONE
 CaptureEvent enum propagates Idle events from capture to the display pipeline.
-New enum in macrdp-capture, handling in macrdp-server display adapter. Prereq
+New enum in macrdp-capture, handling in macrdp-core display adapter. Prereq
 for static scene detection.
 
 **Runtime bitrate update for OpenH264** (57d2a26) — DONE
