@@ -14,6 +14,10 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::bitrate_controller::{
+    detect_network_phase1, BitrateController, FrameStats, NetworkType,
+};
+
 /// OpenH264 enforces max(w,h) ≤ 3840 and min(w,h) ≤ 2160 (Level 5.2).
 /// We clamp client-requested resolutions to these limits so that the
 /// software encoder fallback always succeeds.  VideoToolbox has its own
@@ -28,10 +32,6 @@ const MAX_ENCODE_SHORT: u16 = 2160;
 /// creating a cascade that can crash the session.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-const ADAPTIVE_BITRATE_MIN_INTERVAL_FRAMES: u64 = 30;
-const ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS: f64 = 0.10;
-const ADAPTIVE_BITRATE_MIN_DELTA_BPS: u32 = 1_000_000;
-const ADAPTIVE_BITRATE_FLOOR_BPS: u32 = 500_000;
 const GFX_CAPS_WAIT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_CURSOR_SIZE: u16 = 24;
 
@@ -340,6 +340,14 @@ impl RdpServerDisplay for MacDisplay {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
 
+        let peer_addr = {
+            let gfx = self.gfx_state.lock().unwrap();
+            gfx.peer_addr
+        };
+        let is_lan = peer_addr
+            .map(|ip| detect_network_phase1(ip) == NetworkType::Lan)
+            .unwrap_or(false);
+
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
@@ -347,6 +355,8 @@ impl RdpServerDisplay for MacDisplay {
             pixel_format: capture_pixel_format(self.mode_444, encoder.as_deref()),
             show_cursor: self.show_cursor,
         };
+        let initial_fps = capture_config.frame_rate;
+        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, is_lan);
 
         // The preliminary capturer used BGRA; recreate if the encoder needs NV12.
         let capturer = if capture_config.pixel_format != CapturePixelFormat::Bgra {
@@ -360,7 +370,7 @@ impl RdpServerDisplay for MacDisplay {
             capture_config,
             encoder,
             gfx_state: Arc::clone(&self.gfx_state),
-            adaptive_bitrate: AdaptiveBitrateController::new(self.base_bitrate),
+            bitrate_ctrl,
             idle_frames: IdleFrameController::new(self.skip_unchanged, self.idle_keyframe_interval),
             pending_resize: Arc::clone(&self.pending_resize),
             mode_444: self.mode_444,
@@ -371,6 +381,7 @@ impl RdpServerDisplay for MacDisplay {
             gfx_wait_frames: 0,
             gfx_no_caps_frames: 0,
             sent_pointer: false,
+            last_applied_fps: initial_fps,
         }))
     }
 }
@@ -453,74 +464,18 @@ struct MacDisplayUpdates {
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     gfx_state: Arc<Mutex<GfxState>>,
-    adaptive_bitrate: AdaptiveBitrateController,
+    bitrate_ctrl: BitrateController,
     idle_frames: IdleFrameController,
     pending_resize: Arc<Mutex<Option<(DesktopSize, Instant)>>>,
     mode_444: bool,
     display_frame_count: u64,
     frame_pacer: FramePacer,
-    /// Backpressure: frames remaining to skip before encoding the next one.
-    /// Set after each encode based on the client's pending ack queue depth.
     backpressure_skip_remaining: u32,
     last_backpressure_warn: Option<std::time::Instant>,
-    /// Frame counter for rate-limiting "GFX not ready" diagnostic logs
     gfx_wait_frames: u64,
-    /// Consecutive frames spent with the GFX channel open but no capabilities advertised
     gfx_no_caps_frames: u64,
-    /// Some clients hide their local cursor and wait for a server pointer shape.
     sent_pointer: bool,
-}
-
-#[derive(Debug, Clone)]
-struct AdaptiveBitrateController {
-    base_bitrate: u32,
-    current_bitrate: u32,
-    last_update_frame: u64,
-}
-
-impl AdaptiveBitrateController {
-    fn new(base_bitrate: u32) -> Self {
-        Self {
-            base_bitrate,
-            current_bitrate: base_bitrate,
-            last_update_frame: 0,
-        }
-    }
-
-    fn recommended_bitrate(&self, gfx: &GfxState) -> u32 {
-        let floor = ADAPTIVE_BITRATE_FLOOR_BPS.min(self.base_bitrate);
-        gfx.adaptive_bitrate(self.base_bitrate)
-            .clamp(floor, self.base_bitrate)
-    }
-
-    fn next_update(&mut self, frame_count: u64, gfx: &GfxState) -> Option<u32> {
-        if frame_count.saturating_sub(self.last_update_frame) < ADAPTIVE_BITRATE_MIN_INTERVAL_FRAMES
-        {
-            return None;
-        }
-
-        let recommended = self.recommended_bitrate(gfx);
-        if !bitrate_change_exceeds_hysteresis(self.current_bitrate, recommended) {
-            return None;
-        }
-
-        self.current_bitrate = recommended;
-        self.last_update_frame = frame_count;
-        Some(recommended)
-    }
-}
-
-fn bitrate_change_exceeds_hysteresis(current: u32, recommended: u32) -> bool {
-    if current == 0 {
-        return recommended > 0;
-    }
-
-    let delta = current.abs_diff(recommended);
-    if delta >= ADAPTIVE_BITRATE_MIN_DELTA_BPS {
-        return true;
-    }
-
-    (delta as f64 / current as f64) >= ADAPTIVE_BITRATE_RELATIVE_HYSTERESIS
+    last_applied_fps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,7 +799,13 @@ impl MacDisplayUpdates {
         self.backpressure_skip_remaining = skip;
     }
 
-    fn record_gfx_frame_sent(&mut self, encode_ms: f64, frame_bytes: usize, pending_acks: u32) {
+    fn record_gfx_frame_sent(
+        &mut self,
+        encode_ms: f64,
+        frame_bytes: usize,
+        is_keyframe: bool,
+        pending_acks: u32,
+    ) {
         {
             let mut st = self.gfx_state.lock().unwrap();
             st.last_encode_ms = encode_ms;
@@ -854,23 +815,43 @@ impl MacDisplayUpdates {
         self.frame_pacer.record_sent(Instant::now());
         self.update_backpressure(pending_acks);
         self.idle_frames.record_sent(Instant::now());
+        self.bitrate_ctrl.record_frame(FrameStats {
+            encode_ms,
+            frame_bytes: frame_bytes as u32,
+            is_keyframe,
+        });
+        self.apply_adaptive_decision();
     }
 
-    fn apply_adaptive_bitrate(&mut self) {
-        let target_bitrate = {
-            let state = self.gfx_state.lock().unwrap();
-            self.adaptive_bitrate
-                .next_update(self.display_frame_count, &state)
-        };
+    fn apply_adaptive_decision(&mut self) {
+        if !self.bitrate_ctrl.should_evaluate() {
+            return;
+        }
 
-        if let Some(target_bitrate) = target_bitrate {
-            if let Some(encoder) = &mut self.encoder {
-                encoder.set_bitrate(target_bitrate);
+        {
+            let gfx = self.gfx_state.lock().unwrap();
+            if gfx.rtt_ewma_ms > 0.0 {
+                self.bitrate_ctrl.update_network_type(gfx.rtt_ewma_ms);
             }
-            tracing::info!(
-                target_bitrate_mbps = target_bitrate as f64 / 1_000_000.0,
-                "Adaptive bitrate applied"
-            );
+        }
+
+        let decision = self.bitrate_ctrl.evaluate();
+
+        if let Some(ref mut enc) = self.encoder {
+            enc.set_bitrate(decision.bitrate_bps);
+        }
+
+        if decision.fps != self.last_applied_fps {
+            if let Err(e) = self.capturer.set_frame_rate(decision.fps) {
+                tracing::warn!("Failed to update frame rate: {e}");
+            } else {
+                self.last_applied_fps = decision.fps;
+                tracing::info!(
+                    fps = decision.fps,
+                    bitrate_mbps = decision.bitrate_bps as f64 / 1_000_000.0,
+                    "Adaptive: fps/bitrate updated"
+                );
+            }
         }
     }
 
@@ -927,7 +908,6 @@ impl MacDisplayUpdates {
 
             // GFX H.264 path — always send at capture rate, never block on acks
             self.display_frame_count += 1;
-            self.apply_adaptive_bitrate();
             if let Some(encoder) = &mut self.encoder {
                 let t0 = std::time::Instant::now();
 
@@ -961,6 +941,7 @@ impl MacDisplayUpdates {
                                 self.record_gfx_frame_sent(
                                     encode_ms,
                                     encoded.data.len(),
+                                    encoded.is_keyframe,
                                     pending_acks,
                                 );
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
@@ -1004,7 +985,12 @@ impl MacDisplayUpdates {
                                 encode_ms = format!("{:.1}", encode_ms),
                                 "Display: sending AVC444 GFX frame"
                             );
-                            self.record_gfx_frame_sent(encode_ms, total_bytes, pending_acks);
+                            self.record_gfx_frame_sent(
+                                encode_ms,
+                                total_bytes,
+                                encoded.main_view.is_keyframe,
+                                pending_acks,
+                            );
                             return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
                                 width: frame.width as u16,
@@ -1043,7 +1029,12 @@ impl MacDisplayUpdates {
                             encode_ms = format!("{:.1}", encode_ms),
                             "Display: sending GFX frame"
                         );
-                        self.record_gfx_frame_sent(encode_ms, encoded.data.len(), pending_acks);
+                        self.record_gfx_frame_sent(
+                            encode_ms,
+                            encoded.data.len(),
+                            encoded.is_keyframe,
+                            pending_acks,
+                        );
                         return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
                             width: frame.width as u16,
@@ -1653,34 +1644,6 @@ mod tests {
                 c.name
             );
         }
-    }
-
-    #[test]
-    fn adaptive_bitrate_respects_interval_and_hysteresis() {
-        let mut gfx = GfxState::new(1920, 1080, false);
-        let mut controller = AdaptiveBitrateController::new(10_000_000);
-
-        gfx.network_quality = 0.8;
-        assert_eq!(controller.next_update(29, &gfx), None);
-        assert_eq!(controller.next_update(30, &gfx), Some(8_000_000));
-
-        gfx.network_quality = 0.75;
-        assert_eq!(controller.next_update(60, &gfx), None);
-
-        gfx.network_quality = 0.5;
-        assert_eq!(controller.next_update(60, &gfx), Some(5_000_000));
-    }
-
-    #[test]
-    fn adaptive_bitrate_clamps_to_floor_and_base() {
-        let mut gfx = GfxState::new(1920, 1080, false);
-        let controller = AdaptiveBitrateController::new(10_000_000);
-
-        gfx.network_quality = 0.01;
-        assert_eq!(controller.recommended_bitrate(&gfx), 500_000);
-
-        gfx.network_quality = 1.5;
-        assert_eq!(controller.recommended_bitrate(&gfx), 10_000_000);
     }
 
     fn test_frame_with_dirty_state(

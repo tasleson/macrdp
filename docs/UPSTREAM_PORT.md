@@ -1,5 +1,8 @@
 # Upstream Port: main → experimental
 
+> **Do not commit this file to source control.** It is a local working document
+> for tracking the porting effort and should remain git-ignored.
+
 Status: analysis as of 2026-06-05. Cherry-picking won't work — the branches
 have diverged structurally (main refactored macrdp-server to add display.rs,
 handler.rs, tls.rs, removed keychain.rs/lib.rs; main added
@@ -38,7 +41,7 @@ allocation per frame. Small change in macrdp-encode/src/videotoolbox.rs.
 
 ## High value — Adaptive quality
 
-**BitrateController** (6f8cccc, c267284)
+**BitrateController** (6f8cccc, c267284) — DONE
 Adaptive bitrate with dynamic FPS tiers and LAN bypass. Full feedback loop from
 GFX ack timing. New file macrdp-core/src/bitrate_controller.rs plus integration
 into macrdp-core/src/server.rs. This is the most invasive change — touches the
@@ -61,9 +64,9 @@ recreation. In macrdp-encode/src/openh264_enc.rs. Prereq for BitrateController.
 SCStream::update_configuration changes capture framerate dynamically. In
 macrdp-capture/src/lib.rs. Used by BitrateController to drop FPS on congestion.
 
-**LAN detection** (7d0e7be)
+**LAN detection** (7d0e7be) — DONE
 IP + RTT two-phase approach to detect LAN vs WAN. Used by BitrateController
-for quality bypass on fast networks. Needs peer_addr exposed via GfxState
+for quality bypass on fast networks. Includes peer_addr exposed via GfxState
 (36287f9).
 
 **NetworkQuality scoring** (376a066)
