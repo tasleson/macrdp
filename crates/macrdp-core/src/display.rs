@@ -6,8 +6,8 @@ use ironrdp_server::{
     PixelFormat as RdpPixelFormat, RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use macrdp_capture::{
-    CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, Rect,
-    ScreenCapturer,
+    CaptureConfig, CaptureEvent, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData,
+    Rect, ScreenCapturer,
 };
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -766,8 +766,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
             // which works at the display level (including lock screen).
             let frame = loop {
-                let frame = match self.capturer.next_frame().await {
-                    Some(f) => f,
+                let event = match self.capturer.next_frame().await {
+                    Some(e) => e,
                     None => {
                         // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
                         tracing::warn!(
@@ -802,10 +802,16 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         continue; // retry next_frame with restored SCK capturer
                     }
                 };
+                // Handle CaptureEvent — extract frame or skip idle
+                let frame = match event {
+                    CaptureEvent::Frame(f) => f,
+                    CaptureEvent::Idle => continue,
+                };
                 // If another frame is already buffered, skip this one and grab the newer one
                 // This prevents frame queuing which adds latency
                 match self.capturer.try_next_frame() {
-                    Some(_newer) => continue, // drop older frame, grab newer
+                    Some(CaptureEvent::Frame(_newer)) => continue,
+                    Some(CaptureEvent::Idle) => break frame,
                     None => break frame,
                 }
             };

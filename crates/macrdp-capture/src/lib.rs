@@ -86,6 +86,7 @@ pub enum CapturePixelFormat {
 }
 
 /// Frame pixel data — either raw BGRA bytes or a zero-copy CVPixelBuffer reference
+#[derive(Debug)]
 pub enum FrameData {
     /// BGRA raw bytes copied from CVPixelBuffer (existing behavior)
     Raw(Bytes),
@@ -103,7 +104,17 @@ impl FrameData {
     }
 }
 
+/// Events from the screen capture pipeline.
+#[derive(Debug)]
+pub enum CaptureEvent {
+    /// A complete frame with pixel data ready for encoding.
+    Frame(CapturedFrame),
+    /// Desktop is unchanged — no new pixel data.
+    Idle,
+}
+
 /// A captured screen frame
+#[derive(Debug)]
 pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
@@ -132,11 +143,11 @@ pub struct CaptureConfig {
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
     stream: SCStream,
-    frame_rx: mpsc::Receiver<CapturedFrame>,
+    frame_rx: mpsc::Receiver<CaptureEvent>,
 }
 
 struct OutputHandler {
-    frame_tx: mpsc::Sender<CapturedFrame>,
+    frame_tx: mpsc::Sender<CaptureEvent>,
     pixel_format: CapturePixelFormat,
 }
 
@@ -146,32 +157,32 @@ impl SCStreamOutputTrait for OutputHandler {
             return;
         }
 
-        let frame = match self.pixel_format {
+        let event = match self.pixel_format {
             CapturePixelFormat::Nv12 => extract_frame_nv12(&sample),
             CapturePixelFormat::Bgra => extract_frame(&sample),
         };
-        let Some(frame) = frame else { return };
+        let Some(event) = event else { return };
 
-        // Non-blocking send — drop frame if channel is full
-        let _ = self.frame_tx.try_send(frame);
+        // Non-blocking send — drop event if channel is full
+        let _ = self.frame_tx.try_send(event);
     }
 }
 
-fn should_skip_frame(sample: &CMSampleBuffer) -> bool {
+fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
-    matches!(
-        sample.frame_status(),
-        Some(SCFrameStatus::Idle)
-            | Some(SCFrameStatus::Blank)
-            | Some(SCFrameStatus::Suspended)
-            | Some(SCFrameStatus::Stopped)
-    )
-}
 
-fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
-    // Skip non-complete frames (idle, blank, suspended, etc.)
-    if should_skip_frame(sample) {
-        return None;
+    // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
+    // Blank/Suspended/Stopped are non-displayable states — discard silently.
+    match sample.frame_status() {
+        Some(SCFrameStatus::Idle) => {
+            return Some(CaptureEvent::Idle);
+        }
+        Some(SCFrameStatus::Blank)
+        | Some(SCFrameStatus::Suspended)
+        | Some(SCFrameStatus::Stopped) => {
+            return None;
+        }
+        _ => {}
     }
 
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
@@ -198,7 +209,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         0
     };
 
-    Some(CapturedFrame {
+    Some(CaptureEvent::Frame(CapturedFrame {
         width,
         height,
         data: FrameData::Raw(data),
@@ -206,15 +217,26 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         timestamp_us,
         dirty_rects,
         dirty_rects_available,
-    })
+    }))
 }
 
 /// Extract a frame in NV12 mode — zero-copy CVPixelBuffer wrapped as SafePixelBuffer.
 /// The pixel buffer is retained and passed through the channel without locking or copying.
-fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
-    // Skip non-complete frames (idle, blank, suspended, etc.)
-    if should_skip_frame(sample) {
-        return None;
+fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
+    use screencapturekit::cm::SCFrameStatus;
+
+    // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
+    // Blank/Suspended/Stopped are non-displayable states — discard silently.
+    match sample.frame_status() {
+        Some(SCFrameStatus::Idle) => {
+            return Some(CaptureEvent::Idle);
+        }
+        Some(SCFrameStatus::Blank)
+        | Some(SCFrameStatus::Suspended)
+        | Some(SCFrameStatus::Stopped) => {
+            return None;
+        }
+        _ => {}
     }
 
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
@@ -239,7 +261,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
     // Zero-copy: retain the CVPixelBuffer and wrap it as SafePixelBuffer
     let safe_buf = unsafe { SafePixelBuffer::from_raw(pixel_buffer.as_ptr()) };
 
-    Some(CapturedFrame {
+    Some(CaptureEvent::Frame(CapturedFrame {
         width,
         height,
         data: FrameData::PixelBuffer(safe_buf),
@@ -247,7 +269,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         timestamp_us,
         dirty_rects,
         dirty_rects_available,
-    })
+    }))
 }
 
 fn extract_dirty_rects(sample: &CMSampleBuffer) -> (Vec<Rect>, bool) {
@@ -359,8 +381,9 @@ impl ScreenCapturer {
             })
             .with_shows_cursor(config.show_cursor);
 
-        // Channel for frames: buffer 2 frames to allow for jitter
-        let (frame_tx, frame_rx) = mpsc::channel(2);
+        // Channel for capture events: buffer 2 entries to allow for jitter
+        let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
+            mpsc::channel(2);
 
         let handler = OutputHandler {
             frame_tx,
@@ -383,13 +406,13 @@ impl ScreenCapturer {
         Ok(Self { stream, frame_rx })
     }
 
-    /// Receive the next captured frame (async, cancellation safe)
-    pub async fn next_frame(&mut self) -> Option<CapturedFrame> {
+    /// Receive the next capture event (async, cancellation safe)
+    pub async fn next_frame(&mut self) -> Option<CaptureEvent> {
         self.frame_rx.recv().await
     }
 
-    /// Try to get a buffered frame without waiting. Returns None if no frame ready.
-    pub fn try_next_frame(&mut self) -> Option<CapturedFrame> {
+    /// Try to get a buffered capture event without waiting. Returns None if no event ready.
+    pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
         self.frame_rx.try_recv().ok()
     }
 
@@ -634,5 +657,13 @@ impl Drop for SafePixelBuffer {
         unsafe {
             CVPixelBufferRelease(self.ptr);
         }
+    }
+}
+
+impl std::fmt::Debug for SafePixelBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SafePixelBuffer")
+            .field("ptr", &self.ptr)
+            .finish()
     }
 }
