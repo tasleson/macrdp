@@ -76,12 +76,16 @@ impl CredentialsProxy for CredentialsProxyImpl<'_> {
 
         // Windows usernames are case-insensitive; normalise before comparing.
         if !client_name.eq_ignore_ascii_case(server_name) {
+            let message = format!(
+                "RDP username mismatch: client authenticated as '{client_name}', but macrdp is configured for '{server_name}'. Update the client username or the macrdp username."
+            );
             warn!(
                 client_account = client_name,
                 server_account = server_name,
+                help = %message,
                 "CredSSP username mismatch"
             );
-            return Err(std::io::Error::other("invalid username"));
+            return Err(std::io::Error::other(message));
         }
 
         let mut data = self.credentials.clone();
