@@ -69,7 +69,7 @@ IP + RTT two-phase approach to detect LAN vs WAN. Used by BitrateController
 for quality bypass on fast networks. Includes peer_addr exposed via GfxState
 (36287f9).
 
-**NetworkQuality scoring** (376a066)
+**NetworkQuality scoring** (376a066) — DONE
 Replaces binary LAN/WAN with continuous 0.0–1.0 quality score derived from RTT,
 ack trends, and encode time. Refactors how the server interprets network
 conditions.

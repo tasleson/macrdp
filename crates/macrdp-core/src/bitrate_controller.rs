@@ -9,28 +9,38 @@ pub fn is_private_ip(addr: IpAddr) -> bool {
     }
 }
 
-/// Two-phase LAN detection result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkType {
-    Lan,
-    Wan,
+/// Continuous network quality based on RTT measurement.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkQuality {
+    pub rtt_ms: f64,
+    pub is_private_ip: bool,
 }
 
-/// Phase 1: IP-based initial detection.
-pub fn detect_network_phase1(peer_addr: IpAddr) -> NetworkType {
-    if is_private_ip(peer_addr) {
-        NetworkType::Lan
-    } else {
-        NetworkType::Wan
+impl NetworkQuality {
+    /// Score in [0.1, 1.0]: higher means better (lower latency) network.
+    pub fn score(&self) -> f64 {
+        match self.rtt_ms {
+            r if r < 2.0 => 1.0,
+            r if r < 5.0 => 0.9,
+            r if r < 10.0 => 0.8,
+            r if r < 20.0 => 0.6,
+            r if r < 50.0 => 0.4,
+            r if r < 100.0 => 0.2,
+            _ => 0.1,
+        }
     }
-}
 
-/// Phase 2: RTT-based correction. Call after GFX channel has ~5 RTT samples.
-pub fn detect_network_phase2(phase1: NetworkType, rtt_ewma_ms: f64) -> NetworkType {
-    const LAN_RTT_THRESHOLD_MS: f64 = 10.0;
-    match phase1 {
-        NetworkType::Lan if rtt_ewma_ms > LAN_RTT_THRESHOLD_MS => NetworkType::Wan,
-        other => other,
+    /// Bootstrap from IP type before any RTT samples are available.
+    pub fn from_ip(is_private: bool) -> Self {
+        Self {
+            rtt_ms: if is_private { 5.0 } else { 50.0 },
+            is_private_ip: is_private,
+        }
+    }
+
+    /// Update RTT with a new EWMA sample.
+    pub fn update_rtt(&mut self, rtt_ewma_ms: f64) {
+        self.rtt_ms = rtt_ewma_ms;
     }
 }
 
@@ -57,11 +67,11 @@ pub struct BitrateController {
     eval_window: Vec<FrameStats>,
     last_eval_time: Instant,
     eval_interval: Duration,
-    is_lan: bool,
+    network: NetworkQuality,
 }
 
 impl BitrateController {
-    pub fn new(initial_bitrate: u32, target_fps: u32, is_lan: bool) -> Self {
+    pub fn new(initial_bitrate: u32, target_fps: u32, network: NetworkQuality) -> Self {
         Self {
             initial_bitrate,
             current_bitrate: initial_bitrate,
@@ -70,7 +80,7 @@ impl BitrateController {
             eval_window: Vec::with_capacity(128),
             last_eval_time: Instant::now(),
             eval_interval: Duration::from_secs(1),
-            is_lan,
+            network,
         }
     }
 
@@ -90,21 +100,12 @@ impl BitrateController {
         self.target_fps
     }
 
-    pub fn is_lan(&self) -> bool {
-        self.is_lan
+    pub fn network_score(&self) -> f64 {
+        self.network.score()
     }
 
-    pub fn update_network_type(&mut self, rtt_ewma_ms: f64) {
-        if self.is_lan {
-            let corrected = detect_network_phase2(NetworkType::Lan, rtt_ewma_ms);
-            if corrected == NetworkType::Wan {
-                self.is_lan = false;
-                tracing::info!(
-                    rtt_ewma_ms,
-                    "LAN → WAN: RTT exceeds threshold, activating adaptive bitrate"
-                );
-            }
-        }
+    pub fn update_network_rtt(&mut self, rtt_ewma_ms: f64) {
+        self.network.update_rtt(rtt_ewma_ms);
     }
 
     pub fn on_idle_recovery(&mut self) {
@@ -116,7 +117,8 @@ impl BitrateController {
 
     pub fn evaluate(&mut self) -> AdaptiveDecision {
         let current_fps = self.current_fps();
-        if self.is_lan {
+        // High-quality network: bypass adaptive logic entirely
+        if self.network.score() >= 0.8 {
             self.eval_window.clear();
             self.last_eval_time = Instant::now();
             return AdaptiveDecision {
@@ -131,6 +133,7 @@ impl BitrateController {
             };
         }
 
+        let score = self.network.score();
         let frame_interval_ms = 1000.0 / current_fps as f64;
         let total = self.eval_window.len() as f64;
         let avg_encode_ms = self.eval_window.iter().map(|s| s.encode_ms).sum::<f64>() / total;
@@ -142,15 +145,24 @@ impl BitrateController {
         };
 
         let floor = (self.initial_bitrate as f64 * 0.3) as u32;
-        let ceiling = self.initial_bitrate;
+        let ceiling = (self.initial_bitrate as f64 * (1.0 + score * 0.5)) as u32;
         let target_frame_bytes = self.current_bitrate as f64 / current_fps as f64 / 8.0;
+
+        // Score-based decrease factor: worse network -> more aggressive reduction
+        let decrease_factor = if score <= 0.2 {
+            0.80
+        } else if score < 0.5 {
+            0.85
+        } else {
+            0.90
+        };
 
         let mut new_bitrate = self.current_bitrate;
         let mut new_fps_tier = self.current_fps_tier;
 
         let encode_overloaded = avg_encode_ms > frame_interval_ms * 0.6;
         if encode_overloaded {
-            new_bitrate = ((new_bitrate as f64) * 0.85) as u32;
+            new_bitrate = ((new_bitrate as f64) * decrease_factor) as u32;
         } else if avg_frame_bytes > 0.0
             && target_frame_bytes > 0.0
             && avg_frame_bytes > target_frame_bytes * 1.5
@@ -228,36 +240,16 @@ mod tests {
         ))));
     }
 
-    #[test]
-    fn phase1_detection() {
-        assert_eq!(
-            detect_network_phase1(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
-            NetworkType::Lan
-        );
-        assert_eq!(
-            detect_network_phase1(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-            NetworkType::Wan
-        );
-    }
-
-    #[test]
-    fn phase2_rtt_correction() {
-        assert_eq!(
-            detect_network_phase2(NetworkType::Lan, 50.0),
-            NetworkType::Wan
-        );
-        assert_eq!(
-            detect_network_phase2(NetworkType::Lan, 3.0),
-            NetworkType::Lan
-        );
-        assert_eq!(
-            detect_network_phase2(NetworkType::Wan, 3.0),
-            NetworkType::Wan
-        );
-    }
-
     fn make_controller(initial_bitrate: u32, is_lan: bool, target_fps: u32) -> BitrateController {
-        BitrateController::new(initial_bitrate, target_fps, is_lan)
+        let nq = if is_lan {
+            NetworkQuality::from_ip(true)
+        } else {
+            NetworkQuality {
+                rtt_ms: 30.0,
+                is_private_ip: false,
+            }
+        };
+        BitrateController::new(initial_bitrate, target_fps, nq)
     }
 
     #[test]
@@ -286,6 +278,7 @@ mod tests {
             });
         }
         let decision = ctrl.evaluate();
+        // rtt=30ms -> score=0.4 -> decrease_factor=0.85
         assert_eq!(decision.bitrate_bps, (10_000_000.0 * 0.85) as u32);
     }
 
@@ -384,5 +377,69 @@ mod tests {
         ctrl.on_idle_recovery();
         assert_eq!(ctrl.current_bitrate(), 10_000_000);
         assert_eq!(ctrl.current_fps(), 60);
+    }
+
+    #[test]
+    fn network_quality_scores() {
+        let nq = NetworkQuality {
+            rtt_ms: 1.0,
+            is_private_ip: true,
+        };
+        assert_eq!(nq.score(), 1.0);
+        let nq = NetworkQuality {
+            rtt_ms: 8.0,
+            is_private_ip: true,
+        };
+        assert!((nq.score() - 0.8).abs() < 0.01);
+        let nq = NetworkQuality {
+            rtt_ms: 30.0,
+            is_private_ip: false,
+        };
+        assert!((nq.score() - 0.4).abs() < 0.01);
+        let nq = NetworkQuality {
+            rtt_ms: 150.0,
+            is_private_ip: false,
+        };
+        assert!((nq.score() - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn network_quality_from_ip() {
+        let nq = NetworkQuality::from_ip(true);
+        assert!(nq.score() >= 0.8);
+        let nq = NetworkQuality::from_ip(false);
+        assert!(nq.score() <= 0.5);
+    }
+
+    #[test]
+    fn score_based_high_quality_bypass() {
+        let mut ctrl = BitrateController::new(10_000_000, 60, NetworkQuality::from_ip(true));
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 12.0,
+                frame_bytes: 50_000,
+                is_keyframe: false,
+            });
+        }
+        let decision = ctrl.evaluate();
+        assert_eq!(decision.bitrate_bps, 10_000_000);
+    }
+
+    #[test]
+    fn score_based_poor_quality_aggressive() {
+        let nq = NetworkQuality {
+            rtt_ms: 80.0,
+            is_private_ip: false,
+        };
+        let mut ctrl = BitrateController::new(10_000_000, 60, nq);
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats {
+                encode_ms: 12.0,
+                frame_bytes: 50_000,
+                is_keyframe: false,
+            });
+        }
+        let decision = ctrl.evaluate();
+        assert!(decision.bitrate_bps <= (10_000_000.0 * 0.80) as u32);
     }
 }

@@ -14,9 +14,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::bitrate_controller::{
-    detect_network_phase1, BitrateController, FrameStats, NetworkType,
-};
+use crate::bitrate_controller::{is_private_ip, BitrateController, FrameStats, NetworkQuality};
 
 /// OpenH264 enforces max(w,h) ≤ 3840 and min(w,h) ≤ 2160 (Level 5.2).
 /// We clamp client-requested resolutions to these limits so that the
@@ -344,9 +342,9 @@ impl RdpServerDisplay for MacDisplay {
             let gfx = self.gfx_state.lock().unwrap();
             gfx.peer_addr
         };
-        let is_lan = peer_addr
-            .map(|ip| detect_network_phase1(ip) == NetworkType::Lan)
-            .unwrap_or(false);
+        let network = peer_addr
+            .map(|ip| NetworkQuality::from_ip(is_private_ip(ip)))
+            .unwrap_or(NetworkQuality::from_ip(false));
 
         let capture_config = CaptureConfig {
             width: self.width as u32,
@@ -356,7 +354,7 @@ impl RdpServerDisplay for MacDisplay {
             show_cursor: self.show_cursor,
         };
         let initial_fps = capture_config.frame_rate;
-        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, is_lan);
+        let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
         // The preliminary capturer used BGRA; recreate if the encoder needs NV12.
         let capturer = if capture_config.pixel_format != CapturePixelFormat::Bgra {
@@ -961,7 +959,7 @@ impl MacDisplayUpdates {
         {
             let gfx = self.gfx_state.lock().unwrap();
             if gfx.rtt_ewma_ms > 0.0 {
-                self.bitrate_ctrl.update_network_type(gfx.rtt_ewma_ms);
+                self.bitrate_ctrl.update_network_rtt(gfx.rtt_ewma_ms);
             }
         }
 
