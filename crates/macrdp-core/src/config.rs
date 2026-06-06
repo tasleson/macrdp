@@ -33,8 +33,9 @@ pub struct ServerConfig {
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,
-    /// HiDPI scale factor (default: 1)
-    pub hidpi_scale: Option<u32>,
+    /// Resolution: "auto", or "WxH" like "3840x2160" (default: "auto")
+    #[serde(alias = "hidpi_scale")]
+    pub resolution: Option<String>,
     /// Include the macOS cursor in captured frames. Usually false for RDP
     /// because clients draw a local cursor.
     pub show_cursor: Option<bool>,
@@ -69,7 +70,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("quality", &self.quality)
             .field("encoder", &self.encoder)
             .field("chroma_mode", &self.chroma_mode)
-            .field("hidpi_scale", &self.hidpi_scale)
+            .field("resolution", &self.resolution)
             .field("show_cursor", &self.show_cursor)
             .field("bitrate_mbps", &self.bitrate_mbps)
             .field("skip_unchanged", &self.skip_unchanged)
@@ -98,7 +99,7 @@ impl Default for ServerConfig {
             quality: None,
             encoder: None,
             chroma_mode: None,
-            hidpi_scale: None,
+            resolution: None,
             show_cursor: None,
             bitrate_mbps: None,
             skip_unchanged: None,

@@ -77,7 +77,7 @@ conditions.
 
 ## Medium value — Observability and config
 
-**--perf CLI flag** (f8731fb)
+**--perf CLI flag** (f8731fb) — SKIP
 Frame-level performance statistics: encode time, frame size, pipeline latency.
 New perf_stats.rs in macrdp-core (and duplicated in macrdp-server on main), plus
 CLI arg in macrdp-server/src/main.rs and config.rs.
@@ -92,7 +92,7 @@ ServerHandle::update_config() pushes bitrate/cursor/resolution/encoder/credentia
 changes to a running server without restart. Wired through
 macrdp-core/src/server.rs. Mainly useful alongside the desktop UI.
 
-**Resolution system overhaul** (6be70bb)
+**Resolution system overhaul** (6be70bb) — DONE
 Replaces hidpi_scale with flexible resolution config ("auto" / "WxH" / legacy
 int). Auto-detects Retina scale via detect_display_scale(). Separates SCK
 (capture) and CG (mouse mapping) display size detection. Adds MouseCoordMapper

@@ -151,8 +151,12 @@ struct ServerThreadArgs {
     listener: TcpListener,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
-    logical_w: u16,
-    logical_h: u16,
+    /// SCK logical display size (used for capture sizing and native resolution)
+    sck_w: u16,
+    sck_h: u16,
+    /// CG logical display size (CGEvent coordinate space, used for mouse mapping)
+    cg_w: u16,
+    cg_h: u16,
     width: u16,
     height: u16,
     quality: macrdp_encode::Quality,
@@ -235,6 +239,36 @@ fn generate_password(len: usize) -> String {
     }
 
     password
+}
+
+/// Parse the `resolution` config: "auto" (Retina-aware), "WxH" (explicit), or
+/// a legacy integer scale factor. Returns `(width, height, is_auto)`.
+pub fn resolve_resolution(resolution: Option<&str>, base_w: u16, base_h: u16) -> (u16, u16, bool) {
+    let mode = resolution.unwrap_or("auto");
+    if mode == "auto" {
+        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
+        tracing::info!(scale, base_w, base_h, "Resolution auto: display scale");
+        (
+            base_w.saturating_mul(scale as u16),
+            base_h.saturating_mul(scale as u16),
+            true,
+        )
+    } else if let Some((w, h)) = mode
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
+    {
+        tracing::info!(w, h, "Resolution: explicit WxH");
+        (w, h, false)
+    } else if let Ok(scale) = mode.parse::<u32>() {
+        let scale = scale.clamp(1, 4);
+        let rw = base_w.saturating_mul(scale as u16);
+        let rh = base_h.saturating_mul(scale as u16);
+        tracing::info!(scale, rw, rh, "Resolution: legacy hidpi_scale");
+        (rw, rh, false)
+    } else {
+        tracing::warn!(mode, "Resolution: unrecognized, using logical");
+        (base_w, base_h, true)
+    }
 }
 
 fn resolve_chroma_mode(chroma_mode: Option<&str>) -> Result<bool> {
@@ -327,28 +361,56 @@ pub async fn start_server_with_options(
         }
     }
 
-    // Display detection
+    // Display detection — separate SCK (capture) and CG (mouse mapping) sizes.
+    // CGEvent operates in the CG coordinate space, so mouse mapping MUST use CG dimensions.
     let fixed_config_resolution = config.width > 0 && config.height > 0;
-    let (logical_w, logical_h) = if !options.request_permissions && fixed_config_resolution {
+    let (sck_w, sck_h) = if !options.request_permissions && fixed_config_resolution {
         (config.width as u16, config.height as u16)
     } else {
         match permissions::detect_display_size() {
             Ok((w, h)) => {
-                tracing::info!(width = w, height = h, "Detected macOS logical display size");
+                tracing::info!(width = w, height = h, "SCK logical display size");
                 (w as u16, h as u16)
             }
             Err(e) => {
-                tracing::warn!("Failed to detect display size: {e}, defaulting to 1920x1080");
+                tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
                 (1920u16, 1080u16)
             }
         }
     };
+    let (cg_w, cg_h) = if !options.request_permissions && fixed_config_resolution {
+        (sck_w, sck_h)
+    } else {
+        match macrdp_capture::detect_cg_display_size() {
+            Ok((w, h)) => {
+                tracing::info!(
+                    width = w,
+                    height = h,
+                    "CG logical display size (CGEvent coordinate space)"
+                );
+                (w as u16, h as u16)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
+                (sck_w, sck_h)
+            }
+        }
+    };
+    if sck_w != cg_w || sck_h != cg_h {
+        tracing::warn!(
+            sck_w,
+            sck_h,
+            cg_w,
+            cg_h,
+            "SCK and CG display sizes differ — using CG for mouse mapping, SCK for capture"
+        );
+    }
 
-    // Resolution
+    // Base resolution from config or auto-detect
     let (width, height) = if config.width > 0 && config.height > 0 {
         (config.width as u16, config.height as u16)
     } else {
-        (logical_w, logical_h)
+        (sck_w, sck_h)
     };
 
     // Quality / encoder / chroma
@@ -364,12 +426,9 @@ pub async fn start_server_with_options(
         "Resolved H.264 chroma mode"
     );
 
-    // HiDPI
-    let hidpi_scale = config.hidpi_scale.unwrap_or(1).clamp(1, 4);
-    let (width, height) = (
-        width.saturating_mul(hidpi_scale as u16),
-        height.saturating_mul(hidpi_scale as u16),
-    );
+    // Resolution: "auto" (Retina-aware), "WxH" (explicit), or legacy integer scale
+    let (width, height, _res_auto) =
+        resolve_resolution(config.resolution.as_deref(), width, height);
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
@@ -383,8 +442,10 @@ pub async fn start_server_with_options(
         listener,
         cert_path,
         key_path,
-        logical_w,
-        logical_h,
+        sck_w,
+        sck_h,
+        cg_w,
+        cg_h,
         width,
         height,
         quality,
@@ -523,9 +584,10 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         };
 
-        // Create display first — the mouse scale Arc lives here and is shared
-        // with the input handler so coordinate mapping stays correct after resizes.
-        let fixed_resolution = args.config.width > 0 && args.config.height > 0;
+        // Create display and coordinate mapper. The mapper is shared with the
+        // input handler so mouse mapping stays correct after client-driven resizes.
+        let fixed_resolution =
+            (args.config.width > 0 && args.config.height > 0) || args.config.resolution.is_some();
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
         let skip_unchanged = args
             .config
@@ -536,11 +598,13 @@ fn run_server_thread(args: ServerThreadArgs) {
         } else {
             None
         };
+        let coord_mapper =
+            crate::handler::MouseCoordMapper::new(args.cg_w, args.cg_h, args.width, args.height);
         let display = MacDisplay::new(
             args.width,
             args.height,
-            args.logical_w,
-            args.logical_h,
+            args.sck_w,
+            args.sck_h,
             fixed_resolution,
             args.config.frame_rate,
             args.quality,
@@ -551,11 +615,10 @@ fn run_server_thread(args: ServerThreadArgs) {
             skip_unchanged,
             idle_keyframe_sec,
             Arc::clone(&args.gfx_state),
+            coord_mapper.clone(),
         );
 
-        // Input handler reads the scale Arc from the display so it stays correct
-        // after any client-driven resize.
-        let input_handler = MacInputHandler::new(display.mouse_scale());
+        let input_handler = MacInputHandler::new(coord_mapper);
 
         // Build RDP server (this is the !Send type)
         let builder = match RdpServer::builder().with_listener(args.listener) {

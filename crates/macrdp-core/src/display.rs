@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bitrate_controller::{is_private_ip, BitrateController, FrameStats, NetworkQuality};
+use crate::handler::MouseCoordMapper;
 
 /// OpenH264 enforces max(w,h) ≤ 3840 and min(w,h) ≤ 2160 (Level 5.2).
 /// We clamp client-requested resolutions to these limits so that the
@@ -90,9 +91,9 @@ pub struct MacDisplay {
     idle_keyframe_interval: Option<Duration>,
     gfx_state: Arc<Mutex<GfxState>>,
     pending_resize: Arc<Mutex<Option<(DesktopSize, Instant)>>>,
-    /// Shared with the input handler. `macos_point = rdp_coord / scale`
-    /// where `scale = rdp_dim / native_dim`. Updated on every resize.
-    mouse_scale: Arc<Mutex<(f64, f64)>>,
+    /// Shared with the input handler. Maps RDP desktop coords to macOS
+    /// logical coords. Updated on every resize.
+    coord_mapper: MouseCoordMapper,
 }
 
 impl MacDisplay {
@@ -112,6 +113,7 @@ impl MacDisplay {
         skip_unchanged: bool,
         idle_keyframe_sec: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
+        coord_mapper: MouseCoordMapper,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -120,8 +122,6 @@ impl MacDisplay {
             base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0,
             "Base bitrate"
         );
-        let scale_x = (width as f64 / native_width as f64).max(f64::EPSILON);
-        let scale_y = (height as f64 / native_height as f64).max(f64::EPSILON);
         Self {
             width,
             height,
@@ -140,16 +140,15 @@ impl MacDisplay {
                 .map(|seconds| Duration::from_secs(seconds as u64)),
             gfx_state,
             pending_resize: Arc::new(Mutex::new(None)),
-            mouse_scale: Arc::new(Mutex::new((scale_x, scale_y))),
+            coord_mapper,
         }
     }
 
-    /// Returns a shared handle to the mouse coordinate scale.
+    /// Returns a clone of the coordinate mapper.
     ///
-    /// Pass the returned Arc to [`MacInputHandler`] so it reads the current
-    /// scale after each client-driven resize.
-    pub fn mouse_scale(&self) -> Arc<Mutex<(f64, f64)>> {
-        Arc::clone(&self.mouse_scale)
+    /// Pass to [`MacInputHandler`] so mouse mapping stays correct after resizes.
+    pub fn coord_mapper(&self) -> MouseCoordMapper {
+        self.coord_mapper.clone()
     }
 
     /// Effective encoder preference, accounting for VideoToolbox native-resolution constraint.
@@ -205,9 +204,7 @@ impl MacDisplay {
         );
         self.width = w;
         self.height = h;
-        let scale_x = (w as f64 / self.native_width as f64).max(f64::EPSILON);
-        let scale_y = (h as f64 / self.native_height as f64).max(f64::EPSILON);
-        *self.mouse_scale.lock().unwrap() = (scale_x, scale_y);
+        self.coord_mapper.update_rdp_size(w, h);
         self.base_bitrate =
             macrdp_encode::screen_bitrate(w as u32, h as u32, self.frame_rate as f32, self.quality);
 
@@ -299,9 +296,6 @@ impl RdpServerDisplay for MacDisplay {
                 );
                 self.native_width = nw;
                 self.native_height = nh;
-                let scale_x = (self.width as f64 / nw as f64).max(f64::EPSILON);
-                let scale_y = (self.height as f64 / nh as f64).max(f64::EPSILON);
-                *self.mouse_scale.lock().unwrap() = (scale_x, scale_y);
             }
         }
 
@@ -1373,6 +1367,7 @@ mod tests {
         fixed_resolution: bool,
         encoder_pref: macrdp_encode::EncoderPreference,
     ) -> MacDisplay {
+        let coord_mapper = MouseCoordMapper::new(native_width, native_height, width, height);
         MacDisplay::new(
             width,
             height,
@@ -1388,6 +1383,7 @@ mod tests {
             false,
             None,
             Arc::new(Mutex::new(GfxState::new(width, height, false))),
+            coord_mapper,
         )
     }
 
@@ -1610,16 +1606,16 @@ mod tests {
     }
 
     #[test]
-    fn mouse_scale_is_1_when_native_equals_configured() {
+    fn coord_mapper_maps_1_to_1_when_native_equals_configured() {
         let display = test_display(1920, 1080, false);
-        let (sx, sy) = *display.mouse_scale().lock().unwrap();
-        assert!((sx - 1.0).abs() < 1e-9, "scale_x should be 1.0, got {sx}");
-        assert!((sy - 1.0).abs() < 1e-9, "scale_y should be 1.0, got {sy}");
+        let mapper = display.coord_mapper();
+        let (mx, my) = mapper.map(960, 540);
+        assert_eq!(mx, 960);
+        assert_eq!(my, 540);
     }
 
     #[test]
-    fn mouse_scale_reflects_non_native_initial_resolution() {
-        // Software encoder with a smaller configured resolution: scale < 1.
+    fn coord_mapper_maps_proportionally_for_non_native_resolution() {
         let display = test_display_custom(
             1280,
             720,
@@ -1628,23 +1624,15 @@ mod tests {
             true,
             macrdp_encode::EncoderPreference::Software,
         );
-        let (sx, sy) = *display.mouse_scale().lock().unwrap();
-        let expected_x = 1280.0 / 1920.0;
-        let expected_y = 720.0 / 1080.0;
-        assert!(
-            (sx - expected_x).abs() < 1e-9,
-            "scale_x should be {expected_x}, got {sx}"
-        );
-        assert!(
-            (sy - expected_y).abs() < 1e-9,
-            "scale_y should be {expected_y}, got {sy}"
-        );
+        let mapper = display.coord_mapper();
+        // rdp(1280, 720) → mac(1920, 1080)
+        let (mx, my) = mapper.map(1280, 720);
+        assert_eq!(mx, 1920);
+        assert_eq!(my, 1080);
     }
 
     #[test]
-    fn mouse_scale_updates_on_client_resize() {
-        // Regression: mouse coords were injected using the original startup scale
-        // even after a client requested a smaller resolution, causing cursor mismatch.
+    fn coord_mapper_updates_on_client_resize() {
         let mut display = test_display_custom(
             1920,
             1080,
@@ -1653,21 +1641,14 @@ mod tests {
             false,
             macrdp_encode::EncoderPreference::Software,
         );
-        let scale = display.mouse_scale();
+        let mapper = display.coord_mapper();
 
         display.request_resize(1280, 720);
 
-        let (sx, sy) = *scale.lock().unwrap();
-        let expected_x = 1280.0 / 1920.0;
-        let expected_y = 720.0 / 1080.0;
-        assert!(
-            (sx - expected_x).abs() < 1e-9,
-            "scale_x should update to {expected_x} after resize, got {sx}"
-        );
-        assert!(
-            (sy - expected_y).abs() < 1e-9,
-            "scale_y should update to {expected_y} after resize, got {sy}"
-        );
+        // After resize: rdp(1280, 720) should map to mac(1920, 1080)
+        let (mx, my) = mapper.map(1280, 720);
+        assert_eq!(mx, 1920);
+        assert_eq!(my, 1080);
     }
 
     #[test]

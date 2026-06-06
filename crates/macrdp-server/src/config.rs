@@ -59,9 +59,9 @@ pub struct Cli {
     #[arg(long, value_parser = ["avc420", "avc444"])]
     pub chroma_mode: Option<String>,
 
-    /// HiDPI scale factor (1-4)
+    /// Resolution: "auto", "WxH" (e.g. 3840x2160), or legacy scale factor (1-4)
     #[arg(long)]
-    pub hidpi_scale: Option<u32>,
+    pub resolution: Option<String>,
 
     /// Log level: trace, debug, info, warn, error
     #[arg(long)]
@@ -127,8 +127,8 @@ pub fn load_config(cli: &Cli) -> anyhow::Result<ServerConfig> {
     if let Some(chroma) = &cli.chroma_mode {
         config.chroma_mode = Some(chroma.clone());
     }
-    if let Some(scale) = cli.hidpi_scale {
-        config.hidpi_scale = Some(scale);
+    if let Some(res) = &cli.resolution {
+        config.resolution = Some(res.clone());
     }
     if let Some(level) = &cli.log_level {
         config.log_level = Some(level.clone());
@@ -239,7 +239,7 @@ mod tests {
             encoder: Some("hardware".to_string()),
             bitrate_mbps: Some(20),
             chroma_mode: Some("avc444".to_string()),
-            hidpi_scale: Some(2),
+            resolution: Some("2".to_string()),
             log_level: Some("debug".to_string()),
             ..Cli::default()
         };
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(config.encoder.as_deref(), Some("hardware"));
         assert_eq!(config.bitrate_mbps, Some(20));
         assert_eq!(config.chroma_mode.as_deref(), Some("avc444"));
-        assert_eq!(config.hidpi_scale, Some(2));
+        assert_eq!(config.resolution.as_deref(), Some("2"));
         assert_eq!(
             config.cert_path.as_deref(),
             Some(dir.path().join("cert.pem").as_path())

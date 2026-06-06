@@ -30,7 +30,7 @@ fn converts_file_config_to_core_config() {
             encoder = "hardware"
             bitrate_mbps = 12
             chroma_mode = "avc420"
-            hidpi_scale = 2
+            resolution = "2"
             skip_unchanged = true
             idle_keyframe_sec = 7
             "#,
@@ -54,7 +54,7 @@ fn converts_file_config_to_core_config() {
     assert_eq!(config.encoder.as_deref(), Some("hardware"));
     assert_eq!(config.bitrate_mbps, Some(12));
     assert_eq!(config.chroma_mode.as_deref(), Some("avc420"));
-    assert_eq!(config.hidpi_scale, Some(2));
+    assert_eq!(config.resolution.as_deref(), Some("2"));
     assert_eq!(config.skip_unchanged, Some(true));
     assert_eq!(config.idle_keyframe_sec, Some(7));
 }
@@ -88,7 +88,7 @@ fn cli_overrides_loaded_core_config() {
         encoder: Some("software".to_string()),
         bitrate_mbps: Some(8),
         chroma_mode: Some("avc420".to_string()),
-        hidpi_scale: Some(1),
+        resolution: Some("1".to_string()),
         log_level: Some("debug".to_string()),
         ..Cli::default()
     };
@@ -116,5 +116,5 @@ fn cli_overrides_loaded_core_config() {
     assert_eq!(config.encoder.as_deref(), Some("software"));
     assert_eq!(config.bitrate_mbps, Some(8));
     assert_eq!(config.chroma_mode.as_deref(), Some("avc420"));
-    assert_eq!(config.hidpi_scale, Some(1));
+    assert_eq!(config.resolution.as_deref(), Some("1"));
 }

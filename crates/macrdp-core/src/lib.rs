@@ -20,5 +20,7 @@ pub use permissions::{
     check_permissions, format_report, permission_report, PermissionEntry, PermissionReport,
     ReportFormat,
 };
-pub use server::{start_server, start_server_with_options, ServerHandle, ServerStartupOptions};
+pub use server::{
+    resolve_resolution, start_server, start_server_with_options, ServerHandle, ServerStartupOptions,
+};
 pub use tls::{ensure_tls_files, generate_self_signed_cert};

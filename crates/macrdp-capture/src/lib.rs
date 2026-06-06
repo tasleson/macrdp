@@ -291,7 +291,23 @@ fn extract_dirty_rects(sample: &CMSampleBuffer) -> (Vec<Rect>, bool) {
     }
 }
 
-/// Query the main display's resolution
+/// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
+pub fn detect_display_scale() -> Result<u32> {
+    use core_graphics::display::CGDisplay;
+    let main = CGDisplay::main();
+    let physical_w = main.pixels_wide() as u32;
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
+    let display = content
+        .displays()
+        .into_iter()
+        .next()
+        .context("No display found")?;
+    let logical_w = display.width();
+    let scale = physical_w.checked_div(logical_w).unwrap_or(1);
+    Ok(scale.max(1))
+}
+
+/// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
     let content = SCShareableContent::get().context("Failed to get shareable content")?;
     let display = content
@@ -300,6 +316,21 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
         .next()
         .context("No display found")?;
     Ok((display.width(), display.height()))
+}
+
+/// Query the main display's logical bounds from CoreGraphics.
+/// This is the coordinate system CGEvent uses — must be used for mouse mapping.
+/// May differ from SCDisplay dimensions on non-standard scaling modes.
+pub fn detect_cg_display_size() -> Result<(u32, u32)> {
+    use core_graphics::display::CGDisplay;
+    let main = CGDisplay::main();
+    let bounds = main.bounds();
+    let w = bounds.size.width as u32;
+    let h = bounds.size.height as u32;
+    if w == 0 || h == 0 {
+        anyhow::bail!("CGDisplay returned zero bounds");
+    }
+    Ok((w, h))
 }
 
 /// Returns true if the main display is physically connected but not actively
