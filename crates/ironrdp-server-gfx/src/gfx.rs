@@ -301,6 +301,8 @@ pub struct GfxState {
     pub total_bytes_sent: u64,
     /// Time of first frame sent
     pub start_time: Option<std::time::Instant>,
+    /// Client peer IP address (set after TCP connection is established)
+    pub peer_addr: Option<core::net::IpAddr>,
     /// Instantaneous bitrate tracking (per-frame Mbps samples since last log)
     bitrate_samples: Vec<f64>,
     bitrate_max: f64,
@@ -333,6 +335,7 @@ impl GfxState {
             last_frame_bytes: 0,
             total_bytes_sent: 0,
             start_time: None,
+            peer_addr: None,
             bitrate_samples: Vec::new(),
             bitrate_max: 0.0,
             bitrate_min: f64::MAX,
@@ -613,7 +616,10 @@ impl GfxHandler {
 
     /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
     /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
-    pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
+    pub fn create_uncompressed_pdu(
+        state: &mut GfxState,
+        update: &GfxUncompressedUpdate,
+    ) -> Vec<u8> {
         let mut raw_pdus = Vec::new();
 
         if !state.surface_created {
