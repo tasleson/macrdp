@@ -23,6 +23,20 @@ type CFAllocatorRef = *const c_void;
 type OSStatus = i32;
 type VTEncodeInfoFlags = u32;
 
+#[derive(Copy, Clone)]
+struct EncodeDimensions {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Copy, Clone)]
+struct BgraFrame<'a> {
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+}
+
 /// VT silently dropped this frame. `status == 0`, `sample_buffer == NULL`.
 /// Apple uses this when the rate controller, profile constraint, or input
 /// validation rejects a frame without surfacing it as an error.
@@ -120,6 +134,7 @@ extern "C" {
 
     fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u64) -> OSStatus;
     fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u64) -> OSStatus;
+    fn CVPixelBufferRetain(pixel_buffer: CVPixelBufferRef) -> CVPixelBufferRef;
     fn CVPixelBufferRelease(pixel_buffer: CVPixelBufferRef);
     fn CVPixelBufferGetBaseAddressOfPlane(
         pixel_buffer: CVPixelBufferRef,
@@ -415,6 +430,7 @@ pub struct VtEncoder {
     vimage: Option<VImageConverter>,
     nv12_y_buf: Vec<u8>,
     nv12_uv_buf: Vec<u8>,
+    pending_pixel_buffer: Option<CVPixelBufferRef>,
 }
 
 // VTCompressionSession is thread-safe per Apple docs
@@ -481,6 +497,7 @@ impl VtEncoder {
             vimage,
             nv12_y_buf,
             nv12_uv_buf,
+            pending_pixel_buffer: None,
         })
     }
 
@@ -737,24 +754,26 @@ impl VtEncoder {
     fn create_nv12_vimage(
         &mut self,
         session: VTCompressionSessionRef,
-        enc_w: u32,
-        enc_h: u32,
-        data: &[u8],
-        src_w: u32,
-        src_h: u32,
-        stride: usize,
+        encoded: EncodeDimensions,
+        frame: BgraFrame<'_>,
     ) -> Result<CVPixelBufferRef> {
         let vimage = match &self.vimage {
             Some(v) => v,
             None => {
                 return Self::create_nv12_from_bgra_fast(
-                    session, enc_w, enc_h, data, src_w, src_h, stride,
+                    session,
+                    encoded.width,
+                    encoded.height,
+                    frame.data,
+                    frame.width,
+                    frame.height,
+                    frame.stride,
                 )
             }
         };
 
-        let w = src_w.min(enc_w) as usize;
-        let h = src_h.min(enc_h) as usize;
+        let w = frame.width.min(encoded.width) as usize;
+        let h = frame.height.min(encoded.height) as usize;
         let y_size = w * h;
         let uv_size = w * h / 2;
 
@@ -767,10 +786,10 @@ impl VtEncoder {
 
         vimage
             .bgra_to_nv12(
-                data,
-                src_w,
-                src_h,
-                stride,
+                frame.data,
+                frame.width,
+                frame.height,
+                frame.stride,
                 &mut self.nv12_y_buf[..y_size],
                 &mut self.nv12_uv_buf[..uv_size],
             )
@@ -1170,12 +1189,16 @@ impl VideoEncoder for VtEncoder {
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
         let pixel_buffer = self.create_nv12_vimage(
             self.session,
-            self.width,
-            self.height,
-            data,
-            width,
-            height,
-            stride,
+            EncodeDimensions {
+                width: self.width,
+                height: self.height,
+            },
+            BgraFrame {
+                data,
+                width,
+                height,
+                stride,
+            },
         )?;
 
         let frame_props = self.take_force_keyframe_props();
@@ -1242,8 +1265,12 @@ impl VideoEncoder for VtEncoder {
 
         let frame_props = self.take_force_keyframe_props();
 
+        unsafe {
+            CVPixelBufferRetain(pixel_buffer_ptr as CVPixelBufferRef);
+        }
+
         // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
-        let (nal_data, is_keyframe) = Self::encode_session_frame(
+        let result = Self::encode_session_frame(
             self.session,
             &self.callback_ctx,
             pixel_buffer_ptr,
@@ -1251,13 +1278,18 @@ impl VideoEncoder for VtEncoder {
             duration,
             self.frame_count,
             frame_props,
-        )?;
+        );
 
         if !frame_props.is_null() {
             unsafe {
                 CFRelease(frame_props);
             }
         }
+        unsafe {
+            CVPixelBufferRelease(pixel_buffer_ptr as CVPixelBufferRef);
+        }
+
+        let (nal_data, is_keyframe) = result?;
 
         self.frame_count += 1;
 
@@ -1403,18 +1435,22 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn supports_pipelining(&self) -> bool {
-        true
+        false
     }
 
     fn submit_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<()> {
         let pixel_buffer = self.create_nv12_vimage(
             self.session,
-            self.width,
-            self.height,
-            data,
-            width,
-            height,
-            stride,
+            EncodeDimensions {
+                width: self.width,
+                height: self.height,
+            },
+            BgraFrame {
+                data,
+                width,
+                height,
+                stride,
+            },
         )?;
         let (pts, duration) = self.make_pts_duration();
         let frame_props = self.make_force_keyframe_props();
@@ -1441,8 +1477,16 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn submit_pixel_buffer(&mut self, ptr: *mut std::ffi::c_void) -> Result<()> {
+        if self.pending_pixel_buffer.is_some() {
+            anyhow::bail!("VideoToolbox pixel buffer submit called before collect");
+        }
+
         let (pts, duration) = self.make_pts_duration();
         let frame_props = self.make_force_keyframe_props();
+
+        unsafe {
+            CVPixelBufferRetain(ptr as CVPixelBufferRef);
+        }
 
         let result = Self::submit_session_frame(
             self.session,
@@ -1458,12 +1502,28 @@ impl VideoEncoder for VtEncoder {
                 CFRelease(frame_props);
             }
         }
+
+        if result.is_ok() {
+            self.pending_pixel_buffer = Some(ptr as CVPixelBufferRef);
+        } else {
+            unsafe {
+                CVPixelBufferRelease(ptr as CVPixelBufferRef);
+            }
+        }
+
         self.frame_count += 1;
         result
     }
 
     fn collect_encoded(&mut self, timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
-        match Self::collect_session_frame(self.session, &self.callback_ctx, timeout)? {
+        let result = Self::collect_session_frame(self.session, &self.callback_ctx, timeout);
+        if let Some(pixel_buffer) = self.pending_pixel_buffer.take() {
+            unsafe {
+                CVPixelBufferRelease(pixel_buffer);
+            }
+        }
+
+        match result? {
             Some((nal_data, is_keyframe)) => Ok(Some(EncodedFrame {
                 data: Bytes::from(nal_data),
                 is_keyframe,
@@ -1478,6 +1538,9 @@ impl VideoEncoder for VtEncoder {
 impl Drop for VtEncoder {
     fn drop(&mut self) {
         unsafe {
+            if let Some(pixel_buffer) = self.pending_pixel_buffer.take() {
+                CVPixelBufferRelease(pixel_buffer);
+            }
             VTCompressionSessionInvalidate(self.session);
             if let Some(aux) = self.session_aux {
                 VTCompressionSessionInvalidate(aux);

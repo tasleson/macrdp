@@ -260,6 +260,9 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
 
     // Zero-copy: retain the CVPixelBuffer and wrap it as SafePixelBuffer
     let safe_buf = unsafe { SafePixelBuffer::from_raw(pixel_buffer.as_ptr()) };
+    if !safe_buf.validate_nv12_shape(width, height) {
+        return None;
+    }
 
     Some(CaptureEvent::Frame(CapturedFrame {
         width,
@@ -546,13 +549,21 @@ extern "C" {
     fn CVPixelBufferRelease(pixel_buffer: *mut c_void);
     fn CVPixelBufferLockBaseAddress(pixel_buffer: *mut c_void, flags: u64) -> i32;
     fn CVPixelBufferUnlockBaseAddress(pixel_buffer: *mut c_void, flags: u64) -> i32;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
+    fn CVPixelBufferIsPlanar(pixel_buffer: *mut c_void) -> bool;
+    fn CVPixelBufferGetPlaneCount(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetWidth(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetHeight(pixel_buffer: *mut c_void) -> usize;
     fn CVPixelBufferGetBaseAddressOfPlane(pixel_buffer: *mut c_void, plane: usize) -> *mut u8;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetWidthOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
 }
 
 /// kCVPixelBufferLock_ReadOnly
 const CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 0x0000_0001;
+const K_CV_PIXEL_FORMAT_420F: u32 = u32::from_be_bytes(*b"420f");
+const K_CV_PIXEL_FORMAT_420V: u32 = u32::from_be_bytes(*b"420v");
 
 // ---------------------------------------------------------------------------
 // NV12PlaneData — extracted Y and UV plane data from an NV12 pixel buffer
@@ -616,6 +627,67 @@ impl SafePixelBuffer {
     /// VideoToolbox's `VTCompressionSessionEncodeFrame`).
     pub fn as_ptr(&self) -> *mut c_void {
         self.ptr
+    }
+
+    /// Validate that the retained buffer still has the NV12 biplanar shape
+    /// requested from ScreenCaptureKit.
+    pub fn validate_nv12_shape(&self, expected_width: u32, expected_height: u32) -> bool {
+        unsafe {
+            let pixel_format = CVPixelBufferGetPixelFormatType(self.ptr);
+            let is_planar = CVPixelBufferIsPlanar(self.ptr);
+            let plane_count = CVPixelBufferGetPlaneCount(self.ptr);
+            let width = CVPixelBufferGetWidth(self.ptr);
+            let height = CVPixelBufferGetHeight(self.ptr);
+
+            if pixel_format != K_CV_PIXEL_FORMAT_420F && pixel_format != K_CV_PIXEL_FORMAT_420V
+                || !is_planar
+                || plane_count < 2
+                || width != expected_width as usize
+                || height != expected_height as usize
+            {
+                tracing::warn!(
+                    pixel_format = format!("{pixel_format:#010x}"),
+                    is_planar,
+                    plane_count,
+                    width,
+                    height,
+                    expected_width,
+                    expected_height,
+                    "Unexpected CVPixelBuffer shape for NV12 capture"
+                );
+                return false;
+            }
+
+            let y_width = CVPixelBufferGetWidthOfPlane(self.ptr, 0);
+            let y_height = CVPixelBufferGetHeightOfPlane(self.ptr, 0);
+            let uv_width = CVPixelBufferGetWidthOfPlane(self.ptr, 1);
+            let uv_height = CVPixelBufferGetHeightOfPlane(self.ptr, 1);
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(self.ptr, 0);
+            let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(self.ptr, 1);
+
+            if y_width != expected_width as usize
+                || y_height != expected_height as usize
+                || uv_width < expected_width as usize / 2
+                || uv_height < expected_height as usize / 2
+                || y_stride < expected_width as usize
+                || uv_stride < expected_width as usize
+            {
+                tracing::warn!(
+                    y_width,
+                    y_height,
+                    uv_width,
+                    uv_height,
+                    y_stride,
+                    uv_stride,
+                    expected_width,
+                    expected_height,
+                    "Unexpected NV12 plane layout"
+                );
+                return false;
+            }
+
+            true
+        }
     }
 
     /// Create a new `SafePixelBuffer` that shares the same underlying
