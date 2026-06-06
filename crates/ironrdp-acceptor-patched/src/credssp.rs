@@ -13,7 +13,7 @@ use ironrdp_connector::{
 };
 use ironrdp_core::{other_err, WriteBuf};
 use ironrdp_pdu::PduHint;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub(crate) enum CredsspState {
@@ -64,12 +64,29 @@ impl CredentialsProxy for CredentialsProxyImpl<'_> {
         &mut self,
         username: &Username,
     ) -> std::io::Result<Self::AuthenticationData> {
-        if username.account_name() != self.credentials.username.account_name() {
+        let client_name = username.account_name();
+        let server_name = self.credentials.username.account_name();
+
+        debug!(
+            client_username = %username.inner(),
+            client_account = client_name,
+            server_account = server_name,
+            "CredSSP credentials lookup"
+        );
+
+        // Windows usernames are case-insensitive; normalise before comparing.
+        if !client_name.eq_ignore_ascii_case(server_name) {
+            warn!(
+                client_account = client_name,
+                server_account = server_name,
+                "CredSSP username mismatch"
+            );
             return Err(std::io::Error::other("invalid username"));
         }
 
         let mut data = self.credentials.clone();
-        // keep the original user/domain
+        // keep the original user/domain from the client so NTLM hash
+        // computation uses the exact identity the client authenticated with
         data.username = username.clone();
         Ok(data)
     }
@@ -175,10 +192,17 @@ impl<'a> CredsspSequence<'a> {
         let (ts_request, next_state) = match result {
             Ok(ServerState::ReplyNeeded(ts_request)) => (Some(ts_request), CredsspState::Ongoing),
             Ok(ServerState::Finished(_id)) => (None, CredsspState::Finished),
-            Err(err) => (
-                err.ts_request.map(|ts_request| *ts_request),
-                CredsspState::ServerError(err.error),
-            ),
+            Err(err) => {
+                warn!(
+                    error_kind = ?err.error.error_type,
+                    error_description = %err.error.description,
+                    "CredSSP server authentication error"
+                );
+                (
+                    err.ts_request.map(|ts_request| *ts_request),
+                    CredsspState::ServerError(err.error),
+                )
+            }
         };
 
         self.state = next_state;
