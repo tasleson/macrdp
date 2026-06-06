@@ -1169,7 +1169,13 @@ impl VideoEncoder for VtEncoder {
 
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
         let pixel_buffer = self.create_nv12_vimage(
-            self.session, self.width, self.height, data, width, height, stride,
+            self.session,
+            self.width,
+            self.height,
+            data,
+            width,
+            height,
+            stride,
         )?;
 
         let frame_props = self.take_force_keyframe_props();
@@ -1400,15 +1406,16 @@ impl VideoEncoder for VtEncoder {
         true
     }
 
-    fn submit_bgra(
-        &mut self,
-        data: &[u8],
-        width: u32,
-        height: u32,
-        stride: usize,
-    ) -> Result<()> {
-        let pixel_buffer =
-            self.create_nv12_vimage(self.session, self.width, self.height, data, width, height, stride)?;
+    fn submit_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<()> {
+        let pixel_buffer = self.create_nv12_vimage(
+            self.session,
+            self.width,
+            self.height,
+            data,
+            width,
+            height,
+            stride,
+        )?;
         let (pts, duration) = self.make_pts_duration();
         let frame_props = self.make_force_keyframe_props();
 
@@ -1455,10 +1462,7 @@ impl VideoEncoder for VtEncoder {
         result
     }
 
-    fn collect_encoded(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> Result<Option<EncodedFrame>> {
+    fn collect_encoded(&mut self, timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
         match Self::collect_session_frame(self.session, &self.callback_ctx, timeout)? {
             Some((nal_data, is_keyframe)) => Ok(Some(EncodedFrame {
                 data: Bytes::from(nal_data),
