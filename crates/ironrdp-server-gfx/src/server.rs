@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
 use ironrdp_async::{single_sequence_step, Framed};
 use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsRequest, OwnedFileContentsResponse};
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_core::{decode, encode_vec, impl_as_any, WriteBuf};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
@@ -22,7 +23,10 @@ pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
-use ironrdp_svc::{server_encode_svc_messages, StaticChannelId, StaticChannelSet, SvcProcessor};
+use ironrdp_svc::{
+    server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage,
+    SvcProcessor,
+};
 use ironrdp_tokio::{
     split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed,
 };
@@ -244,6 +248,8 @@ pub struct RdpServer {
 pub enum ServerEvent {
     Quit(String),
     Clipboard(ClipboardMessage),
+    ClipboardFileContents(OwnedFileContentsResponse),
+    ClipboardFileContentsRequest(FileContentsRequest),
     Rdpsnd(RdpsndServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -639,7 +645,7 @@ impl RdpServer {
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
-                        ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+                        ChannelFlags::SHOW_PROTOCOL,
                     )
                     .context("Failed to encode DVC messages")?;
 
@@ -674,7 +680,7 @@ impl RdpServer {
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
-                        ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+                        ChannelFlags::SHOW_PROTOCOL,
                     )
                     .context("Failed to encode DVC messages")?;
 
@@ -792,6 +798,31 @@ impl RdpServer {
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
                     let data =
                         server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                }
+                ServerEvent::ClipboardFileContents(response) => {
+                    let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                        warn!("No clipboard channel, dropping file contents response");
+                        continue;
+                    };
+                    let msgs = cliprdr
+                        .submit_file_contents(response)
+                        .context("failed to submit file contents")?;
+                    let channel_id = self
+                        .get_channel_id_by_type::<CliprdrServer>()
+                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                }
+                ServerEvent::ClipboardFileContentsRequest(request) => {
+                    let channel_id = self
+                        .get_channel_id_by_type::<CliprdrServer>()
+                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    let pdu = ClipboardPdu::FileContentsRequest(request);
+                    let svc_msg = encode_cliprdr_pdu(pdu);
+                    let data =
+                        server_encode_svc_messages(vec![svc_msg], channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
             }
@@ -1381,6 +1412,10 @@ async fn send_server_denied(
     let msg = encode_vec(&X224(pdu))?;
     writer.write_all(&msg).await?;
     Ok(())
+}
+
+fn encode_cliprdr_pdu(pdu: ClipboardPdu<'static>) -> SvcMessage {
+    SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL)
 }
 
 struct SharedWriter<'w, W: FramedWrite> {
