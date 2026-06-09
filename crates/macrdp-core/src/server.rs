@@ -549,10 +549,10 @@ pub async fn start_server_with_options(
 /// server thread. Constructs the !Send RdpServer here so it never crosses thread
 /// boundaries.
 fn run_server_thread(args: ServerThreadArgs) {
-    use crate::clipboard::MacClipboardFactory;
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
     use ironrdp_server::{Credentials, RdpServer, ServerEvent, TlsIdentityCtx};
+    use macrdp_clipboard::MacClipboardFactory;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -657,6 +657,23 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         };
 
+        // Clipboard factory: bridges the local NSPasteboard to the CLIPRDR
+        // channel (text, images, HTML, and file transfer). Disabled entirely
+        // when the operator opts out via config.
+        let cliprdr_factory: Option<Box<dyn ironrdp_server::CliprdrServerFactory>> =
+            if args.config.clipboard.enabled {
+                let temp_dir = dirs::cache_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("macrdp")
+                    .join("clipboard");
+                Some(Box::new(MacClipboardFactory::new(
+                    temp_dir,
+                    args.config.clipboard.max_file_size_mb,
+                )))
+            } else {
+                None
+            };
+
         // NLA/CredSSP is the default path: with_hybrid advertises HYBRID,
         // HYBRID_EX, and SSL, and the acceptor selects the strongest mutually
         // supported protocol (HYBRID_EX > HYBRID > SSL). TLS-only is reachable
@@ -665,7 +682,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             .with_hybrid(tls_acceptor, tls_identity.pub_key)
             .with_input_handler(input_handler)
             .with_display_handler(display)
-            .with_cliprdr_factory(Some(Box::new(MacClipboardFactory::new())))
+            .with_cliprdr_factory(cliprdr_factory)
             .build();
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));

@@ -3,6 +3,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Clipboard synchronization configuration.
+///
+/// Lives under the `[clipboard]` table in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardConfig {
+    /// Enable bidirectional clipboard synchronization over the CLIPRDR channel.
+    pub enabled: bool,
+    /// Allow file transfer via the clipboard (copy/paste of files).
+    pub file_transfer: bool,
+    /// Maximum size, in megabytes, of a single file transferred via the clipboard.
+    pub max_file_size_mb: u32,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_transfer: true,
+            max_file_size_mb: 100,
+        }
+    }
+}
+
 /// Server configuration loaded from TOML by the CLI daemon.
 ///
 /// `Debug` is implemented manually so the password never appears in log output.
@@ -51,6 +75,8 @@ pub struct ServerConfig {
     /// Advertise the FreeRDP advanced-input dynamic channel. Standard
     /// fast-path keyboard/mouse remains enabled when this is false.
     pub advanced_input: Option<bool>,
+    /// Clipboard synchronization configuration.
+    pub clipboard: ClipboardConfig,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -83,6 +109,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("idle_keyframe_sec", &self.idle_keyframe_sec)
             .field("input_tap", &self.input_tap)
             .field("advanced_input", &self.advanced_input)
+            .field("clipboard", &self.clipboard)
             .finish()
     }
 }
@@ -114,6 +141,7 @@ impl Default for ServerConfig {
             idle_keyframe_sec: None,
             input_tap: None,
             advanced_input: None,
+            clipboard: ClipboardConfig::default(),
         }
     }
 }

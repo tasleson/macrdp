@@ -2,7 +2,6 @@
 
 pub mod bitrate_controller;
 pub mod callbacks;
-pub mod clipboard;
 pub mod config;
 pub mod display;
 pub mod features;
@@ -14,7 +13,7 @@ pub mod tls;
 pub use callbacks::*;
 pub use config::{
     config_dir, default_cert_path, default_config_path, default_key_path, default_log_path,
-    default_tls_dir, ServerConfig,
+    default_tls_dir, ClipboardConfig, ServerConfig,
 };
 pub use permissions::{
     check_permissions, format_report, permission_report, PermissionEntry, PermissionReport,
