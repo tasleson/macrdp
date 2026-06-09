@@ -7,6 +7,7 @@ members = [
     "crates/macrdp-capture",
     "crates/macrdp-input",
     "crates/macrdp-encode",
+    "crates/macrdp-clipboard",
     "crates/ironrdp-server-gfx",
     "crates/ironrdp-acceptor-patched",
 ]

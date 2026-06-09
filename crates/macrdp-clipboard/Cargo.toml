@@ -1,0 +1,18 @@
+[package]
+name = "macrdp-clipboard"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSURL", "NSData", "NSObject",
+] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+ironrdp-server = "0.10"
+ironrdp-cliprdr = "0.5"
+ironrdp-core = "0.1"
