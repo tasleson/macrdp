@@ -466,6 +466,26 @@ impl ScreenCapturer {
     }
 }
 
+impl Drop for ScreenCapturer {
+    fn drop(&mut self) {
+        // `SCStream::drop` only releases the stream and its handler context — it
+        // does NOT stop capture. ScreenCaptureKit can still have sample-delivery
+        // blocks queued on its dispatch queue that reference our output handler;
+        // if the handler is freed while one is pending, the next callback fires
+        // against freed memory (a use-after-free that surfaces as a SIGBUS /
+        // pointer-authentication crash deep inside ScreenCaptureKit). This bit us
+        // when swapping the preliminary BGRA capturer for the NV12 one and on
+        // client disconnect. `stop_capture` blocks until the system tears the
+        // delivery queue down, guaranteeing no further callbacks run after this
+        // returns, so the subsequent release is safe.
+        if let Err(e) = self.stream.stop_capture() {
+            // A stream that never fully started can report a stop failure; that
+            // is harmless here, so log at debug rather than warn.
+            tracing::debug!("SCStream stop_capture during drop failed: {e:?}");
+        }
+    }
+}
+
 /// Fallback capturer using CGDisplayCreateImage (CoreGraphics).
 /// Works during lock screen because it captures at the display level,
 /// below the window server / ScreenCaptureKit layer.

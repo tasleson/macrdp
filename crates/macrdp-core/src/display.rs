@@ -351,7 +351,11 @@ impl RdpServerDisplay for MacDisplay {
         let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
         // The preliminary capturer used BGRA; recreate if the encoder needs NV12.
+        // Drop the BGRA capturer first so its stream is fully stopped (see
+        // ScreenCapturer's Drop) before the NV12 stream starts — otherwise two
+        // capture streams briefly run against the same display.
         let capturer = if capture_config.pixel_format != CapturePixelFormat::Bgra {
+            drop(capturer);
             ScreenCapturer::new(capture_config.clone()).await?
         } else {
             capturer
