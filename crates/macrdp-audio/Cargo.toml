@@ -16,3 +16,4 @@ macrdp-build = { path = "../macrdp-build" }
 
 [dev-dependencies]
 approx = "0.5"
+tokio = { workspace = true, features = ["macros", "test-util"] }

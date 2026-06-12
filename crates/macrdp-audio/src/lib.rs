@@ -72,16 +72,26 @@ fn has_discontinuity(prev_tail: &[f32], chunk: &[f32], channels: u16) -> bool {
     false
 }
 
+struct ChannelClosed;
+
 /// Drain all pending frames from the capture channel into the ring buffer.
+/// Returns the timestamp of the first frame drained (if any), or
+/// `Err(ChannelClosed)` once the capture side has gone away for good.
 fn drain_channel(
     audio_rx: &mut mpsc::Receiver<AudioFrame>,
     ring_buffer: &mut VecDeque<f32>,
-) -> bool {
+) -> Result<Option<u64>, ChannelClosed> {
+    let mut first_ts = None;
     loop {
         match audio_rx.try_recv() {
-            Ok(frame) => ring_buffer.extend(frame.data.iter()),
-            Err(mpsc::error::TryRecvError::Empty) => return true,
-            Err(mpsc::error::TryRecvError::Disconnected) => return false,
+            Ok(frame) => {
+                if first_ts.is_none() {
+                    first_ts = Some(frame.timestamp_ms);
+                }
+                ring_buffer.extend(frame.data.iter());
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(first_ts),
+            Err(mpsc::error::TryRecvError::Disconnected) => return Err(ChannelClosed),
         }
     }
 }
@@ -108,47 +118,54 @@ async fn audio_loop(
     tracing::info!(
         frame_size_interleaved,
         chunk_ms,
-        "Audio loop started ({}Hz, {}ch), waiting for RDPSND handshake",
+        "Audio loop started ({}Hz, {}ch)",
         sample_rate,
         channels
     );
 
-    // Wait for RDPSND handshake and first audio data
-    let base_timestamp_ms = loop {
-        match audio_rx.recv().await {
-            Some(frame) if ready.load(Ordering::Relaxed) => {
-                let ts = frame.timestamp_ms;
-                ring_buffer.extend(frame.data.iter());
-                break ts;
-            }
-            Some(_) => continue,
-            None => {
-                tracing::info!("Audio channel closed before handshake");
-                return;
-            }
-        }
-    };
+    // This loop outlives any single RDP connection: each connection's RDPSND
+    // handler toggles the shared `ready` flag, and streaming re-baselines its
+    // timestamps every time the flag turns on again. `None` means streaming is
+    // (re)starting and needs a fresh timestamp anchor from the next frame.
+    let mut base_timestamp_ms: Option<u64> = None;
 
     let mut interval = tokio::time::interval(chunk_duration);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await; // consume immediate first tick
-
-    tracing::info!("Audio streaming started");
 
     loop {
         interval.tick().await;
 
+        let first_ts = match drain_channel(&mut audio_rx, &mut ring_buffer) {
+            Ok(ts) => ts,
+            Err(ChannelClosed) => {
+                tracing::info!("Audio loop ended (capture channel closed)");
+                return;
+            }
+        };
+
         if !ready.load(Ordering::Relaxed) {
+            // No client listening — discard captured audio and reset state so
+            // the next connection starts clean.
             ring_buffer.clear();
             prev_tail.clear();
             was_silent = true;
+            if base_timestamp_ms.take().is_some() {
+                tracing::info!("Audio streaming paused (RDPSND stopped)");
+            }
             continue;
         }
 
-        if !drain_channel(&mut audio_rx, &mut ring_buffer) {
-            tracing::info!("Audio loop ended (channel closed)");
-            return;
-        }
+        let base_ts = match base_timestamp_ms {
+            Some(ts) => ts,
+            None => {
+                // (Re)starting: anchor timestamps to the first captured frame.
+                let Some(ts) = first_ts else { continue };
+                base_timestamp_ms = Some(ts);
+                samples_sent = 0;
+                tracing::info!("Audio streaming started");
+                ts
+            }
+        };
 
         // Trim excess buffer to bound latency
         if ring_buffer.len() > max_buffer_samples {
@@ -183,7 +200,7 @@ async fn audio_loop(
 
         let samples_per_ch = frame_size_interleaved / ch;
         let offset_ms = (samples_sent * 1000) / sample_rate as u64;
-        let ts = base_timestamp_ms + offset_ms;
+        let ts = base_ts + offset_ms;
 
         let _ = event_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
             wave_data, ts as u32,
@@ -279,6 +296,7 @@ pub struct MacAudioFactory {
     event_sender: Option<tokio::sync::mpsc::UnboundedSender<ServerEvent>>,
     sample_rate: u32,
     channels: u16,
+    ready: Arc<AtomicBool>,
 }
 
 impl MacAudioFactory {
@@ -288,35 +306,37 @@ impl MacAudioFactory {
             event_sender: None,
             sample_rate,
             channels,
+            ready: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl SoundServerFactory for MacAudioFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
-        let channels = self.channels;
-        let sample_rate = self.sample_rate;
-        let ready = Arc::new(AtomicBool::new(false));
-
-        // audio_rx may already be consumed by a prior connection. The SCK
-        // capture channel is created once per server lifetime; only the first
-        // connection gets live audio. Subsequent reconnects still negotiate
-        // RDPSND but won't receive samples until a full server restart.
-        if let Some(rx) = self.audio_rx.lock().unwrap().take() {
-            if let Some(sender) = self.event_sender.clone() {
-                let frame_size_interleaved = (sample_rate as usize / 50) * channels as usize;
+        // The audio loop is spawned once, on the first connection, and runs
+        // for the server's lifetime. Every connection's handler shares the
+        // same `ready` flag, so a reconnecting client resumes streaming on
+        // the existing loop instead of going permanently silent.
+        if let Some(sender) = self.event_sender.clone() {
+            if let Some(rx) = self.audio_rx.lock().unwrap().take() {
+                let frame_size_interleaved =
+                    (self.sample_rate as usize / 50) * self.channels as usize;
                 tokio::spawn(audio_loop(
                     rx,
                     sender,
-                    Arc::clone(&ready),
+                    Arc::clone(&self.ready),
                     frame_size_interleaved,
-                    channels,
-                    sample_rate,
+                    self.channels,
+                    self.sample_rate,
                 ));
             }
         }
 
-        Box::new(MacAudioHandler::new(sample_rate, channels, ready))
+        Box::new(MacAudioHandler::new(
+            self.sample_rate,
+            self.channels,
+            Arc::clone(&self.ready),
+        ))
     }
 }
 
@@ -405,6 +425,93 @@ mod tests {
         let prev_tail = vec![0.5, 0.5];
         let chunk = vec![0.55, 0.55, 0.6, 0.6]; // jump of 0.05 < 0.15
         assert!(!has_discontinuity(&prev_tail, &chunk, 2));
+    }
+
+    fn audio_frame(timestamp_ms: u64, data: Vec<f32>) -> AudioFrame {
+        let num_samples = data.len() / 2;
+        AudioFrame {
+            data,
+            sample_rate: 48000,
+            channels: 2,
+            num_samples,
+            timestamp_ms,
+        }
+    }
+
+    /// Receive events until none arrive for a while; returns how many were drained.
+    async fn drain_events(ev_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>) -> usize {
+        let mut n = 0;
+        while tokio::time::timeout(Duration::from_millis(200), ev_rx.recv())
+            .await
+            .is_ok()
+        {
+            n += 1;
+        }
+        n
+    }
+
+    fn wave_ts(ev: ServerEvent) -> u32 {
+        match ev {
+            ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(_, ts)) => ts,
+            other => panic!("expected Wave event, got {other:?}"),
+        }
+    }
+
+    /// Regression test: a client that disconnects (handler `stop()`) and
+    /// reconnects (new handler's `start()` on the shared `ready` flag) must
+    /// resume audio on the same long-lived loop, with re-based timestamps.
+    #[tokio::test(start_paused = true)]
+    async fn audio_loop_resumes_after_reconnect() {
+        const FRAME_SIZE: usize = 1920; // 20ms at 48kHz stereo
+
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(64);
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ready = Arc::new(AtomicBool::new(false));
+
+        tokio::spawn(audio_loop(
+            audio_rx,
+            ev_tx,
+            Arc::clone(&ready),
+            FRAME_SIZE,
+            2,
+            48000,
+        ));
+
+        // Frames arriving before the RDPSND handshake are discarded.
+        audio_tx
+            .send(audio_frame(500, vec![0.5; FRAME_SIZE]))
+            .await
+            .unwrap();
+        assert_eq!(drain_events(&mut ev_rx).await, 0);
+
+        // First connection completes the handshake.
+        ready.store(true, Ordering::Relaxed);
+        audio_tx
+            .send(audio_frame(1000, vec![0.5; FRAME_SIZE]))
+            .await
+            .unwrap();
+        let ts = wave_ts(ev_rx.recv().await.expect("loop alive"));
+        assert_eq!(ts, 1000);
+
+        // Client disconnects: handler stop() flips the shared flag. The loop
+        // must go quiet but stay alive.
+        ready.store(false, Ordering::Relaxed);
+        drain_events(&mut ev_rx).await;
+        audio_tx
+            .send(audio_frame(50_000, vec![0.5; FRAME_SIZE]))
+            .await
+            .unwrap();
+        assert_eq!(drain_events(&mut ev_rx).await, 0);
+
+        // New connection negotiates RDPSND again: streaming must resume,
+        // re-anchored to the new frame's timestamp.
+        ready.store(true, Ordering::Relaxed);
+        audio_tx
+            .send(audio_frame(99_000, vec![0.5; FRAME_SIZE]))
+            .await
+            .unwrap();
+        let ts = wave_ts(ev_rx.recv().await.expect("loop must survive reconnect"));
+        assert_eq!(ts, 99_000);
     }
 
     #[test]
