@@ -575,7 +575,7 @@ impl RdpServer {
                             // leave the loop blocked on server events. Brief
                             // sleep so a persistent error can't spin us hot.
                             warn!(%error, "accept failed; continuing to listen");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            tokio::time::sleep(core::time::Duration::from_millis(100)).await;
                         }
                     }
                 }
@@ -745,7 +745,10 @@ impl RdpServer {
         match server_encode_svc_messages(msgs, channel_id, user_channel_id) {
             Ok(data) => Some(data),
             Err(error) => {
-                warn!(?error, channel, "failed to encode SVC messages; dropping event");
+                warn!(
+                    ?error,
+                    channel, "failed to encode SVC messages; dropping event"
+                );
                 None
             }
         }
@@ -1019,7 +1022,11 @@ impl RdpServer {
                         break Ok(RunState::Disconnect);
                     }
                     Err(error) => {
-                        warn!(error = format!("{error:#}"), "next_updated failed");
+                        // Stay connected — display errors are usually transient
+                        // (the capture fallback handles recovery) — but back off
+                        // so a persistent failure can't spin this task hot.
+                        warn!(error = format!("{error:#}"), "next_update failed");
+                        tokio::time::sleep(core::time::Duration::from_secs(1)).await;
                     }
                 }
             }
