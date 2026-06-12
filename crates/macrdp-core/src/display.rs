@@ -806,7 +806,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         if let Some(update) = self.send_idle_idr() {
                             return Ok(Some(update));
                         }
-                        None
+                        // Keepalive failed (GFX not ready or encode error) —
+                        // retry after another interval instead of disabling
+                        // keepalives until the next real frame.
+                        Some(IDLE_IDR_INTERVAL)
                     } else {
                         Some(IDLE_IDR_INTERVAL - elapsed)
                     }
