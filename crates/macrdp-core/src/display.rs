@@ -1242,6 +1242,12 @@ impl MacDisplayUpdates {
                             display_frame = self.display_frame_count,
                             "H.264 encode failed: {e:#}"
                         );
+                        // Drop the frame. Falling through would send a bitmap
+                        // update into the active GFX session, which desyncs the
+                        // client decoder (0xd06 DECOMPRESSION_FAILED) and drops
+                        // the connection. The next successful encode resumes
+                        // the stream; the periodic IDR bounds any staleness.
+                        return Ok(None);
                     }
                 }
             }
