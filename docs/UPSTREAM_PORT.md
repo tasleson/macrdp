@@ -102,12 +102,15 @@ of this (show_cursor, dynamic resolution clamping, mouse scale sync).
 
 ## Separate feature crates
 
-**macrdp-clipboard** (6b25950 → 49b013e, ~10 commits)
+**macrdp-clipboard** (6b25950 → 49b013e, ~10 commits) — DONE
 Full clipboard crate: PasteboardBridge with text (UTF-8 ↔ UTF-16LE), DIB ↔ PNG
 image conversion, HTML format wrap/unwrap, FileGroupDescriptorW file transfer.
-Integrated into macrdp-core and macrdp-server via clipboard factory. Depends on
-ironrdp-cliprdr. This is a self-contained crate but the integration touches the
-core server.
+Integrated into macrdp-core via the clipboard factory (gated on the new
+`[clipboard]` config table). Depends on ironrdp-cliprdr. The integration also
+required adding the `ClipboardFileContents` / `ClipboardFileContentsRequest`
+ServerEvent variants (and their handlers) to the patched ironrdp-server-gfx,
+which experimental lacked. Replaces the previous pbcopy/pbpaste text-only
+backend in macrdp-core.
 
 **macrdp-audio** (ed7aada → 5e80d32, 4 commits)
 macrdp-audio crate with AudioConverter, SCK audio capture with AudioFrame

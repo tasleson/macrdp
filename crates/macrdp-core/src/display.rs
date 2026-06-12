@@ -6,13 +6,14 @@ use ironrdp_server::{
     PixelFormat as RdpPixelFormat, RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use macrdp_capture::{
-    CaptureConfig, CaptureEvent, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData,
-    Rect, SafePixelBuffer, ScreenCapturer,
+    AudioFrame, CaptureConfig, CaptureEvent, CapturePixelFormat, CapturedFrame, CgFallbackCapturer,
+    FrameData, Rect, SafePixelBuffer, ScreenCapturer,
 };
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 use crate::bitrate_controller::{is_private_ip, BitrateController, FrameStats, NetworkQuality};
 use crate::handler::MouseCoordMapper;
@@ -94,6 +95,7 @@ pub struct MacDisplay {
     /// Shared with the input handler. Maps RDP desktop coords to macOS
     /// logical coords. Updated on every resize.
     coord_mapper: MouseCoordMapper,
+    audio_tx: Option<mpsc::Sender<AudioFrame>>,
 }
 
 impl MacDisplay {
@@ -114,6 +116,7 @@ impl MacDisplay {
         idle_keyframe_sec: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
         coord_mapper: MouseCoordMapper,
+        audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -141,6 +144,7 @@ impl MacDisplay {
             gfx_state,
             pending_resize: Arc::new(Mutex::new(None)),
             coord_mapper,
+            audio_tx,
         }
     }
 
@@ -279,7 +283,7 @@ impl RdpServerDisplay for MacDisplay {
             pixel_format: CapturePixelFormat::Bgra,
             show_cursor: self.show_cursor,
         };
-        let capturer = ScreenCapturer::new(preliminary_config).await?;
+        let capturer = ScreenCapturer::new(preliminary_config, self.audio_tx.clone()).await?;
 
         // The display is now awake.  Re-detect native resolution so the mouse
         // scale and VideoToolbox decision use the real values, not a fallback
@@ -356,7 +360,7 @@ impl RdpServerDisplay for MacDisplay {
         // capture streams briefly run against the same display.
         let capturer = if capture_config.pixel_format != CapturePixelFormat::Bgra {
             drop(capturer);
-            ScreenCapturer::new(capture_config.clone()).await?
+            ScreenCapturer::new(capture_config.clone(), self.audio_tx.clone()).await?
         } else {
             capturer
         };
@@ -846,7 +850,7 @@ impl MacDisplayUpdates {
         tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
         let fallback = CgFallbackCapturer::new(&self.capture_config);
         loop {
-            match ScreenCapturer::new(self.capture_config.clone()).await {
+            match ScreenCapturer::new(self.capture_config.clone(), None).await {
                 Ok(new_capturer) => {
                     tracing::info!("SCStream recovered — switching back from CoreGraphics");
                     self.capturer = new_capturer;
@@ -1414,6 +1418,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(GfxState::new(width, height, false))),
             coord_mapper,
+            None,
         )
     }
 

@@ -609,6 +609,25 @@ fn run_server_thread(args: ServerThreadArgs) {
         } else {
             None
         };
+        // Audio setup
+        let (audio_tx, audio_rx) = if args.config.audio.enabled {
+            let (tx, rx) = tokio::sync::mpsc::channel::<macrdp_capture::AudioFrame>(256);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
+            if let Some(rx) = audio_rx {
+                Some(Box::new(macrdp_audio::MacAudioFactory::new(
+                    rx,
+                    args.config.audio.sample_rate,
+                    args.config.audio.channels,
+                )))
+            } else {
+                None
+            };
+
         let coord_mapper =
             crate::handler::MouseCoordMapper::new(args.cg_w, args.cg_h, args.width, args.height);
         let display = MacDisplay::new(
@@ -627,6 +646,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             idle_keyframe_sec,
             Arc::clone(&args.gfx_state),
             coord_mapper.clone(),
+            audio_tx,
         );
 
         let input_tap = match resolve_input_tap(args.config.input_tap.as_deref()) {
@@ -682,6 +702,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             .with_hybrid(tls_acceptor, tls_identity.pub_key)
             .with_input_handler(input_handler)
             .with_display_handler(display)
+            .with_sound_factory(sound_factory)
             .with_cliprdr_factory(cliprdr_factory)
             .build();
 

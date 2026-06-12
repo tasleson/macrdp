@@ -9,11 +9,11 @@ pub const SUPPORTED_DAEMON_FEATURES: &[&str] = &[
     "RDPGFX AVC420/AVC444 video",
     "bitmap fallback",
     "clipboard text redirection",
+    "audio output (RDPSND)",
 ];
 
 /// RDP features intentionally deferred from the v1 daemon scope.
 pub const DEFERRED_DAEMON_FEATURES: &[&str] = &[
-    "audio output",
     "printer redirection",
     "file/drive redirection",
     "smartcard redirection",
@@ -27,7 +27,6 @@ mod tests {
     #[test]
     fn v1_policy_defers_non_daemon_redirection_features() {
         for feature in [
-            "audio output",
             "printer redirection",
             "file/drive redirection",
             "smartcard redirection",

@@ -1,0 +1,18 @@
+[package]
+name = "macrdp-audio"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+ironrdp-server = "0.10"
+ironrdp-rdpsnd = "0.7"
+macrdp-capture = { path = "../macrdp-capture" }
+
+[build-dependencies]
+macrdp-build = { path = "../macrdp-build" }
+
+[dev-dependencies]
+approx = "0.5"

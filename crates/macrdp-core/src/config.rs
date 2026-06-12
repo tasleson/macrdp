@@ -3,6 +3,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Audio forwarding configuration.
+///
+/// Lives under the `[audio]` table in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AudioConfig {
+    /// Enable audio capture and forwarding over the RDPSND channel.
+    pub enabled: bool,
+    /// Audio sample rate in Hz.
+    pub sample_rate: u32,
+    /// Number of audio channels (1 = mono, 2 = stereo).
+    pub channels: u16,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: 48000,
+            channels: 2,
+        }
+    }
+}
+
 /// Clipboard synchronization configuration.
 ///
 /// Lives under the `[clipboard]` table in `config.toml`.
@@ -75,6 +99,8 @@ pub struct ServerConfig {
     /// Advertise the FreeRDP advanced-input dynamic channel. Standard
     /// fast-path keyboard/mouse remains enabled when this is false.
     pub advanced_input: Option<bool>,
+    /// Audio forwarding configuration.
+    pub audio: AudioConfig,
     /// Clipboard synchronization configuration.
     pub clipboard: ClipboardConfig,
 }
@@ -109,6 +135,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("idle_keyframe_sec", &self.idle_keyframe_sec)
             .field("input_tap", &self.input_tap)
             .field("advanced_input", &self.advanced_input)
+            .field("audio", &self.audio)
             .field("clipboard", &self.clipboard)
             .finish()
     }
@@ -141,6 +168,7 @@ impl Default for ServerConfig {
             idle_keyframe_sec: None,
             input_tap: None,
             advanced_input: None,
+            audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
         }
     }
