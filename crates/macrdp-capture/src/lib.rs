@@ -7,6 +7,7 @@ use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::prelude::*;
+use screencapturekit::stream::delegate_trait::SCStreamDelegateTrait;
 use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
@@ -111,6 +112,9 @@ pub enum CaptureEvent {
     Frame(CapturedFrame),
     /// Desktop is unchanged — no new pixel data.
     Idle,
+    /// The capture stream stopped due to an error (e.g. display reconfiguration
+    /// after wake from sleep). The receiver should restart the capturer.
+    Error(String),
 }
 
 /// A captured screen frame
@@ -149,6 +153,17 @@ pub struct ScreenCapturer {
 struct OutputHandler {
     frame_tx: mpsc::Sender<CaptureEvent>,
     pixel_format: CapturePixelFormat,
+}
+
+struct StreamErrorDelegate {
+    frame_tx: mpsc::Sender<CaptureEvent>,
+}
+
+impl SCStreamDelegateTrait for StreamErrorDelegate {
+    fn did_stop_with_error(&self, error: screencapturekit::error::SCError) {
+        tracing::error!(%error, "SCStream stopped with error");
+        let _ = self.frame_tx.try_send(CaptureEvent::Error(error.to_string()));
+    }
 }
 
 impl SCStreamOutputTrait for OutputHandler {
@@ -420,11 +435,13 @@ impl ScreenCapturer {
             mpsc::channel(2);
 
         let handler = OutputHandler {
-            frame_tx,
+            frame_tx: frame_tx.clone(),
             pixel_format: config.pixel_format,
         };
 
-        let mut stream = SCStream::new(&filter, &stream_config);
+        let delegate = StreamErrorDelegate { frame_tx };
+
+        let mut stream = SCStream::new_with_delegate(&filter, &stream_config, delegate);
         stream.add_output_handler(handler, SCStreamOutputType::Screen);
 
         stream.start_capture().context("Failed to start capture")?;

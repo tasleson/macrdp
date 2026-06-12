@@ -801,12 +801,24 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         self.idle_frame_count += 1;
                         continue;
                     }
+                    CaptureEvent::Error(msg) => {
+                        tracing::warn!(error = %msg, "SCStream error — restarting capture");
+                        self.idle_frame_count = 0;
+                        self.handle_sck_stopped().await?;
+                        continue;
+                    }
                 };
                 // If another frame is already buffered, skip this one and grab the newer one
                 // This prevents frame queuing which adds latency
                 match self.capturer.try_next_frame() {
                     Some(CaptureEvent::Frame(_newer)) => continue,
                     Some(CaptureEvent::Idle) => break frame,
+                    Some(CaptureEvent::Error(msg)) => {
+                        tracing::warn!(error = %msg, "SCStream error — restarting capture");
+                        self.idle_frame_count = 0;
+                        self.handle_sck_stopped().await?;
+                        continue;
+                    }
                     None => break frame,
                 }
             };
