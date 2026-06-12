@@ -552,19 +552,32 @@ impl RdpServer {
                         }
                     }
                 },
-                Ok((stream, peer)) = listener.accept() => {
-                    debug!(?peer, "Received connection");
+                result = listener.accept() => {
                     drop(ev_receiver);
-                    if let Err(error) = self.run_connection(stream).await {
-                        let err_str = format!("{error:#}");
-                        if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
-                            warn!("Client disconnected: {err_str}");
-                        } else {
-                            error!(?error, "Connection error");
+                    match result {
+                        Ok((stream, peer)) => {
+                            debug!(?peer, "Received connection");
+                            if let Err(error) = self.run_connection(stream).await {
+                                let err_str = format!("{error:#}");
+                                if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
+                                    warn!("Client disconnected: {err_str}");
+                                } else {
+                                    error!(?error, "Connection error");
+                                }
+                            }
+                            info!("Ready for next connection");
+                            self.static_channels = StaticChannelSet::new();
+                        }
+                        Err(error) => {
+                            // Transient accept failures (ECONNABORTED, EMFILE)
+                            // must not stop the listener. Matching only the Ok
+                            // case in select! would disable this branch and
+                            // leave the loop blocked on server events. Brief
+                            // sleep so a persistent error can't spin us hot.
+                            warn!(%error, "accept failed; continuing to listen");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
-                    info!("Ready for next connection");
-                    self.static_channels = StaticChannelSet::new();
                 }
                 else => break,
             }
