@@ -4,7 +4,7 @@ use std::net::TcpListener as StdTcpListener;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
 use ironrdp_async::{single_sequence_step, Framed};
 use ironrdp_cliprdr::backend::ClipboardMessage;
@@ -720,6 +720,24 @@ impl RdpServer {
         Ok((RunState::Continue, encoder))
     }
 
+    /// Encode SVC messages for a non-essential channel (rdpsnd, cliprdr),
+    /// logging and returning `None` on failure so one bad message is dropped
+    /// instead of tearing down the client connection.
+    fn encode_svc_or_drop(
+        msgs: Vec<SvcMessage>,
+        channel_id: StaticChannelId,
+        user_channel_id: u16,
+        channel: &str,
+    ) -> Option<Vec<u8>> {
+        match server_encode_svc_messages(msgs, channel_id, user_channel_id) {
+            Ok(data) => Some(data),
+            Err(error) => {
+                warn!(?error, channel, "failed to encode SVC messages; dropping event");
+                None
+            }
+        }
+    }
+
     async fn dispatch_server_events(
         &mut self,
         events: &mut Vec<ServerEvent>,
@@ -765,13 +783,28 @@ impl RdpServer {
                             error!(?error, "Handling rdpsnd event");
                             continue;
                         }
-                    }
-                    .context("failed to send rdpsnd event")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<RdpsndServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data =
-                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    };
+                    // Audio is non-essential: drop the event on backend errors
+                    // rather than disconnecting the client.
+                    let msgs = match msgs {
+                        Ok(msgs) => msgs,
+                        Err(error) => {
+                            warn!(?error, "rdpsnd backend error; dropping event");
+                            continue;
+                        }
+                    };
+                    let Some(channel_id) = self.get_channel_id_by_type::<RdpsndServer>() else {
+                        warn!("rdpsnd SVC channel not found; dropping event");
+                        continue;
+                    };
+                    let Some(data) = Self::encode_svc_or_drop(
+                        msgs.into(),
+                        channel_id,
+                        user_channel_id,
+                        "rdpsnd",
+                    ) else {
+                        continue;
+                    };
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::Clipboard(c) => {
@@ -791,13 +824,28 @@ impl RdpServer {
                             error!(?error, "Handling clipboard event");
                             continue;
                         }
-                    }
-                    .context("failed to send clipboard event")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data =
-                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    };
+                    // Clipboard is non-essential: drop the event on backend
+                    // errors rather than disconnecting the client.
+                    let msgs = match msgs {
+                        Ok(msgs) => msgs,
+                        Err(error) => {
+                            warn!(?error, "clipboard backend error; dropping event");
+                            continue;
+                        }
+                    };
+                    let Some(channel_id) = self.get_channel_id_by_type::<CliprdrServer>() else {
+                        warn!("cliprdr SVC channel not found; dropping event");
+                        continue;
+                    };
+                    let Some(data) = Self::encode_svc_or_drop(
+                        msgs.into(),
+                        channel_id,
+                        user_channel_id,
+                        "cliprdr",
+                    ) else {
+                        continue;
+                    };
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::ClipboardFileContents(response) => {
@@ -805,24 +853,42 @@ impl RdpServer {
                         warn!("No clipboard channel, dropping file contents response");
                         continue;
                     };
-                    let msgs = cliprdr
-                        .submit_file_contents(response)
-                        .context("failed to submit file contents")?;
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data =
-                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let msgs = match cliprdr.submit_file_contents(response) {
+                        Ok(msgs) => msgs,
+                        Err(error) => {
+                            warn!(?error, "failed to submit file contents; dropping event");
+                            continue;
+                        }
+                    };
+                    let Some(channel_id) = self.get_channel_id_by_type::<CliprdrServer>() else {
+                        warn!("cliprdr SVC channel not found; dropping event");
+                        continue;
+                    };
+                    let Some(data) = Self::encode_svc_or_drop(
+                        msgs.into(),
+                        channel_id,
+                        user_channel_id,
+                        "cliprdr",
+                    ) else {
+                        continue;
+                    };
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::ClipboardFileContentsRequest(request) => {
-                    let channel_id = self
-                        .get_channel_id_by_type::<CliprdrServer>()
-                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    let Some(channel_id) = self.get_channel_id_by_type::<CliprdrServer>() else {
+                        warn!("cliprdr SVC channel not found; dropping event");
+                        continue;
+                    };
                     let pdu = ClipboardPdu::FileContentsRequest(request);
                     let svc_msg = encode_cliprdr_pdu(pdu);
-                    let data =
-                        server_encode_svc_messages(vec![svc_msg], channel_id, user_channel_id)?;
+                    let Some(data) = Self::encode_svc_or_drop(
+                        vec![svc_msg],
+                        channel_id,
+                        user_channel_id,
+                        "cliprdr",
+                    ) else {
+                        continue;
+                    };
                     writer.write_all(&data).await?;
                 }
             }
