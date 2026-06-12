@@ -472,6 +472,13 @@ enum CachedFrame {
 /// IDR keepalive interval during idle scenes.
 const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Periodic IDR interval during active scenes. H.264 P-frames depend on
+/// prior reference frames; if any frame is lost (capture channel overflow,
+/// backpressure skip, transport error) the client's decoder state desyncs
+/// and affected regions show stale content until the next IDR. This
+/// interval bounds the worst-case staleness regardless of scene activity.
+const PERIODIC_IDR_INTERVAL: Duration = Duration::from_secs(10);
+
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
@@ -1050,11 +1057,18 @@ impl MacDisplayUpdates {
                 let t0 = std::time::Instant::now();
 
                 // Force IDR keyframe on the first GFX frame so the decoder initializes cleanly.
-                let force_keyframe = self.display_frame_count == 1 || force_idle_keyframe;
+                let periodic_idr_due = self.last_idr_time.elapsed() >= PERIODIC_IDR_INTERVAL;
+                let force_keyframe =
+                    self.display_frame_count == 1 || force_idle_keyframe || periodic_idr_due;
                 if force_keyframe {
                     if self.display_frame_count == 1 {
                         tracing::info!(
                             "First GFX frame — forcing IDR keyframe for clean decoder init"
+                        );
+                    } else if periodic_idr_due {
+                        tracing::debug!(
+                            secs_since_last_idr = self.last_idr_time.elapsed().as_secs(),
+                            "Periodic IDR refresh — forcing keyframe for decoder resync"
                         );
                     } else {
                         tracing::debug!("Idle interval elapsed — forcing IDR keyframe");

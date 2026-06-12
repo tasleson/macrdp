@@ -178,8 +178,12 @@ impl SCStreamOutputTrait for OutputHandler {
         };
         let Some(event) = event else { return };
 
-        // Non-blocking send — drop event if channel is full
-        let _ = self.frame_tx.try_send(event);
+        // Non-blocking send — drop if channel is full (encoder too slow)
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+            self.frame_tx.try_send(event)
+        {
+            tracing::warn!("Capture channel full — frame dropped at source");
+        }
     }
 }
 
