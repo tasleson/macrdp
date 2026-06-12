@@ -25,6 +25,8 @@ prototype is intentionally not part of this fork's release scope.
 - **Hardware-accelerated encoding** — GPU-powered H.264 via Apple VideoToolbox, low latency on Apple Silicon
 - **High fidelity color** — AVC444 mode for pixel-perfect color reproduction (RDP 10)
 - **Full keyboard & mouse** — complete input injection with 104-key mapping, numpad, modifiers, scroll
+- **System audio** — remote Mac audio streamed to the client over the RDPSND channel; the local speaker is muted for the duration of the session and restored on disconnect
+- **Clipboard sharing** — bidirectional clipboard sync over CLIPRDR for text, images, and HTML, plus file copy/paste with a configurable size cap
 - **HiDPI / Retina support** — capture at 2x/3x resolution for sharp 4K remote display
 - **Dynamic resolution** — automatically follows client window resize; the server reacts to display-control PDUs and adjusts the session resolution on the fly
 - **Native cursor embedding** — real macOS cursor shapes (resize handles, I-beams, etc.) are streamed in the video; configurable via `show_cursor`
@@ -101,6 +103,18 @@ bitrate_mbps = 50           # target bitrate (Mbps)
 # Logging
 log_level = "info"          # trace / debug / info / warn / error
 log_path = "/path/to/macrdp.log"
+
+# Audio (RDPSND) — enabled by default
+[audio]
+enabled = true
+sample_rate = 48000         # Hz
+channels = 2                # 1 = mono, 2 = stereo
+
+# Clipboard (CLIPRDR) — enabled by default
+[clipboard]
+enabled = true
+file_transfer = true        # allow copy/paste of files
+max_file_size_mb = 100      # per-file transfer cap
 ```
 
 All daemon files live under a single base directory:
@@ -205,10 +219,14 @@ The plist uses `KeepAlive = { SuccessfulExit = false; Crashed = true; }` so a cl
 
 ```
 crates/
-├── macrdp-server/       Main server binary
+├── macrdp-server/       Main server binary (CLI daemon)
+├── macrdp-core/         Runtime: session, config, callbacks, adaptive bitrate
 ├── macrdp-capture/      Screen capture
 ├── macrdp-input/        Keyboard & mouse injection
 ├── macrdp-encode/       Video encoding
+├── macrdp-audio/        System audio capture + RDPSND streaming
+├── macrdp-clipboard/    Native clipboard bridge (text/image/HTML/files)
+├── macrdp-build/        Shared build-script helpers
 ├── ironrdp-server-gfx/  RDP protocol (IronRDP fork)
 └── ironrdp-acceptor-patched/
                          RDP connection acceptor

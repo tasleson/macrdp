@@ -146,3 +146,41 @@ idle_timeout_secs = 1800
 # When unchanged-frame skipping is enabled, send an idle keyframe/keepalive
 # after this many seconds. Default when skip_unchanged = true: 5
 # idle_keyframe_sec = 5
+
+# ─── Audio ───────────────────────────────────────────────────────────────────
+
+# System audio redirection over the RDPSND virtual channel.
+# When enabled, audio from the remote Mac is streamed to the RDP client. The
+# local Mac speaker is muted for the duration of the session and the prior mute
+# state is restored on disconnect.
+[audio]
+
+# Enable audio capture and forwarding.
+# Default: true
+enabled = true
+
+# Audio sample rate in Hz.
+# Default: 48000
+sample_rate = 48000
+
+# Number of audio channels (1 = mono, 2 = stereo).
+# Default: 2
+channels = 2
+
+# ─── Clipboard ───────────────────────────────────────────────────────────────
+
+# Bidirectional clipboard synchronization over the CLIPRDR virtual channel
+# (text, images, HTML, and optionally files).
+[clipboard]
+
+# Enable clipboard synchronization.
+# Default: true
+enabled = true
+
+# Allow file transfer via the clipboard (copy/paste of files).
+# Default: true
+file_transfer = true
+
+# Maximum size, in megabytes, of a single file transferred via the clipboard.
+# Default: 100
+max_file_size_mb = 100
