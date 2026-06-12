@@ -663,9 +663,27 @@ impl CgFallbackCapturer {
         let data = image.data();
         let raw = data.bytes().to_vec();
 
+        let width = if self.width > 0 { self.width } else { w };
+        let height = if self.height > 0 { self.height } else { h };
+
+        // CGDisplayCreateImage returns the display's *current* pixel size,
+        // which can differ from the configured capture size (Retina scaling,
+        // resolution change while SCK is down). A buffer smaller than the
+        // claimed dimensions would make the encoder read out of bounds.
+        if raw.len() < bpr.saturating_mul(height as usize) {
+            tracing::warn!(
+                image_w = w,
+                image_h = h,
+                claimed_w = width,
+                claimed_h = height,
+                "CG fallback image smaller than configured capture size — dropping frame"
+            );
+            return None;
+        }
+
         Some(CapturedFrame {
-            width: if self.width > 0 { self.width } else { w },
-            height: if self.height > 0 { self.height } else { h },
+            width,
+            height,
             data: FrameData::Raw(Bytes::from(raw)),
             stride: bpr,
             timestamp_us: std::time::SystemTime::now()

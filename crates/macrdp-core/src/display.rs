@@ -368,6 +368,8 @@ impl RdpServerDisplay for MacDisplay {
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
+            cg_fallback: None,
+            audio_tx: self.audio_tx.clone(),
             encoder,
             gfx_state: Arc::clone(&self.gfx_state),
             bitrate_ctrl,
@@ -483,9 +485,43 @@ const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
 /// interval bounds the worst-case staleness regardless of scene activity.
 const PERIODIC_IDR_INTERVAL: Duration = Duration::from_secs(10);
 
+/// While in CoreGraphics fallback, how often to attempt to restore the
+/// ScreenCaptureKit stream. Creating an SCK stream enumerates shareable
+/// content, which is far too expensive to retry at frame rate.
+const SCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// End the update stream when neither SCK nor the CoreGraphics fallback has
+/// produced a frame for this long. At that point capture is irrecoverably
+/// dead (e.g. screen-recording permission was revoked) and a clean disconnect
+/// beats a session frozen forever; if the client reconnects while capture is
+/// still unavailable it gets an explicit denial from `updates()`.
+const CAPTURE_BLACKOUT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Active CoreGraphics fallback state while the SCK stream is down
+/// (lock screen, display reconfiguration, wake from sleep).
+struct CgFallback {
+    capturer: CgFallbackCapturer,
+    entered_at: Instant,
+    /// Last time the fallback produced a frame, for blackout detection.
+    last_frame_at: Option<Instant>,
+    last_sck_retry: Instant,
+}
+
+/// Outcome of one CoreGraphics fallback iteration.
+enum CgFallbackTick {
+    Update(DisplayUpdate),
+    Continue,
+    /// Capture is irrecoverably dead — end the stream (disconnects the client).
+    EndOfStream,
+}
+
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
+    /// `Some` while the SCK stream is down and we serve CoreGraphics frames.
+    cg_fallback: Option<CgFallback>,
+    /// Kept so SCK re-creation after a capture restart retains audio capture.
+    audio_tx: Option<mpsc::Sender<AudioFrame>>,
     encoder: Option<Box<dyn VideoEncoder>>,
     gfx_state: Arc<Mutex<GfxState>>,
     bitrate_ctrl: BitrateController,
@@ -710,9 +746,9 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // tears the whole session down. A skipped frame is emphatically not
         // end-of-stream, so we loop and pull the next frame instead. This does
         // not busy-spin: `next_frame().await` blocks until the capturer
-        // produces the next frame, which paces us at the capture rate. We only
-        // ever surface an actual `DisplayUpdate`; genuine capture loss is
-        // handled inline by the CoreGraphics fallback below.
+        // produces the next frame, which paces us at the capture rate. The only
+        // `Ok(None)` we surface deliberately is the capture-blackout case in
+        // `cg_fallback_tick`, where disconnecting is the graceful outcome.
         'outer: loop {
             if !self.sent_pointer {
                 self.sent_pointer = true;
@@ -747,6 +783,16 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
             }
 
+            // While SCK is down, serve CoreGraphics frames and probe for
+            // recovery; the dead capturer's channel would block forever.
+            if self.cg_fallback.is_some() {
+                match self.cg_fallback_tick().await? {
+                    CgFallbackTick::Update(update) => return Ok(Some(update)),
+                    CgFallbackTick::Continue => continue 'outer,
+                    CgFallbackTick::EndOfStream => return Ok(None),
+                }
+            }
+
             // Drain stale frames — always use the latest available frame.
             // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
             // which works at the display level (including lock screen).
@@ -773,8 +819,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         Ok(Some(e)) => e,
                         Ok(None) => {
                             self.idle_frame_count = 0;
-                            self.handle_sck_stopped().await?;
-                            continue;
+                            self.enter_cg_fallback();
+                            continue 'outer;
                         }
                         Err(_elapsed) => {
                             if let Some(update) = self.send_idle_idr() {
@@ -788,8 +834,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         Some(e) => e,
                         None => {
                             self.idle_frame_count = 0;
-                            self.handle_sck_stopped().await?;
-                            continue;
+                            self.enter_cg_fallback();
+                            continue 'outer;
                         }
                     }
                 };
@@ -815,8 +861,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     CaptureEvent::Error(msg) => {
                         tracing::warn!(error = %msg, "SCStream error — restarting capture");
                         self.idle_frame_count = 0;
-                        self.handle_sck_stopped().await?;
-                        continue;
+                        self.enter_cg_fallback();
+                        continue 'outer;
                     }
                 };
                 // If another frame is already buffered, skip this one and grab the newer one
@@ -827,8 +873,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     Some(CaptureEvent::Error(msg)) => {
                         tracing::warn!(error = %msg, "SCStream error — restarting capture");
                         self.idle_frame_count = 0;
-                        self.handle_sck_stopped().await?;
-                        continue;
+                        self.enter_cg_fallback();
+                        continue 'outer;
                     }
                     None => break frame,
                 }
@@ -843,24 +889,86 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
-    /// SCK channel closed — fall back to CoreGraphics capture, then try to
-    /// restore SCK. Returns `Ok(())` after recovery; the caller should
-    /// `continue` to retry `next_frame`.
-    async fn handle_sck_stopped(&mut self) -> Result<()> {
+    /// SCK stream stopped — switch `next_update` into CoreGraphics fallback
+    /// mode. Subsequent iterations call [`Self::cg_fallback_tick`] until the
+    /// SCK stream is restored.
+    fn enter_cg_fallback(&mut self) {
+        if self.cg_fallback.is_some() {
+            return;
+        }
         tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
-        let fallback = CgFallbackCapturer::new(&self.capture_config);
-        loop {
-            match ScreenCapturer::new(self.capture_config.clone(), None).await {
+        let now = Instant::now();
+        self.cg_fallback = Some(CgFallback {
+            capturer: CgFallbackCapturer::new(&self.capture_config),
+            entered_at: now,
+            last_frame_at: None,
+            last_sck_retry: now,
+        });
+    }
+
+    /// One iteration of CoreGraphics fallback: periodically probe for SCK
+    /// recovery, otherwise capture and deliver a CG frame so the client keeps
+    /// seeing the screen (e.g. the lock screen) while SCK is down.
+    async fn cg_fallback_tick(&mut self) -> Result<CgFallbackTick> {
+        let now = Instant::now();
+        let retry_sck = {
+            let fb = self.cg_fallback.as_ref().expect("fallback active");
+            now.duration_since(fb.last_sck_retry) >= SCK_RETRY_INTERVAL
+        };
+        if retry_sck {
+            self.cg_fallback
+                .as_mut()
+                .expect("fallback active")
+                .last_sck_retry = now;
+            match ScreenCapturer::new(self.capture_config.clone(), self.audio_tx.clone()).await {
                 Ok(new_capturer) => {
                     tracing::info!("SCStream recovered — switching back from CoreGraphics");
                     self.capturer = new_capturer;
-                    return Ok(());
-                }
-                Err(_) => {
-                    if let Some(cg_frame) = fallback.capture_frame() {
-                        let _ = self.encode_and_send(cg_frame)?;
+                    self.cg_fallback = None;
+                    // CG frames can differ subtly from SCK frames (scaling,
+                    // colorimetry) and some may have been dropped; resync the
+                    // client decoder with a fresh IDR.
+                    if let Some(enc) = &mut self.encoder {
+                        enc.force_keyframe();
                     }
-                    tokio::time::sleep(fallback.frame_interval()).await;
+                    return Ok(CgFallbackTick::Continue);
+                }
+                Err(e) => {
+                    tracing::debug!(error = format!("{e:#}"), "SCStream still unavailable");
+                }
+            }
+        }
+
+        let (frame, interval) = {
+            let fb = self.cg_fallback.as_ref().expect("fallback active");
+            (fb.capturer.capture_frame(), fb.capturer.frame_interval())
+        };
+        tokio::time::sleep(interval).await;
+
+        match frame {
+            Some(cg_frame) => {
+                self.cg_fallback
+                    .as_mut()
+                    .expect("fallback active")
+                    .last_frame_at = Some(Instant::now());
+                match self.encode_and_send(cg_frame)? {
+                    Some(update) => Ok(CgFallbackTick::Update(update)),
+                    None => Ok(CgFallbackTick::Continue),
+                }
+            }
+            None => {
+                let fb = self.cg_fallback.as_ref().expect("fallback active");
+                let blackout_since = fb.last_frame_at.unwrap_or(fb.entered_at);
+                if blackout_since.elapsed() >= CAPTURE_BLACKOUT_TIMEOUT {
+                    tracing::error!(
+                        blackout_secs = blackout_since.elapsed().as_secs(),
+                        "Capture is dead: SCStream cannot be restored and CoreGraphics \
+                         produces no frames (screen-recording permission revoked?) — \
+                         ending the update stream to disconnect the client"
+                    );
+                    Ok(CgFallbackTick::EndOfStream)
+                } else {
+                    Ok(CgFallbackTick::Continue)
                 }
             }
         }
