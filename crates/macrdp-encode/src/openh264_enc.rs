@@ -402,6 +402,70 @@ mod tests {
         assert!(frame.is_keyframe);
     }
 
+    /// At a non-16-aligned height the encoder must report the exact visible
+    /// size (not a macroblock-padded one) and decode back to that size with
+    /// colour intact. A padded size here would leak into the RDPGFX surface and
+    /// corrupt the client picture, so this guards the geometry contract.
+    #[test]
+    fn encode_reports_exact_visible_size_at_1080p() {
+        use openh264::decoder::Decoder;
+
+        let (w, h) = (1920u32, 1080u32); // 1080 is NOT a multiple of 16
+        let stride = w as usize * 4;
+        let bands = [
+            [0u8, 0, 255, 255],     // red
+            [0u8, 255, 0, 255],     // green
+            [255u8, 0, 0, 255],     // blue
+            [255u8, 255, 255, 255], // white
+        ];
+        let mut bgra = vec![0u8; stride * h as usize];
+        for row in 0..h as usize {
+            let band = (row * 4 / h as usize).min(3);
+            for col in 0..w as usize {
+                let o = row * stride + col * 4;
+                bgra[o..o + 4].copy_from_slice(&bands[band]);
+            }
+        }
+
+        let mut encoder = OpenH264Encoder::new(w, h, 60.0, 99_000_000, false).unwrap();
+        encoder.force_keyframe();
+        let frame = encoder.encode_bgra(&bgra, w, h, stride).unwrap();
+        assert_eq!(
+            (frame.width, frame.height),
+            (w, h),
+            "must report visible size"
+        );
+
+        let mut decoder = Decoder::new().unwrap();
+        let decoded = decoder
+            .decode(&frame.data)
+            .unwrap()
+            .expect("IDR should decode");
+        let (dw, dh) = openh264::formats::YUVSource::dimensions(&decoded);
+        assert_eq!(
+            (dw as u32, dh as u32),
+            (w, h),
+            "must decode to visible size"
+        );
+
+        let mut rgb = vec![0u8; dw * dh * 3];
+        decoded.write_rgb8(&mut rgb);
+        let cx = dw / 2;
+        for (i, (er, eg, eb)) in [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
+            .iter()
+            .map(|c: &(i32, i32, i32)| *c)
+            .enumerate()
+        {
+            let y = (i * 270 + 135).min(dh - 1);
+            let o = (y * dw + cx) * 3;
+            let (r, g, b) = (rgb[o] as i32, rgb[o + 1] as i32, rgb[o + 2] as i32);
+            assert!(
+                (r - er).abs() < 70 && (g - eg).abs() < 70 && (b - eb).abs() < 70,
+                "band {i} @row{y} = ({r},{g},{b}), expected ~({er},{eg},{eb}) — colour/tiling regression"
+            );
+        }
+    }
+
     #[test]
     fn test_screen_bitrate() {
         let br = crate::screen_bitrate(1920, 1080, 60.0, crate::Quality::HighQuality);

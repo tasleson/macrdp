@@ -191,6 +191,20 @@ pub fn align16(v: u32) -> u32 {
     (v + 15) & !15
 }
 
+/// Round a dimension up to the nearest even value.
+///
+/// H.264 4:2:0 chroma subsampling requires even width and height. We round to
+/// *even* rather than to the 16-px macroblock grid on purpose: the encoded
+/// dimensions returned in [`EncodedFrame`] become the RDPGFX surface and
+/// destination-rectangle sizes, so they must equal the visible desktop size.
+/// Both VideoToolbox and OpenH264 already pad internally to the macroblock grid
+/// and emit SPS frame-cropping, so the decoded frame is exactly this size.
+/// Rounding up to 16 here instead would make the surface taller/wider than the
+/// desktop and corrupt the client's picture (see `create_encoder`).
+pub fn align_even(v: u32) -> u32 {
+    (v + 1) & !1
+}
+
 /// Calculate optimal bitrate for screen content
 pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
     let pixels = width as f64 * height as f64;
@@ -262,8 +276,15 @@ pub fn create_encoder(
     mode_444: bool,
     bitrate: u32,
 ) -> Result<Box<dyn VideoEncoder>> {
-    let enc_w = align16(width);
-    let enc_h = align16(height);
+    // Encoded dimensions must equal the visible desktop size (only rounded up
+    // to even for 4:2:0), NOT the 16-px macroblock grid: these values flow into
+    // the RDPGFX CreateSurface / destination rect, and a surface larger than
+    // the desktop corrupts the client (e.g. 1080 -> 1088 leaks an 8-px overhang
+    // that some clients render as a tiled, desaturated mess). The encoders pad
+    // to macroblocks internally and crop via SPS, so the decoded frame is
+    // exactly enc_w x enc_h.
+    let enc_w = align_even(width);
+    let enc_h = align_even(height);
 
     // Hardware: VideoToolbox GPU encoder
     #[cfg(target_os = "macos")]

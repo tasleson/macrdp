@@ -181,8 +181,12 @@ impl MacDisplay {
         } else {
             (MAX_ENCODE_SHORT, MAX_ENCODE_LONG)
         };
-        let w = width.min(long);
-        let h = height.min(short);
+        // Round down to even: H.264 4:2:0 needs even dimensions, and the desktop
+        // size must match the encoded size exactly (the encoder uses these same
+        // dimensions and the RDPGFX surface is built from them). Rounding down
+        // keeps us within the client-requested bounds.
+        let w = (width.min(long)) & !1;
+        let h = (height.min(short)) & !1;
         if w == 0 || h == 0 || (w == self.width && h == self.height) {
             return;
         }

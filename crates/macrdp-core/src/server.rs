@@ -245,7 +245,7 @@ fn generate_password(len: usize) -> String {
 /// a legacy integer scale factor. Returns `(width, height, is_auto)`.
 pub fn resolve_resolution(resolution: Option<&str>, base_w: u16, base_h: u16) -> (u16, u16, bool) {
     let mode = resolution.unwrap_or("auto");
-    if mode == "auto" {
+    let (w, h, is_auto) = if mode == "auto" {
         let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
         tracing::info!(scale, base_w, base_h, "Resolution auto: display scale");
         (
@@ -268,7 +268,10 @@ pub fn resolve_resolution(resolution: Option<&str>, base_w: u16, base_h: u16) ->
     } else {
         tracing::warn!(mode, "Resolution: unrecognized, using logical");
         (base_w, base_h, true)
-    }
+    };
+    // H.264 4:2:0 needs even dimensions, and the desktop size must equal the
+    // encoded size (the RDPGFX surface is built from it). Round down to even.
+    (w & !1, h & !1, is_auto)
 }
 
 fn resolve_chroma_mode(chroma_mode: Option<&str>) -> Result<bool> {
