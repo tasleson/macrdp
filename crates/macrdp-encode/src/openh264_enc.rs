@@ -453,7 +453,7 @@ mod tests {
         let cx = dw / 2;
         for (i, (er, eg, eb)) in [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
             .iter()
-            .map(|c: &(i32, i32, i32)| *c)
+            .copied()
             .enumerate()
         {
             let y = (i * 270 + 135).min(dh - 1);
