@@ -82,8 +82,8 @@ port = 13389
 bind_address = "::"  # 双栈 IPv4 + IPv6；如需仅 IPv4 请使用 "0.0.0.0"
 
 # 认证
-username = "admin"
-password = "123456"
+username = "macrdp"
+password = "change-this-password"
 allow_generated_credentials = false
 
 # 显示

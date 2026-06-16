@@ -30,8 +30,8 @@ bind_address = "::"
 
 # RDP login credentials (NLA/Hybrid/CredSSP)
 # Both fields are required for unattended daemon use.
-username = "admin"
-password = "123456"
+username = "macrdp"
+password = "change-this-password"
 
 # Development-only fallback for temporary credentials.
 # Default: false. When true and username/password are missing, macrdp generates

@@ -83,8 +83,8 @@ port = 13389
 bind_address = "::"  # dual-stack IPv4 + IPv6; use "0.0.0.0" to force IPv4-only
 
 # Authentication
-username = "admin"
-password = "123456"
+username = "macrdp"
+password = "change-this-password"
 allow_generated_credentials = false
 
 # Display

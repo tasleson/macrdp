@@ -30,8 +30,8 @@ bind_address = "0.0.0.0"
 
 # RDP 登录凭据 (NLA/Hybrid/CredSSP 认证)
 # 作为无人值守守护进程运行时必须设置这两个字段
-username = "admin"
-password = "123456"
+username = "macrdp"
+password = "change-this-password"
 
 # 仅用于开发的临时凭据回退
 # 默认值: false。设置为 true 且未配置 username/password 时, macrdp 会使用
