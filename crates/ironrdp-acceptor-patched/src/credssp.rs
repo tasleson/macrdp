@@ -230,6 +230,8 @@ impl<'a> CredsspSequence<'a> {
             output.advance(length);
 
             Ok(Written::from_size(length)?)
+        } else if let CredsspState::ServerError(err) = &self.state {
+            Err(custom_err!("Credssp server error", err.clone()))
         } else {
             Ok(Written::Nothing)
         }
