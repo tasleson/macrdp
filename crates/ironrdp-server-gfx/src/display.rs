@@ -333,6 +333,14 @@ pub trait RdpServerDisplay: Send {
     /// so the size returned by this method will be enforced.
     async fn size(&mut self) -> DesktopSize;
 
+    /// Whether this display accepts client-driven desktop resize requests.
+    ///
+    /// When false, the server does not advertise desktop resize support or
+    /// register the display-control dynamic channel.
+    fn supports_dynamic_resize(&self) -> bool {
+        false
+    }
+
     /// Return a display updates receiver
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>>;
 

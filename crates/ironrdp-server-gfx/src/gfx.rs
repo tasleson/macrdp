@@ -1157,4 +1157,57 @@ mod tests {
             congested_quality,
         );
     }
+
+    fn dummy_frame(w: u16, h: u16) -> GfxFrameUpdate {
+        GfxFrameUpdate {
+            h264_data: bytes::Bytes::new(),
+            width: w,
+            height: h,
+            enc_width: w,
+            enc_height: h,
+            is_keyframe: true,
+            h264_aux: None,
+        }
+    }
+
+    /// A resize clears `surface_created`; the next frame must re-emit the surface
+    /// setup (ResetGraphics + CreateSurface) at the new dimensions. Without it,
+    /// the stale surface keeps its old size and only that sub-rectangle of the
+    /// screen refreshes after a client-driven resize.
+    #[test]
+    fn cleared_surface_flag_re_emits_setup_at_new_size() {
+        let mut gfx = GfxState::new(1920, 1080, false);
+
+        // First frame: surface is created, setup PDUs included.
+        let first = GfxHandler::create_frame_pdu(&mut gfx, &dummy_frame(1920, 1080));
+        assert!(gfx.surface_created);
+
+        // Steady-state frame: no setup, so it is strictly smaller.
+        let steady = GfxHandler::create_frame_pdu(&mut gfx, &dummy_frame(1920, 1080));
+        assert!(gfx.surface_created);
+        assert!(
+            steady.len() < first.len(),
+            "steady frame ({}) should omit surface setup present in first ({})",
+            steady.len(),
+            first.len(),
+        );
+
+        // Simulate a deactivation/reactivation resize: size changes and the
+        // surface is invalidated (as run_connection's reactivation path does).
+        gfx.width = 1280;
+        gfx.height = 720;
+        gfx.surface_created = false;
+
+        let resized = GfxHandler::create_frame_pdu(&mut gfx, &dummy_frame(1280, 720));
+        assert!(
+            gfx.surface_created,
+            "surface must be recreated after resize"
+        );
+        assert!(
+            resized.len() > steady.len(),
+            "post-resize frame ({}) must re-include surface setup vs steady ({})",
+            resized.len(),
+            steady.len(),
+        );
+    }
 }

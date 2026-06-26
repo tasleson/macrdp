@@ -403,7 +403,7 @@ impl RdpServer {
         }
     }
 
-    fn attach_channels(&mut self, acceptor: &mut Acceptor) {
+    fn attach_channels(&mut self, acceptor: &mut Acceptor, dynamic_resize: bool) {
         if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
             let backend = cliprdr_factory.build_cliprdr_backend();
 
@@ -418,9 +418,15 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpsndServer::new(backend));
         }
 
-        let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let mut dvc = dvc::DrdynvcServer::new()
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+        let mut dvc = dvc::DrdynvcServer::new();
+
+        if dynamic_resize {
+            let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
+            dvc = dvc.with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+            debug!("Display-control channel registered");
+        } else {
+            debug!("Display-control channel disabled for fixed-resolution display");
+        }
 
         if self.advanced_input_enabled {
             dvc = dvc.with_dynamic_channel(AInputHandler {
@@ -455,7 +461,10 @@ impl RdpServer {
             gs.peer_addr = peer_ip;
         };
 
-        let size = self.display.lock().await.size().await;
+        let (size, dynamic_resize) = {
+            let mut display = self.display.lock().await;
+            (display.size().await, display.supports_dynamic_resize())
+        };
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(
             self.opts.security.flag(),
@@ -464,7 +473,7 @@ impl RdpServer {
             self.creds.clone(),
         );
 
-        self.attach_channels(&mut acceptor);
+        self.attach_channels(&mut acceptor, dynamic_resize);
 
         let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
             .await
@@ -956,12 +965,21 @@ impl RdpServer {
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let gfx_state = Arc::clone(&self.gfx_state);
 
-        // Update GFX state with current desktop size
+        // Update GFX state with current desktop size. This runs on every
+        // (re)activation, so on a deactivation/reactivation resize the size
+        // changes here. Invalidate the surface too: it was created at the old
+        // dimensions, and create_frame_pdu only emits ResetGraphics +
+        // CreateSurface while `surface_created` is false. Without this reset the
+        // stale, smaller surface keeps receiving WireToSurface1 updates and only
+        // that sub-rectangle of the screen refreshes. On the initial activation
+        // `surface_created` is already false (reset in run_connection), so this
+        // is a no-op there.
         {
             let size = self.display.lock().await.size().await;
             let mut gs = self.gfx_state.lock().unwrap();
             gs.width = size.width;
-            gs.height = size.height
+            gs.height = size.height;
+            gs.surface_created = false;
         };
 
         // Get DRDYNVC channel ID for sending GFX frames

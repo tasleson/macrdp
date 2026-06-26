@@ -13,7 +13,7 @@ use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::bitrate_controller::{is_private_ip, BitrateController, FrameStats, NetworkQuality};
 use crate::handler::MouseCoordMapper;
@@ -92,6 +92,7 @@ pub struct MacDisplay {
     idle_keyframe_interval: Option<Duration>,
     gfx_state: Arc<Mutex<GfxState>>,
     pending_resize: Arc<Mutex<Option<(DesktopSize, Instant)>>>,
+    resize_notify: Arc<Notify>,
     /// Shared with the input handler. Maps RDP desktop coords to macOS
     /// logical coords. Updated on every resize.
     coord_mapper: MouseCoordMapper,
@@ -143,6 +144,7 @@ impl MacDisplay {
                 .map(|seconds| Duration::from_secs(seconds as u64)),
             gfx_state,
             pending_resize: Arc::new(Mutex::new(None)),
+            resize_notify: Arc::new(Notify::new()),
             coord_mapper,
             audio_tx,
         }
@@ -229,6 +231,7 @@ impl MacDisplay {
             },
             Instant::now(),
         ));
+        self.resize_notify.notify_one();
     }
 }
 
@@ -239,6 +242,10 @@ impl RdpServerDisplay for MacDisplay {
             width: self.width,
             height: self.height,
         }
+    }
+
+    fn supports_dynamic_resize(&self) -> bool {
+        !self.fixed_resolution
     }
 
     fn request_resize(&mut self, width: u16, height: u16) {
@@ -379,6 +386,7 @@ impl RdpServerDisplay for MacDisplay {
             bitrate_ctrl,
             idle_frames: IdleFrameController::new(self.skip_unchanged, self.idle_keyframe_interval),
             pending_resize: Arc::clone(&self.pending_resize),
+            resize_notify: Arc::clone(&self.resize_notify),
             mode_444: self.mode_444,
             display_frame_count: 0,
             frame_pacer: FramePacer::new(self.frame_rate),
@@ -519,6 +527,12 @@ enum CgFallbackTick {
     EndOfStream,
 }
 
+enum CaptureWait {
+    Event(Option<CaptureEvent>),
+    ResizeWake,
+    IdleTimeout,
+}
+
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
@@ -531,6 +545,7 @@ struct MacDisplayUpdates {
     bitrate_ctrl: BitrateController,
     idle_frames: IdleFrameController,
     pending_resize: Arc<Mutex<Option<(DesktopSize, Instant)>>>,
+    resize_notify: Arc<Notify>,
     mode_444: bool,
     display_frame_count: u64,
     frame_pacer: FramePacer,
@@ -821,29 +836,19 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     None
                 };
 
-                let event = if let Some(timeout) = idle_deadline {
-                    match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
-                        Ok(Some(e)) => e,
-                        Ok(None) => {
-                            self.idle_frame_count = 0;
-                            self.enter_cg_fallback();
-                            continue 'outer;
-                        }
-                        Err(_elapsed) => {
-                            if let Some(update) = self.send_idle_idr() {
-                                return Ok(Some(update));
-                            }
-                            continue;
-                        }
+                let event = match self.wait_for_capture(idle_deadline).await {
+                    CaptureWait::Event(Some(event)) => event,
+                    CaptureWait::Event(None) => {
+                        self.idle_frame_count = 0;
+                        self.enter_cg_fallback();
+                        continue 'outer;
                     }
-                } else {
-                    match self.capturer.next_frame().await {
-                        Some(e) => e,
-                        None => {
-                            self.idle_frame_count = 0;
-                            self.enter_cg_fallback();
-                            continue 'outer;
+                    CaptureWait::ResizeWake => continue 'outer,
+                    CaptureWait::IdleTimeout => {
+                        if let Some(update) = self.send_idle_idr() {
+                            return Ok(Some(update));
                         }
+                        continue;
                     }
                 };
 
@@ -896,6 +901,49 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    fn pending_resize_timeout(&self) -> Option<Duration> {
+        self.pending_resize
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, requested_at)| RESIZE_DEBOUNCE.saturating_sub(requested_at.elapsed()))
+    }
+
+    async fn wait_for_capture(&mut self, idle_timeout: Option<Duration>) -> CaptureWait {
+        let resize_timeout = self.pending_resize_timeout();
+
+        match (resize_timeout, idle_timeout) {
+            (Some(resize_timeout), Some(idle_timeout)) => {
+                tokio::select! {
+                    _ = self.resize_notify.notified() => CaptureWait::ResizeWake,
+                    _ = tokio::time::sleep(resize_timeout) => CaptureWait::ResizeWake,
+                    _ = tokio::time::sleep(idle_timeout) => CaptureWait::IdleTimeout,
+                    event = self.capturer.next_frame() => CaptureWait::Event(event),
+                }
+            }
+            (Some(resize_timeout), None) => {
+                tokio::select! {
+                    _ = self.resize_notify.notified() => CaptureWait::ResizeWake,
+                    _ = tokio::time::sleep(resize_timeout) => CaptureWait::ResizeWake,
+                    event = self.capturer.next_frame() => CaptureWait::Event(event),
+                }
+            }
+            (None, Some(idle_timeout)) => {
+                tokio::select! {
+                    _ = self.resize_notify.notified() => CaptureWait::ResizeWake,
+                    _ = tokio::time::sleep(idle_timeout) => CaptureWait::IdleTimeout,
+                    event = self.capturer.next_frame() => CaptureWait::Event(event),
+                }
+            }
+            (None, None) => {
+                tokio::select! {
+                    _ = self.resize_notify.notified() => CaptureWait::ResizeWake,
+                    event = self.capturer.next_frame() => CaptureWait::Event(event),
+                }
+            }
+        }
+    }
+
     /// SCK stream stopped — switch `next_update` into CoreGraphics fallback
     /// mode. Subsequent iterations call [`Self::cg_fallback_tick`] until the
     /// SCK stream is restored.
@@ -1712,6 +1760,24 @@ mod tests {
             }
         );
         assert_eq!(pending_resize(&display), None);
+    }
+
+    #[test]
+    fn resize_support_matches_resolution_mode() {
+        assert!(test_display(1920, 1080, false).supports_dynamic_resize());
+        assert!(!test_display(1920, 1080, true).supports_dynamic_resize());
+    }
+
+    #[tokio::test]
+    async fn resize_request_wakes_idle_update_loop() {
+        let mut display = test_display(1920, 1080, false);
+        let resize_notify = Arc::clone(&display.resize_notify);
+
+        display.request_resize(2560, 1440);
+
+        tokio::time::timeout(Duration::from_millis(50), resize_notify.notified())
+            .await
+            .expect("resize notification should remain available until consumed");
     }
 
     #[tokio::test]

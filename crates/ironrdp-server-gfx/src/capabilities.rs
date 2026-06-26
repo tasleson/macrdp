@@ -31,8 +31,13 @@ fn bitmap_capabilities(size: &DesktopSize) -> capability_sets::Bitmap {
         pref_bits_per_pix: 32,
         desktop_width: size.width,
         desktop_height: size.height,
-        // This makes freerdp keep the flag up and handle desktop resize/deactivation-reactivation.
-        // Likely okay to advertize if the server doesn't resize anyway.
+        // Always advertise desktop-resize support, even for fixed-resolution
+        // displays that never resize. This keeps the client treating the
+        // server's desktop size as authoritative (handling any
+        // deactivation/reactivation) instead of clamping the rendered desktop
+        // to its own client-core size, which clips the bottom of the screen.
+        // Whether we actually honor client resize requests is governed
+        // separately by registering (or not) the display-control channel.
         desktop_resize_flag: true,
         drawing_flags: capability_sets::BitmapDrawingFlags::empty(),
     }
@@ -88,5 +93,24 @@ fn multifragment_update() -> capability_sets::MultifragmentUpdate {
         // FIXME(#318): use an acceptable value for msctc.
         // What is the actual server max size?
         max_request_size: 16_777_215,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bitmap_capabilities;
+    use crate::DesktopSize;
+
+    #[test]
+    fn bitmap_always_advertises_desktop_resize() {
+        // The flag must stay set regardless of whether the display accepts
+        // client-driven resizes, so fixed-resolution clients don't clamp the
+        // desktop to their window size and clip the bottom of the screen.
+        let size = DesktopSize {
+            width: 1920,
+            height: 1080,
+        };
+
+        assert!(bitmap_capabilities(&size).desktop_resize_flag);
     }
 }
