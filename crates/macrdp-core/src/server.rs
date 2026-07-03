@@ -360,6 +360,13 @@ pub async fn start_server_with_options(
             }
             Ok(n) => {
                 tracing::info!(display_count = n, "ScreenCaptureKit preflight ok");
+                if n > 1 {
+                    tracing::warn!(
+                        display_count = n,
+                        "Multiple displays detected — v1 captures only the main display; \
+                         app windows opening on other displays will not be visible to clients"
+                    );
+                }
             }
             Err(e) => {
                 handler.on_status_change(ServerStatus {

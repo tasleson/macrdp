@@ -412,17 +412,37 @@ fn extract_dirty_rects(sample: &CMSampleBuffer) -> (Vec<Rect>, bool) {
     }
 }
 
+/// Pick the display to capture from the SCK display list: the one whose ID
+/// matches `CGMainDisplayID`. `SCShareableContent.displays()` ordering is not
+/// guaranteed, so trusting the first entry can silently capture a secondary
+/// display on multi-display systems. Falls back to the first listed display
+/// (with a warning) when none matches — e.g. the main display went offline
+/// between enumeration and selection.
+fn main_sc_display(displays: Vec<SCDisplay>) -> Result<SCDisplay> {
+    let main_id = core_graphics::display::CGDisplay::main().id;
+    let mut displays = displays.into_iter();
+    let first = displays.next().context("No display found")?;
+    if first.display_id() == main_id {
+        return Ok(first);
+    }
+    if let Some(display) = displays.find(|d| d.display_id() == main_id) {
+        return Ok(display);
+    }
+    tracing::warn!(
+        main_display_id = main_id,
+        fallback_display_id = first.display_id(),
+        "Main display not in ScreenCaptureKit list — falling back to first listed display"
+    );
+    Ok(first)
+}
+
 /// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
 pub fn detect_display_scale() -> Result<u32> {
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
     let content = SCShareableContent::get().context("Failed to get shareable content")?;
-    let display = content
-        .displays()
-        .into_iter()
-        .next()
-        .context("No display found")?;
+    let display = main_sc_display(content.displays())?;
     let logical_w = display.width();
     let scale = physical_w.checked_div(logical_w).unwrap_or(1);
     Ok(scale.max(1))
@@ -431,11 +451,7 @@ pub fn detect_display_scale() -> Result<u32> {
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
     let content = SCShareableContent::get().context("Failed to get shareable content")?;
-    let display = content
-        .displays()
-        .into_iter()
-        .next()
-        .context("No display found")?;
+    let display = main_sc_display(content.displays())?;
     Ok((display.width(), display.height()))
 }
 
@@ -504,11 +520,15 @@ impl ScreenCapturer {
             .await?
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .context("No display found")?;
+        let displays = content.displays();
+        if displays.len() > 1 {
+            tracing::warn!(
+                display_count = displays.len(),
+                "Multiple displays detected — capturing the main display only; \
+                 windows on other displays will not be visible to the client"
+            );
+        }
+        let display = main_sc_display(displays)?;
 
         let actual_width = if config.width == 0 {
             display.width() as u32
