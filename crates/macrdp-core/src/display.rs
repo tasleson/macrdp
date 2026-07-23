@@ -479,12 +479,32 @@ fn capture_pixel_format(mode_444: bool, encoder: Option<&dyn VideoEncoder>) -> C
 /// Cached frame data for idle IDR re-encoding.
 enum CachedFrame {
     Bgra {
-        data: Vec<u8>,
+        data: Bytes,
         width: u32,
         height: u32,
         stride: usize,
     },
     PixelBuffer(SafePixelBuffer, u32, u32),
+}
+
+/// Snapshot a captured frame's content for `last_frame_cache`.
+///
+/// The cache must track the newest frame *received*, not the newest frame
+/// *sent*: the idle IDR keepalive re-encodes it, so if a skipped frame (frame
+/// pacing, ack backpressure) was the final state of a change burst, caching on
+/// send would leave the keepalive re-broadcasting stale content indefinitely.
+fn cached_frame_content(frame: &CapturedFrame) -> CachedFrame {
+    match &frame.data {
+        FrameData::Raw(bytes) => CachedFrame::Bgra {
+            data: bytes.clone(),
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+        },
+        FrameData::PixelBuffer(buf) => {
+            CachedFrame::PixelBuffer(buf.clone_ref(), frame.width, frame.height)
+        }
+    }
 }
 
 /// IDR keepalive interval during idle scenes.
@@ -1190,14 +1210,18 @@ impl MacDisplayUpdates {
 
         if gfx.ready {
             // Backpressure: skip frames when the client's ack queue is deep.
+            // Cache the content anyway so the idle IDR keepalive re-encodes
+            // the true screen state if this was the last frame of a burst.
             if self.backpressure_skip_remaining > 0 {
                 self.backpressure_skip_remaining -= 1;
+                self.last_frame_cache = Some(cached_frame_content(&frame));
                 return Ok(None);
             }
 
             // Frame pacing: skip if we're sending faster than the encoder can sustain.
             let now = Instant::now();
             if !self.frame_pacer.should_send(now) {
+                self.last_frame_cache = Some(cached_frame_content(&frame));
                 return Ok(None);
             }
             let idle_decision = self.idle_frames.next_decision(&frame, now);
@@ -1264,11 +1288,7 @@ impl MacDisplayUpdates {
                                     is_keyframe,
                                     pending_acks,
                                 );
-                                self.last_frame_cache = Some(CachedFrame::PixelBuffer(
-                                    buf.clone_ref(),
-                                    frame.width,
-                                    frame.height,
-                                ));
+                                self.last_frame_cache = Some(cached_frame_content(&frame));
                                 if is_keyframe {
                                     self.last_idr_time = Instant::now();
                                 }
@@ -1320,12 +1340,7 @@ impl MacDisplayUpdates {
                                 is_keyframe,
                                 pending_acks,
                             );
-                            self.last_frame_cache = Some(CachedFrame::Bgra {
-                                data: bgra.to_vec(),
-                                width: frame.width,
-                                height: frame.height,
-                                stride: frame.stride,
-                            });
+                            self.last_frame_cache = Some(cached_frame_content(&frame));
                             if is_keyframe {
                                 self.last_idr_time = Instant::now();
                             }
@@ -1374,12 +1389,7 @@ impl MacDisplayUpdates {
                             is_keyframe,
                             pending_acks,
                         );
-                        self.last_frame_cache = Some(CachedFrame::Bgra {
-                            data: bgra.to_vec(),
-                            width: frame.width,
-                            height: frame.height,
-                            stride: frame.stride,
-                        });
+                        self.last_frame_cache = Some(cached_frame_content(&frame));
                         if is_keyframe {
                             self.last_idr_time = Instant::now();
                         }
@@ -2018,6 +2028,30 @@ mod tests {
             timestamp_us: 0,
             dirty_rects,
             dirty_rects_available,
+        }
+    }
+
+    /// The cache snapshot must preserve the frame's geometry and share the
+    /// pixel bytes (cheap `Bytes` clone), so skipped frames can be cached on
+    /// every backpressure/pacing drop without copying the framebuffer.
+    #[test]
+    fn cached_frame_content_snapshots_raw_frame() {
+        let frame = test_frame_with_dirty_state(true, vec![]);
+        match cached_frame_content(&frame) {
+            CachedFrame::Bgra {
+                data,
+                width,
+                height,
+                stride,
+            } => {
+                assert_eq!((width, height, stride), (16, 16, 16 * 4));
+                assert_eq!(data.len(), 16 * 16 * 4);
+                let FrameData::Raw(original) = &frame.data else {
+                    unreachable!();
+                };
+                assert_eq!(data.as_ptr(), original.as_ptr(), "must share, not copy");
+            }
+            CachedFrame::PixelBuffer(..) => panic!("Raw frame must cache as Bgra"),
         }
     }
 
