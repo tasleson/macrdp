@@ -872,7 +872,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     }
                 };
 
-                let frame = match event {
+                let mut frame = match event {
                     CaptureEvent::Frame(f) => {
                         if self.idle_frame_count > 0 {
                             tracing::debug!(
@@ -897,19 +897,25 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         continue 'outer;
                     }
                 };
-                // If another frame is already buffered, skip this one and grab the newer one
-                // This prevents frame queuing which adds latency
-                match self.capturer.try_next_frame() {
-                    Some(CaptureEvent::Frame(_newer)) => continue,
-                    Some(CaptureEvent::Idle) => break frame,
-                    Some(CaptureEvent::Error(msg)) => {
-                        tracing::warn!(error = %msg, "SCStream error — restarting capture");
-                        self.idle_frame_count = 0;
-                        self.enter_cg_fallback();
-                        continue 'outer;
+                // Drain frames that queued while we were busy and keep the
+                // newest one. This prevents frame queuing which adds latency,
+                // but must *replace* rather than discard: if the burst ends
+                // here, a dropped frame is the screen's final state and the
+                // client would keep showing stale content until the next
+                // change (the capturer only reports Idle from then on).
+                loop {
+                    match self.capturer.try_next_frame() {
+                        Some(CaptureEvent::Frame(newer)) => frame = newer,
+                        Some(CaptureEvent::Idle) | None => break,
+                        Some(CaptureEvent::Error(msg)) => {
+                            tracing::warn!(error = %msg, "SCStream error — restarting capture");
+                            self.idle_frame_count = 0;
+                            self.enter_cg_fallback();
+                            continue 'outer;
+                        }
                     }
-                    None => break frame,
                 }
+                break frame;
             };
 
             match self.encode_and_send(frame)? {
