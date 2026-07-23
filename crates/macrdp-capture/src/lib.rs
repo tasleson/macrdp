@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use core_foundation::base::TCFType;
+use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::access::ScreenCaptureAccess;
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::prelude::*;
@@ -161,6 +163,55 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: SCStream,
     frame_rx: mpsc::Receiver<CaptureEvent>,
+    /// Keeps the display awake for the lifetime of the capture stream.
+    _display_sleep: DisplaySleepAssertion,
+}
+
+/// RAII IOKit assertion that prevents display idle sleep while held.
+///
+/// RDP input is injected via CGEvent and does not count as local user
+/// activity, so macOS still puts the display to sleep after its idle timeout
+/// during an active remote session. A sleeping display makes ScreenCaptureKit
+/// tear the stream down ("Failed to find any displays or windows to capture")
+/// every few seconds, bouncing the session through the CoreGraphics fallback.
+/// Holding this assertion for the lifetime of the capturer keeps the display
+/// awake while a client is connected.
+struct DisplaySleepAssertion {
+    id: Option<u32>,
+}
+
+impl DisplaySleepAssertion {
+    fn new() -> Self {
+        let assertion_type = CFString::from_static_string("PreventUserIdleDisplaySleep");
+        let name = CFString::from_static_string("macrdp screen capture active");
+        let mut id: u32 = 0;
+        // SAFETY: both CFStrings outlive the call; `id` is a valid out-pointer.
+        let status = unsafe {
+            IOPMAssertionCreateWithName(
+                assertion_type.as_concrete_TypeRef(),
+                IOPM_ASSERTION_LEVEL_ON,
+                name.as_concrete_TypeRef(),
+                &mut id,
+            )
+        };
+        if status == 0 {
+            Self { id: Some(id) }
+        } else {
+            tracing::warn!(status, "Failed to create display-sleep assertion");
+            Self { id: None }
+        }
+    }
+}
+
+impl Drop for DisplaySleepAssertion {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // SAFETY: `id` came from a successful IOPMAssertionCreateWithName.
+            unsafe {
+                IOPMAssertionRelease(id);
+            }
+        }
+    }
 }
 
 struct VideoOutputHandler {
@@ -596,7 +647,11 @@ impl ScreenCapturer {
             "Screen capture started"
         );
 
-        Ok(Self { stream, frame_rx })
+        Ok(Self {
+            stream,
+            frame_rx,
+            _display_sleep: DisplaySleepAssertion::new(),
+        })
     }
 
     /// Receive the next capture event (async, cancellation safe)
@@ -734,6 +789,24 @@ extern "C" {
     fn CGDisplayIsActive(display: u32) -> bool;
     /// Returns true when display hardware is connected, even while sleeping.
     fn CGDisplayIsOnline(display: u32) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// IOKit power-assertion FFI — keep the display awake while capturing
+// ---------------------------------------------------------------------------
+
+/// `kIOPMAssertionLevelOn`
+const IOPM_ASSERTION_LEVEL_ON: u32 = 255;
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOPMAssertionCreateWithName(
+        assertion_type: CFStringRef,
+        assertion_level: u32,
+        assertion_name: CFStringRef,
+        assertion_id: *mut u32,
+    ) -> i32;
+    fn IOPMAssertionRelease(assertion_id: u32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
