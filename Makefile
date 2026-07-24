@@ -1,4 +1,4 @@
-.PHONY: help build build-cli dev run-cli run-cli-ipc clean clean-cli check release
+.PHONY: help build build-cli dev run-cli clean clean-cli check release
 
 # Default target
 help:
@@ -7,7 +7,6 @@ help:
 	@echo "  开发:"
 	@echo "    make build-cli        编译 RDP 服务端"
 	@echo "    make run-cli          运行 CLI (端口 3389)"
-	@echo "    make run-cli-ipc      运行 CLI + IPC socket"
 	@echo "    make check            检查所有编译"
 	@echo ""
 	@echo "  发布:"
@@ -24,9 +23,6 @@ build-cli:
 
 run-cli:
 	cargo run -p macrdp-server
-
-run-cli-ipc:
-	cargo run -p macrdp-server -- --ipc-socket /tmp/macrdp.sock
 
 # === 发布 ===
 
