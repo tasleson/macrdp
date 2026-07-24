@@ -21,20 +21,20 @@ The project is a macOS RDP (Remote Desktop Protocol) server built in Rust. This 
 
 ---
 
-## One Issue Found
+## One Issue Found (Fixed)
 
 ### Password bytes logged on auth failure (severity: low-medium)
 
-In `crates/ironrdp-acceptor-patched/src/connection.rs` (~lines 558-559), when credential validation fails, the actual password bytes are logged:
+In `crates/ironrdp-acceptor-patched/src/connection.rs` (~lines 558-559), when credential validation fails, the actual password bytes were logged:
 
 ```rust
 client_pass_bytes = ?creds.password.as_bytes(),
 server_pass_bytes = ?self.creds.as_ref().map(|c| c.password.as_bytes()),
 ```
 
-This appears to be leftover debugging code, not a backdoor. However, it could expose credentials if logs are captured or viewed by others.
+This appeared to be leftover debugging code, not a backdoor, but it could have exposed credentials if logs were captured or viewed by others.
 
-**Recommendation:** Remove password byte logging and only log password length.
+**Status:** Fixed. Auth-failure logging now records only the username/domain, never password bytes.
 
 ---
 
@@ -45,7 +45,7 @@ This appears to be leftover debugging code, not a backdoor. However, it could ex
 | Network exfiltration | Clean |
 | Backdoor access / hidden commands | Clean |
 | Reverse shells / command execution | Clean |
-| Credential harvesting | Clean (minor logging issue noted) |
+| Credential harvesting | Clean (logging issue fixed) |
 | Crypto miners | Clean |
 | Obfuscated code | Clean |
 | Suspicious file access | Clean |
@@ -53,4 +53,4 @@ This appears to be leftover debugging code, not a backdoor. However, it could ex
 | Supply chain (dependencies) | Clean |
 | Build-time attacks | Clean |
 
-The codebase appears to be a legitimate macOS RDP server implementation. The only actionable finding is the password byte logging, which should be sanitized.
+The codebase is a legitimate macOS RDP server implementation with no backdoors or malicious code.
